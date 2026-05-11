@@ -9,6 +9,7 @@ from typing import Any, Optional, Sequence
 
 DEFAULT_PLANNER_MODELS = ("gpt-5.5", "gpt-5.4")
 DEFAULT_WORKER_MODEL = "gpt-5.3-codex"
+TERMINAL_MANIFEST_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
 
 
 def _json_default(value: Any) -> Any:
@@ -78,6 +79,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--prepare-only",
         action="store_true",
         help="Create manifest and worker worktree without calling Codex MCP.",
+    )
+
+    resume = subparsers.add_parser(
+        "resume",
+        help="Resume an existing single-worker c-orch run.",
+    )
+    resume.add_argument("run_id", help="Existing run ID to resume.")
+    resume.add_argument("--cwd", default=".", help="Target repository path.")
+    resume.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
+    resume.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
+    resume.add_argument(
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="Maximum Worker attempts including the initial attempt.",
+    )
+    resume.add_argument(
+        "--sandbox",
+        default="workspace-write",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help="Sandbox mode passed to Codex MCP sessions.",
+    )
+    resume.add_argument(
+        "--approval-policy",
+        default="never",
+        choices=("untrusted", "on-failure", "on-request", "never"),
+        help="Approval policy passed to Codex MCP sessions.",
     )
 
     return parser
@@ -177,7 +205,7 @@ def run_prepare(args: argparse.Namespace) -> int:
                     approval_policy=args.approval_policy,
                 )
         except Exception as exc:
-            if manifest.status not in {"APPROVED", "BLOCKED", "FAILED"}:
+            if not _is_terminal_manifest_status(manifest.status):
                 manifest.status = "FAILED"
             store.save(manifest)
             _print_run_summary(
@@ -200,11 +228,94 @@ def run_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_resume(args: argparse.Namespace) -> int:
+    from .mcp_driver import McpCodexDriver
+    from .orchestrator import OrchestratorConfig, RunOrchestrator
+    from .run_store import RunStore
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
+    store = RunStore(runs_dir)
+    manifest = store.load(args.run_id)
+    worker = manifest.workers[0]
+    planner_model = manifest.planner.model
+    worker_model = worker.model
+    summary_codex_path = (
+        args.codex_bin
+        or manifest.codex_binary_path
+        or manifest.planner.codex_binary_path
+        or "unknown"
+    )
+
+    if _is_terminal_manifest_status(manifest.status):
+        _print_run_summary(
+            manifest=manifest,
+            manifest_path=store.manifest_path(manifest.run_id),
+            codex_path=summary_codex_path,
+            planner_model=planner_model,
+            worker_model=worker_model,
+        )
+        return 0
+
+    codex_path = (
+        args.codex_bin
+        or manifest.codex_binary_path
+        or manifest.planner.codex_binary_path
+    )
+    if not codex_path:
+        from .codex_discovery import inspect_codex_environment
+
+        report = inspect_codex_environment(explicit_codex_bin=args.codex_bin)
+        if not report.selected:
+            print("No usable Codex binary found. Run `c-orch doctor` for details.", file=sys.stderr)
+            return 1
+        codex_path = report.selected.path
+
+    try:
+        with McpCodexDriver(codex_bin=codex_path) as driver:
+            orchestrator = RunOrchestrator(
+                store=store,
+                driver=driver,
+                config=OrchestratorConfig(
+                    max_attempts=args.max_attempts,
+                    sandbox=args.sandbox,
+                    approval_policy=args.approval_policy,
+                ),
+            )
+            manifest = orchestrator.run(manifest)
+    except Exception as exc:
+        if not _is_terminal_manifest_status(manifest.status):
+            manifest.status = "FAILED"
+        store.save(manifest)
+        _print_run_summary(
+            manifest=manifest,
+            manifest_path=store.manifest_path(manifest.run_id),
+            codex_path=codex_path,
+            planner_model=planner_model,
+            worker_model=worker_model,
+        )
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_run_summary(
+        manifest=manifest,
+        manifest_path=store.manifest_path(manifest.run_id),
+        codex_path=codex_path,
+        planner_model=planner_model,
+        worker_model=worker_model,
+    )
+    return 0
+
+
 def _resolve_under_cwd(cwd: Path, value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
     return cwd / path
+
+
+def _is_terminal_manifest_status(status: str) -> bool:
+    return status in TERMINAL_MANIFEST_STATUSES
 
 
 def _print_run_summary(
@@ -236,6 +347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_doctor(args)
     if args.command == "run":
         return run_prepare(args)
+    if args.command == "resume":
+        return run_resume(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

@@ -179,6 +179,129 @@ class CliRunTests(unittest.TestCase):
             manifest = RunStore(runs_dir).load(run_ids[0])
             self.assertEqual(manifest.status, "FAILED")
 
+    def test_resume_terminal_statuses_print_summary_without_orchestration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = cwd / "runs"
+            store = RunStore(runs_dir)
+
+            for status in ("APPROVED", "BLOCKED", "FAILED"):
+                manifest = store.create_run(
+                    cwd=cwd,
+                    user_task=f"Task for {status}",
+                    planner_model="gpt-5.5",
+                    worker_model="gpt-5.3-codex",
+                    codex_binary_path="/bin/codex",
+                )
+                manifest.status = status
+                store.save(manifest)
+
+                with self.subTest(status=status), mock.patch(
+                    "c_orch.codex_discovery.inspect_codex_environment",
+                ) as inspect_mock, mock.patch(
+                    "c_orch.mcp_driver.McpCodexDriver",
+                ) as driver_cls, mock.patch(
+                    "c_orch.orchestrator.RunOrchestrator",
+                ) as orchestrator_cls, redirect_stdout(StringIO()) as stdout:
+                    exit_code = main(
+                        [
+                            "resume",
+                            manifest.run_id,
+                            "--cwd",
+                            str(cwd),
+                            "--runs-dir",
+                            "runs",
+                        ]
+                    )
+
+                self.assertEqual(exit_code, 0)
+                inspect_mock.assert_not_called()
+                driver_cls.assert_not_called()
+                orchestrator_cls.assert_not_called()
+                output = stdout.getvalue()
+                self.assertIn(f"run_id: {manifest.run_id}", output)
+                self.assertIn("manifest:", output)
+                self.assertIn(f"status: {status}", output)
+
+    def test_resume_new_manifest_runs_orchestrator_and_persists_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = cwd / "runs"
+            store = RunStore(runs_dir)
+            manifest = store.create_run(
+                cwd=cwd,
+                user_task="Implement feature X",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/custom/codex",
+            )
+            worker_worktree = root / "worktrees" / manifest.run_id / "worker-1"
+            worker_worktree.mkdir(parents=True)
+            manifest.workers[0].worktree_path = str(worker_worktree)
+            store.save(manifest)
+
+            driver = FakeDriver()
+
+            def fake_orchestrator_run(loaded_manifest):
+                loaded_manifest.status = "APPROVED"
+                loaded_manifest.planner.thread_id = "planner-resume-thread"
+                loaded_manifest.workers[0].thread_id = "worker-resume-thread"
+                store.save(loaded_manifest)
+                return loaded_manifest
+
+            with mock.patch(
+                "c_orch.codex_discovery.inspect_codex_environment",
+            ) as inspect_mock, mock.patch(
+                "c_orch.mcp_driver.McpCodexDriver",
+                return_value=driver,
+            ) as driver_cls, mock.patch(
+                "c_orch.orchestrator.RunOrchestrator",
+            ) as orchestrator_cls, redirect_stdout(StringIO()) as stdout:
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.run.side_effect = fake_orchestrator_run
+                exit_code = main(
+                    [
+                        "resume",
+                        manifest.run_id,
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                        "--max-attempts",
+                        "2",
+                        "--sandbox",
+                        "read-only",
+                        "--approval-policy",
+                        "on-request",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            inspect_mock.assert_not_called()
+            driver_cls.assert_called_once_with(codex_bin="/custom/codex")
+            self.assertTrue(driver.entered)
+            self.assertTrue(driver.exited)
+            self.assertEqual(orchestrator.run.call_count, 1)
+            self.assertEqual(orchestrator.run.call_args.args[0].run_id, manifest.run_id)
+            config = orchestrator_cls.call_args.kwargs["config"]
+            self.assertEqual(config.max_attempts, 2)
+            self.assertEqual(config.sandbox, "read-only")
+            self.assertEqual(config.approval_policy, "on-request")
+
+            run_dirs = [path.name for path in runs_dir.iterdir()]
+            self.assertEqual(run_dirs, [manifest.run_id])
+
+            persisted = store.load(manifest.run_id)
+            self.assertEqual(persisted.status, "APPROVED")
+            self.assertEqual(persisted.planner.thread_id, "planner-resume-thread")
+            self.assertEqual(persisted.workers[0].thread_id, "worker-resume-thread")
+            output = stdout.getvalue()
+            self.assertIn("status: APPROVED", output)
+
 
 class FakeDriver:
     def __init__(self) -> None:
