@@ -326,8 +326,8 @@ def run_ui(args: argparse.Namespace) -> int:
 
     cwd = Path(args.cwd).expanduser().resolve()
     runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
-    print(f"c-orch UI: http://{args.host}:{args.port}")
-    print(f"runs_dir: {runs_dir}")
+    print(f"c-orch UI: http://{args.host}:{args.port}", flush=True)
+    print(f"runs_dir: {runs_dir}", flush=True)
     serve_dashboard(runs_dir=runs_dir, host=args.host, port=args.port)
     return 0
 
