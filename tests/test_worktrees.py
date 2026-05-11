@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from c_orch.worktrees import (
+    apply_diff_evidence_to_repo,
     collect_diff_evidence,
     create_worker_worktree,
     worker_worktree_path,
@@ -90,6 +91,75 @@ class WorktreeTests(unittest.TestCase):
                     "run-1",
                     "worker-1",
                 )
+
+    def test_apply_diff_evidence_to_repo_applies_tracked_and_untracked_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._create_repo(root / "repo")
+            worktree = create_worker_worktree(
+                repo,
+                root / "worktrees",
+                "run-1",
+                "worker-1",
+            )
+            (worktree / "README.md").write_text("hello from worker\n", encoding="utf-8")
+            (worktree / "new.txt").write_text("new evidence\n", encoding="utf-8")
+            diff_evidence = collect_diff_evidence(
+                worktree,
+                root / "runs" / "run-1" / "evidence",
+            )
+
+            report = apply_diff_evidence_to_repo(
+                diff_evidence,
+                repo,
+                root / "runs" / "run-1" / "evidence",
+            )
+
+            self.assertTrue(report.applied)
+            self.assertTrue(report.output_path.exists())
+            self.assertEqual(
+                (repo / "README.md").read_text(encoding="utf-8"),
+                "hello from worker\n",
+            )
+            self.assertEqual((repo / "new.txt").read_text(encoding="utf-8"), "new evidence\n")
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("Summary: Patch applied successfully.", output)
+            self.assertIn("apply --check --binary", output)
+            self.assertIn("returncode: 0", output)
+
+    def test_apply_diff_evidence_to_repo_failure_keeps_target_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._create_repo(root / "repo")
+            worktree = create_worker_worktree(
+                repo,
+                root / "worktrees",
+                "run-1",
+                "worker-1",
+            )
+            (worktree / "README.md").write_text("hello from worker\n", encoding="utf-8")
+            diff_evidence = collect_diff_evidence(
+                worktree,
+                root / "runs" / "run-1" / "evidence",
+            )
+            (repo / "README.md").write_text("hello from target\n", encoding="utf-8")
+
+            report = apply_diff_evidence_to_repo(
+                diff_evidence,
+                repo,
+                root / "runs" / "run-1" / "evidence",
+            )
+
+            self.assertFalse(report.applied)
+            self.assertEqual(
+                (repo / "README.md").read_text(encoding="utf-8"),
+                "hello from target\n",
+            )
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("Failed: git apply --check rejected the patch.", output)
+            self.assertIn("apply --check --binary", output)
+            self.assertIn("returncode:", output)
+            self.assertIn("stderr:", output)
 
     def _create_repo(self, path: Path) -> Path:
         path.mkdir()

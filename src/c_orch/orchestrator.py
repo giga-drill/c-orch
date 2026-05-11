@@ -9,7 +9,12 @@ from .drivers import CodexDriver
 from .prompts import planner_initial_prompt, planner_review_prompt, worker_prompt
 from .run_store import ReviewRecord, RunManifest, RunStore, WorkerRecord
 from .verification import VerificationReport, run_verification_commands
-from .worktrees import DiffEvidence, collect_diff_evidence
+from .worktrees import (
+    ApplyReport,
+    DiffEvidence,
+    apply_diff_evidence_to_repo,
+    collect_diff_evidence,
+)
 
 
 Pathish = Union[str, Path]
@@ -35,6 +40,16 @@ class VerificationRunner(Protocol):
         ...
 
 
+class DiffApplier(Protocol):
+    def __call__(
+        self,
+        diff: DiffEvidence,
+        target_repo_path: Pathish,
+        evidence_dir: Pathish,
+    ) -> ApplyReport:
+        ...
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     sandbox: str = "workspace-write"
@@ -51,12 +66,14 @@ class RunOrchestrator:
         store: RunStore,
         driver: CodexDriver,
         evidence_collector: EvidenceCollector = collect_diff_evidence,
+        diff_applier: DiffApplier = apply_diff_evidence_to_repo,
         verification_runner: VerificationRunner = run_verification_commands,
         config: Optional[OrchestratorConfig] = None,
     ) -> None:
         self.store = store
         self.driver = driver
         self.evidence_collector = evidence_collector
+        self.diff_applier = diff_applier
         self.verification_runner = verification_runner
         self.config = config or OrchestratorConfig()
         if self.config.max_attempts < 1:
@@ -110,9 +127,20 @@ class RunOrchestrator:
             )
 
             if decision.decision == "approved":
-                manifest.status = "APPROVED"
-                manifest.planner.status = "APPROVED"
-                worker.status = "APPROVED"
+                apply_report = self._apply_reviewed_diff(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                )
+                if apply_report.applied:
+                    manifest.status = "APPROVED"
+                    manifest.planner.status = "APPROVED"
+                    worker.status = "APPROVED"
+                    self._save(manifest)
+                    return manifest
+                manifest.status = "FAILED"
+                manifest.planner.status = "FAILED"
+                worker.status = "FAILED"
                 self._save(manifest)
                 return manifest
 
@@ -286,6 +314,27 @@ class RunOrchestrator:
 
     def _evidence_dir(self, manifest: RunManifest) -> Path:
         return self.store.run_dir(manifest.run_id) / "evidence"
+
+    def _apply_reviewed_diff(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+    ) -> ApplyReport:
+        apply_report = self.diff_applier(
+            evidence,
+            manifest.cwd,
+            self._evidence_dir(manifest),
+        )
+        worker.evidence_files = _append_unique(worker.evidence_files, apply_report.evidence_files)
+        if manifest.review is not None:
+            manifest.review.evidence_files = _append_unique(
+                manifest.review.evidence_files,
+                apply_report.evidence_files,
+            )
+        self._save(manifest)
+        return apply_report
 
 
 def run_single_worker(

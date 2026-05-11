@@ -10,7 +10,7 @@ from c_orch.drivers import SessionResult
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import RunStore
 from c_orch.verification import CommandVerification, VerificationReport
-from c_orch.worktrees import DiffEvidence
+from c_orch.worktrees import ApplyReport, DiffEvidence
 
 
 class FakeDriver:
@@ -115,6 +115,35 @@ class FakeVerificationRunner:
         )
 
 
+class FakeDiffApplier:
+    def __init__(self, *, applied: bool = True) -> None:
+        self.applied = applied
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        diff: DiffEvidence,
+        target_repo_path: str,
+        evidence_dir: Path,
+    ) -> ApplyReport:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        output_path = evidence_dir / "git-apply-output.txt"
+        output_path.write_text("fake apply output\n", encoding="utf-8")
+        self.calls.append(
+            {
+                "diff": diff,
+                "target_repo_path": Path(target_repo_path),
+                "evidence_dir": evidence_dir,
+            }
+        )
+        return ApplyReport(
+            applied=self.applied,
+            summary="applied" if self.applied else "failed",
+            output_path=output_path,
+        )
+
+
 class OrchestratorTests(unittest.TestCase):
     def test_approved_flow_updates_manifest_and_uses_worker_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,11 +158,13 @@ class OrchestratorTests(unittest.TestCase):
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
 
             result = RunOrchestrator(
                 store=store,
                 driver=driver,
                 evidence_collector=evidence,
+                diff_applier=applier,
                 verification_runner=verification,
             ).run(manifest)
 
@@ -163,11 +194,20 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(verification.calls[0]["cwd"], worktree)
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "approved")
-            self.assertEqual(len(result.review.evidence_files), 3)
+            self.assertEqual(len(result.review.evidence_files), 4)
+            self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+            self.assertEqual(len(result.workers[0].evidence_files), 4)
+            self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(applier.calls[0]["target_repo_path"], Path(manifest.cwd))
+            self.assertEqual(
+                applier.calls[0]["evidence_dir"],
+                store.run_dir(manifest.run_id) / "evidence",
+            )
 
             loaded = store.load(manifest.run_id)
             self.assertEqual(loaded.status, "APPROVED")
             self.assertEqual(loaded.review.decision, "approved")
+            self.assertEqual(len(loaded.review.evidence_files), 4)
 
     def test_needs_changes_reuses_worker_thread_then_reviews_again(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,11 +226,13 @@ class OrchestratorTests(unittest.TestCase):
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
 
             result = RunOrchestrator(
                 store=store,
                 driver=driver,
                 evidence_collector=evidence,
+                diff_applier=applier,
                 verification_runner=verification,
                 config=OrchestratorConfig(max_attempts=2),
             ).run(manifest)
@@ -212,7 +254,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "approved")
             self.assertEqual(len(verification.calls), 2)
-            self.assertEqual(len(result.workers[0].evidence_files), 3)
+            self.assertEqual(len(result.workers[0].evidence_files), 4)
+            self.assertEqual(len(applier.calls), 1)
+            self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
 
     def test_needs_changes_after_max_attempts_fails_without_extra_worker_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,11 +271,13 @@ class OrchestratorTests(unittest.TestCase):
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
 
             result = RunOrchestrator(
                 store=store,
                 driver=driver,
                 evidence_collector=evidence,
+                diff_applier=applier,
                 verification_runner=verification,
                 config=OrchestratorConfig(max_attempts=1),
             ).run(manifest)
@@ -246,6 +292,45 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "needs_changes")
+            self.assertEqual(len(applier.calls), 0)
+
+    def test_apply_failure_after_approved_review_marks_run_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("approved"))],
+            )
+            evidence = FakeEvidenceCollector()
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier(applied=False)
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(result.planner.status, "FAILED")
+            self.assertEqual(result.workers[0].status, "FAILED")
+            self.assertIsNotNone(result.review)
+            self.assertEqual(result.review.decision, "approved")
+            self.assertEqual(len(applier.calls), 1)
+            self.assertIn("git-apply-output.txt", result.workers[0].evidence_files[-1])
+            self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+
+            loaded = store.load(manifest.run_id)
+            self.assertEqual(loaded.status, "FAILED")
+            self.assertEqual(loaded.planner.status, "FAILED")
+            self.assertEqual(loaded.workers[0].status, "FAILED")
+            self.assertEqual(loaded.review.decision, "approved")
 
 
 def _create_manifest(root: Path):
