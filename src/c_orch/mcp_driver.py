@@ -127,7 +127,8 @@ class McpCodexDriver:
             )
             if recovered is None:
                 raise exc
-            self._reset_client_after_timeout()
+            # Keep the MCP server process alive: Codex MCP resolves codex-reply
+            # thread ids against state held by that process.
             return _session_result_from_snapshot(recovered)
 
     def _wait_for_recovered_session(
@@ -157,17 +158,6 @@ class McpCodexDriver:
             if now >= deadline:
                 return None
             time.sleep(min(self._session_recovery_poll_seconds, deadline - now))
-
-    def _reset_client_after_timeout(self) -> None:
-        client = self._client
-        self._client = None
-        self._tools_checked = False
-        if client is None:
-            return
-        try:
-            client.close()
-        except Exception:
-            pass
 
     def _ensure_required_tools(self) -> None:
         if self._tools_checked:

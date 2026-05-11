@@ -131,7 +131,7 @@ class McpCodexDriverTests(unittest.TestCase):
         self.assertEqual(result.thread_id, "thr_worker")
         self.assertEqual(result.content, "worker done from log")
         self.assertEqual(result.raw["recoveredFromSessionLog"], "/sessions/worker.jsonl")
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
         self.assertEqual(session_logs.calls[0]["cwd"], "/repo")
         self.assertIsNone(session_logs.calls[0]["thread_id"])
 
@@ -159,9 +159,54 @@ class McpCodexDriverTests(unittest.TestCase):
 
         self.assertEqual(result.thread_id, "thr_planner")
         self.assertEqual(result.content, '{"decision":"approved"}')
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
         self.assertEqual(session_logs.calls[0]["thread_id"], "thr_planner")
         self.assertIsNone(session_logs.calls[0]["cwd"])
+
+    def test_start_session_recovery_preserves_client_for_planner_reply(self) -> None:
+        client = FakeMcpClient(
+            [
+                {
+                    "structuredContent": {
+                        "threadId": "thr_planner",
+                        "content": '{"decision":"approved"}',
+                    }
+                }
+            ]
+        )
+        client.timeout_next_call = True
+        session_logs = FakeSessionLogStore(
+            CodexSessionSnapshot(
+                thread_id="thr_planner",
+                path=Path("/sessions/planner.jsonl"),
+                cwd=Path("/repo"),
+                source="mcp",
+                has_activity_after_started=True,
+                final_content='{"status":"plan_ready"}',
+                final_epoch=1.0,
+            )
+        )
+        driver = McpCodexDriver(
+            client=client,
+            session_log_store=session_logs,
+            session_recovery_poll_seconds=0,
+        )
+
+        plan = driver.start_session(
+            role="planner",
+            model="gpt-5.5",
+            cwd="/repo",
+            prompt="Plan",
+            sandbox="workspace-write",
+            approval_policy="never",
+        )
+        review = driver.reply(thread_id="thr_planner", prompt="Review")
+
+        self.assertEqual(plan.thread_id, "thr_planner")
+        self.assertEqual(plan.content, '{"status":"plan_ready"}')
+        self.assertEqual(review.content, '{"decision":"approved"}')
+        self.assertFalse(client.closed)
+        self.assertEqual([call[0] for call in client.calls], ["codex", "codex-reply"])
 
     def test_timeout_without_session_activity_still_raises(self) -> None:
         client = FakeMcpClient([])
@@ -201,12 +246,16 @@ class FakeMcpClient:
         self.started = False
         self.closed = False
         self.timeout_on_call = False
+        self.timeout_next_call = False
 
     def start(self) -> None:
         self.started = True
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Dict[str, Any]:
         self.calls.append((name, dict(arguments)))
+        if self.timeout_next_call:
+            self.timeout_next_call = False
+            raise McpTimeoutError("timeout")
         if self.timeout_on_call:
             raise McpTimeoutError("timeout")
         if not self.results:
