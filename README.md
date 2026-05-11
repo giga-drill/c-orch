@@ -36,6 +36,14 @@ PYTHONPATH=src python3 -m c_orch.cli run \
   "Implement feature X"
 ```
 
+Open the local run dashboard:
+
+```bash
+PYTHONPATH=src python3 -m c_orch.cli ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs
+```
+
 Common options:
 
 ```bash

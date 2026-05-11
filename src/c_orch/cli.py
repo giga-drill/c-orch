@@ -108,6 +108,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approval policy passed to Codex MCP sessions.",
     )
 
+    ui = subparsers.add_parser(
+        "ui",
+        help="Serve a local web dashboard for c-orch runs.",
+    )
+    ui.add_argument("--cwd", default=".", help="Target repository path.")
+    ui.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
+    ui.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for the local dashboard.",
+    )
+
     return parser
 
 
@@ -307,6 +321,17 @@ def run_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_ui(args: argparse.Namespace) -> int:
+    from .ui import serve_dashboard
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
+    print(f"c-orch UI: http://{args.host}:{args.port}")
+    print(f"runs_dir: {runs_dir}")
+    serve_dashboard(runs_dir=runs_dir, host=args.host, port=args.port)
+    return 0
+
+
 def _resolve_under_cwd(cwd: Path, value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
@@ -349,6 +374,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_prepare(args)
     if args.command == "resume":
         return run_resume(args)
+    if args.command == "ui":
+        return run_ui(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

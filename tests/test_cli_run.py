@@ -302,6 +302,37 @@ class CliRunTests(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn("status: APPROVED", output)
 
+    def test_ui_serves_resolved_runs_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+
+            with mock.patch(
+                "c_orch.ui.serve_dashboard",
+            ) as serve_dashboard, redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "ui",
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        "9999",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            serve_dashboard.assert_called_once_with(
+                runs_dir=cwd.resolve() / "runs",
+                host="127.0.0.1",
+                port=9999,
+            )
+            self.assertIn("http://127.0.0.1:9999", stdout.getvalue())
+
 
 class FakeDriver:
     def __init__(self) -> None:

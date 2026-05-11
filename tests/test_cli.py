@@ -18,6 +18,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.cwd, "repo")
         self.assertEqual(args.runs_dir, "runs")
 
+    def test_ui_command_parses(self) -> None:
+        args = build_parser().parse_args(
+            ["ui", "--cwd", "repo", "--runs-dir", "runs", "--host", "0.0.0.0", "--port", "7777"]
+        )
+        self.assertEqual(args.command, "ui")
+        self.assertEqual(args.cwd, "repo")
+        self.assertEqual(args.runs_dir, "runs")
+        self.assertEqual(args.host, "0.0.0.0")
+        self.assertEqual(args.port, 7777)
+
 
 if __name__ == "__main__":
     unittest.main()
