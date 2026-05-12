@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
-from c_orch.ui import INDEX_HTML, build_run_payload, build_runs_payload
+from c_orch.task_store import TaskStore
+from c_orch.ui import INDEX_HTML, build_queue_payload, build_run_payload, build_runs_payload
 
 
 class UiTests(unittest.TestCase):
@@ -108,9 +109,35 @@ class UiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(build_run_payload(Path(tmp) / "runs", "../outside"))
 
+    def test_build_queue_payload_includes_task_run_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="APPROVED",
+                active_run_id="run-123",
+                run_ids=["run-123"],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json")
+
+            self.assertEqual(payload["queue"]["status"], "PENDING")
+            self.assertEqual(payload["tasks"][0]["task_id"], "task-001")
+            self.assertEqual(payload["tasks"][0]["active_run_id"], "run-123")
+            self.assertEqual(payload["tasks"][0]["run_ids"], ["run-123"])
+
     def test_index_html_contains_dashboard_mount_points(self) -> None:
         self.assertIn('id="runList"', INDEX_HTML)
         self.assertIn("/api/runs", INDEX_HTML)
+        self.assertIn("/api/queue", INDEX_HTML)
+        self.assertIn('id="queueList"', INDEX_HTML)
+        self.assertIn("Task Queue", INDEX_HTML)
         self.assertIn('id="detail"', INDEX_HTML)
         self.assertIn("运行时间线", INDEX_HTML)
         self.assertIn("payload.events", INDEX_HTML)

@@ -533,6 +533,7 @@ approval_policy = "on-request"
             self.assertEqual(exit_code, 0)
             serve_dashboard.assert_called_once_with(
                 runs_dir=cwd.resolve() / "runs",
+                queue_path=cwd.resolve() / ".c-orch" / "tasks" / "queue.json",
                 host="127.0.0.1",
                 port=9999,
             )

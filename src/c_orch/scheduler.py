@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional, Protocol
+
+from .drivers import CodexDriver
+from .orchestrator import OrchestratorConfig, RunOrchestrator
+from .run_store import RunManifest, RunStore
+from .states import RUN_APPROVED, RUN_BLOCKED, RUN_FAILED
+from .task_store import (
+    QUEUE_APPROVED,
+    QUEUE_BLOCKED,
+    QUEUE_FAILED,
+    QUEUE_PENDING,
+    QUEUE_RESTART_REQUIRED,
+    QUEUE_RUNNING,
+    TASK_APPROVED,
+    TASK_BLOCKED,
+    TASK_FAILED,
+    TASK_PENDING,
+    TASK_RUNNING,
+    TaskQueue,
+    TaskStore,
+)
+from .worktrees import create_worker_worktree
+
+
+class OrchestratorLike(Protocol):
+    def run(self, manifest: RunManifest) -> RunManifest:
+        ...
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    cwd: Path
+    runs_dir: Path
+    worktrees_dir: Path
+    planner_model: str
+    worker_model: str
+    codex_binary_path: str
+    max_attempts: int
+    sandbox: str
+    approval_policy: str
+    planner_reasoning_effort: Optional[str] = None
+    worker_reasoning_effort: Optional[str] = None
+    planner_service_tier: Optional[str] = None
+    worker_service_tier: Optional[str] = None
+    max_tasks: Optional[int] = None
+
+
+class TaskScheduler:
+    def __init__(
+        self,
+        *,
+        task_store: TaskStore,
+        run_store: RunStore,
+        driver: CodexDriver,
+        config: SchedulerConfig,
+        worktree_factory: Callable[..., Path] = create_worker_worktree,
+        orchestrator_factory: Optional[Callable[[], OrchestratorLike]] = None,
+    ) -> None:
+        self.task_store = task_store
+        self.run_store = run_store
+        self.driver = driver
+        self.config = config
+        self.worktree_factory = worktree_factory
+        self._orchestrator_factory = orchestrator_factory or self._default_orchestrator
+
+    def run(self) -> TaskQueue:
+        queue = self.task_store.load()
+        orchestrator = self._orchestrator_factory()
+        processed = 0
+
+        while True:
+            if self.config.max_tasks is not None and processed >= self.config.max_tasks:
+                if queue.status == QUEUE_RUNNING:
+                    queue.status = QUEUE_PENDING
+                    self.task_store.save(queue)
+                return queue
+
+            task = self._first_incomplete_task(queue)
+            if task is None:
+                queue.status = QUEUE_APPROVED
+                self.task_store.save(queue)
+                return queue
+            if task.status == TASK_FAILED:
+                queue.status = QUEUE_FAILED
+                self.task_store.save(queue)
+                return queue
+            if task.status == TASK_BLOCKED:
+                queue.status = QUEUE_BLOCKED
+                self.task_store.save(queue)
+                return queue
+            if task.status == TASK_RUNNING:
+                queue.status = QUEUE_RUNNING
+                self.task_store.save(queue)
+                return queue
+            if task.status != TASK_PENDING:
+                queue.status = QUEUE_FAILED
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_FAILED,
+                    reason=f"unsupported task status: {task.status}",
+                )
+                self.task_store.save(queue)
+                return queue
+
+            queue.status = QUEUE_RUNNING
+            self.task_store.update_task(
+                queue,
+                task.task_id,
+                status=TASK_RUNNING,
+                error=None,
+                reason=None,
+            )
+            self.task_store.save(queue)
+
+            try:
+                manifest = self.run_store.create_run(
+                    cwd=self.config.cwd,
+                    user_task=task.prompt,
+                    planner_model=self.config.planner_model,
+                    worker_model=self.config.worker_model,
+                    codex_binary_path=self.config.codex_binary_path,
+                    planner_reasoning_effort=self.config.planner_reasoning_effort,
+                    worker_reasoning_effort=self.config.worker_reasoning_effort,
+                    planner_service_tier=self.config.planner_service_tier,
+                    worker_service_tier=self.config.worker_service_tier,
+                )
+                worker = manifest.workers[0]
+                worker.worktree_path = str(
+                    self.worktree_factory(
+                        repo_path=self.config.cwd,
+                        worktrees_dir=self.config.worktrees_dir,
+                        run_id=manifest.run_id,
+                        worker_id=worker.id,
+                    )
+                )
+                self.run_store.save(manifest)
+                run_ids = list(task.run_ids)
+                run_ids.append(manifest.run_id)
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    active_run_id=manifest.run_id,
+                    run_ids=run_ids,
+                )
+                self.task_store.save(queue)
+            except Exception as exc:
+                queue.status = QUEUE_FAILED
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_FAILED,
+                    error=str(exc),
+                    reason="run_prepare_failed",
+                )
+                self.task_store.save(queue)
+                raise
+
+            try:
+                manifest = orchestrator.run(manifest)
+            except Exception as exc:
+                queue.status = QUEUE_FAILED
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_FAILED,
+                    error=str(exc),
+                    reason="orchestrator_exception",
+                )
+                self.task_store.save(queue)
+                raise
+
+            if manifest.status == RUN_APPROVED:
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_APPROVED,
+                    completed_at=self.run_store.now_iso(),
+                    error=None,
+                    reason=None,
+                )
+                if manifest.requires_restart:
+                    queue.status = QUEUE_RESTART_REQUIRED
+                    self.task_store.save(queue)
+                    return queue
+                queue.status = QUEUE_PENDING
+                self.task_store.save(queue)
+                processed += 1
+                continue
+
+            if manifest.status == RUN_BLOCKED:
+                queue.status = QUEUE_BLOCKED
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_BLOCKED,
+                    reason=manifest.status,
+                )
+                self.task_store.save(queue)
+                return queue
+
+            queue.status = QUEUE_FAILED
+            self.task_store.update_task(
+                queue,
+                task.task_id,
+                status=TASK_FAILED,
+                reason=manifest.status or RUN_FAILED,
+            )
+            self.task_store.save(queue)
+            return queue
+
+    def _first_incomplete_task(self, queue: TaskQueue):
+        for task in queue.tasks:
+            if task.status != TASK_APPROVED:
+                return task
+        return None
+
+    def _default_orchestrator(self) -> RunOrchestrator:
+        return RunOrchestrator(
+            store=self.run_store,
+            driver=self.driver,
+            config=OrchestratorConfig(
+                sandbox=self.config.sandbox,
+                approval_policy=self.config.approval_policy,
+                max_attempts=self.config.max_attempts,
+                require_plan_approval=False,
+                approve_plan=False,
+            ),
+        )

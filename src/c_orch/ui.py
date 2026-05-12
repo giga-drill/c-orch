@@ -12,6 +12,7 @@ from .codex_session_logs import CodexSessionLogStore
 from .run_store import RunStore
 from .settings import DEFAULT_UI_HOST, DEFAULT_UI_PORT
 from .states import RUN_STATUS_ORDER, TERMINAL_RUN_STATUSES
+from .task_store import TaskStore
 
 
 Pathish = Union[str, Path]
@@ -20,10 +21,11 @@ Pathish = Union[str, Path]
 def serve_dashboard(
     *,
     runs_dir: Pathish,
+    queue_path: Optional[Pathish] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
 ) -> None:
-    server = build_server(runs_dir=runs_dir, host=host, port=port)
+    server = build_server(runs_dir=runs_dir, queue_path=queue_path, host=host, port=port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -35,15 +37,17 @@ def serve_dashboard(
 def build_server(
     *,
     runs_dir: Pathish,
+    queue_path: Optional[Pathish] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
 ) -> ThreadingHTTPServer:
     runs_path = Path(runs_dir).expanduser().resolve()
-    handler = make_dashboard_handler(runs_path)
+    queue_file = Path(queue_path).expanduser().resolve() if queue_path is not None else None
+    handler = make_dashboard_handler(runs_path, queue_file)
     return ThreadingHTTPServer((host, port), handler)
 
 
-def make_dashboard_handler(runs_dir: Path) -> Type[BaseHTTPRequestHandler]:
+def make_dashboard_handler(runs_dir: Path, queue_path: Optional[Path]) -> Type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
@@ -52,6 +56,9 @@ def make_dashboard_handler(runs_dir: Path) -> Type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/runs":
                 self._send_json(HTTPStatus.OK, build_runs_payload(runs_dir))
+                return
+            if path == "/api/queue":
+                self._send_json(HTTPStatus.OK, build_queue_payload(queue_path))
                 return
             if path.startswith("/api/runs/"):
                 run_id = unquote(path[len("/api/runs/"):])
@@ -182,6 +189,50 @@ def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
         "runs_dir": str(runs_path),
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "runs": runs,
+    }
+
+
+def build_queue_payload(queue_path: Optional[Pathish]) -> Dict[str, Any]:
+    generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    if queue_path is None:
+        return {
+            "queue_file": None,
+            "generated_at": generated_at,
+            "queue": None,
+            "tasks": [],
+        }
+    queue_file = Path(queue_path).expanduser().resolve()
+    store = TaskStore(queue_file)
+    try:
+        queue = store.load()
+    except (OSError, ValueError):
+        return {
+            "queue_file": str(queue_file),
+            "generated_at": generated_at,
+            "queue": None,
+            "tasks": [],
+        }
+    return {
+        "queue_file": str(queue_file),
+        "generated_at": generated_at,
+        "queue": {
+            "queue_id": queue.queue_id,
+            "status": queue.status,
+            "created_at": queue.created_at,
+            "updated_at": queue.updated_at,
+        },
+        "tasks": [
+            {
+                "task_id": task.task_id,
+                "title": task.title,
+                "status": task.status,
+                "active_run_id": task.active_run_id,
+                "run_ids": list(task.run_ids),
+                "updated_at": task.updated_at,
+                "completed_at": task.completed_at,
+            }
+            for task in queue.tasks
+        ],
     }
 
 
@@ -472,6 +523,33 @@ INDEX_HTML = """<!doctype html>
       overflow: auto;
       padding-right: 3px;
     }
+    .queueBlock {
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .queueList {
+      display: grid;
+      gap: 6px;
+      max-height: 32vh;
+      overflow: auto;
+      padding-right: 3px;
+    }
+    .queueItem {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 8px;
+      display: grid;
+      gap: 4px;
+    }
+    .queueTop {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
     .runItem {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -665,6 +743,11 @@ INDEX_HTML = """<!doctype html>
         <button id="refreshBtn" type="button">刷新</button>
       </div>
       <div class="list" id="runList"></div>
+      <section class="queueBlock">
+        <h3>Task Queue</h3>
+        <p class="meta" id="queueMeta"></p>
+        <div class="queueList" id="queueList"></div>
+      </section>
     </aside>
     <main>
       <div class="detailTop">
@@ -693,6 +776,8 @@ INDEX_HTML = """<!doctype html>
       "DONE"
     ];
     const statusText = {
+      PENDING: "待执行",
+      RUNNING: "执行中",
       NEW: "新建",
       PLANNING: "规划中",
       PLAN_READY: "方案已生成",
@@ -705,13 +790,17 @@ INDEX_HTML = """<!doctype html>
       REVIEW_RETRYABLE: "复核可重试",
       APPROVED: "已通过",
       BLOCKED: "阻塞",
-      FAILED: "失败"
+      FAILED: "失败",
+      RESTART_REQUIRED: "需要重启"
     };
     let runs = [];
+    let queueData = null;
     let selected = null;
 
     const els = {
       runList: document.getElementById("runList"),
+      queueMeta: document.getElementById("queueMeta"),
+      queueList: document.getElementById("queueList"),
       runsDir: document.getElementById("runsDir"),
       refreshBtn: document.getElementById("refreshBtn"),
       detail: document.getElementById("detail"),
@@ -734,11 +823,37 @@ INDEX_HTML = """<!doctype html>
         selected = runs[0] ? runs[0].run_id : null;
       }
       renderList();
+      await loadQueue();
       if (selected) {
         await loadRun(selected);
       } else {
         renderEmpty();
       }
+    }
+
+    async function loadQueue() {
+      const response = await fetch("/api/queue", { cache: "no-store" });
+      const payload = await response.json();
+      queueData = payload;
+      const queue = payload.queue;
+      if (!queue) {
+        els.queueMeta.textContent = payload.queue_file ? `未加载: ${payload.queue_file}` : "未配置 queue file";
+        els.queueList.innerHTML = `<div class="meta">暂无任务队列。</div>`;
+        return;
+      }
+      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${payload.queue_file || ""}`;
+      const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+      els.queueList.innerHTML = tasks.map(task => `
+        <article class="queueItem">
+          <div class="queueTop">
+            <span class="runId">${escapeHtml(task.task_id || "")}</span>
+            <span class="badge ${escapeHtml(task.status || "")}">${escapeHtml(formatStatus(task.status || ""))}</span>
+          </div>
+          <div>${escapeHtml(task.title || "")}</div>
+          <div class="meta">run: ${escapeHtml(task.active_run_id || "-")}</div>
+          <div class="meta">runs: ${escapeHtml((task.run_ids || []).join(", "))}</div>
+        </article>
+      `).join("") || `<div class="meta">暂无任务。</div>`;
     }
 
     function renderList() {

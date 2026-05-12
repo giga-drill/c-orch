@@ -212,8 +212,124 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Port for the local dashboard.",
     )
+    ui.add_argument(
+        "--queue-file",
+        default=None,
+        help="Optional task queue file for dashboard queue view.",
+    )
+
+    queue = subparsers.add_parser(
+        "queue",
+        help="Manage and execute a serial task queue.",
+    )
+    queue_subparsers = queue.add_subparsers(dest="queue_command", required=True)
+
+    queue_import = queue_subparsers.add_parser(
+        "import",
+        help="Import tasks JSON into queue storage.",
+    )
+    queue_import.add_argument("tasks_json", help="Path to tasks JSON file.")
+    queue_import.add_argument("--cwd", default=".", help="Target repository path.")
+    queue_import.add_argument("--queue-file", default=None, help="Queue JSON path.")
+
+    queue_status = queue_subparsers.add_parser(
+        "status",
+        help="Show queue and task status.",
+    )
+    queue_status.add_argument("--cwd", default=".", help="Target repository path.")
+    queue_status.add_argument("--queue-file", default=None, help="Queue JSON path.")
+    queue_status.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+
+    queue_run = queue_subparsers.add_parser(
+        "run",
+        help="Run queue tasks serially from the first PENDING task.",
+    )
+    _add_queue_run_arguments(queue_run)
+
+    queue_resume = queue_subparsers.add_parser(
+        "resume",
+        help="Alias of queue run; queue run is already idempotent.",
+    )
+    _add_queue_run_arguments(queue_resume)
 
     return parser
+
+
+def _add_queue_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cwd", default=".", help="Target repository path.")
+    parser.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    parser.add_argument("--queue-file", default=None, help="Queue JSON path.")
+    parser.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
+    parser.add_argument("--runs-dir", default=None, help="Run manifest directory.")
+    parser.add_argument(
+        "--worktrees-dir",
+        default=None,
+        help="Worker worktree root. Relative paths resolve under --cwd.",
+    )
+    parser.add_argument(
+        "--planner-model",
+        default=None,
+        help=(
+            "Planner model override "
+            f"(default: first available of {', '.join(DEFAULT_PLANNER_MODELS)})."
+        ),
+    )
+    parser.add_argument(
+        "--worker-model",
+        default=None,
+        help=f"Worker model (default: {DEFAULT_WORKER_MODEL}).",
+    )
+    parser.add_argument(
+        "--planner-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help=(
+            "Planner reasoning effort passed as Codex model_reasoning_effort "
+            f"(default: {DEFAULT_PLANNER_REASONING_EFFORT})."
+        ),
+    )
+    parser.add_argument(
+        "--worker-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help="Worker reasoning effort passed as Codex model_reasoning_effort.",
+    )
+    parser.add_argument(
+        "--planner-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Planner service tier.",
+    )
+    parser.add_argument(
+        "--worker-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Worker service tier.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="Maximum Worker attempts including the initial attempt.",
+    )
+    parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=None,
+        help="Maximum tasks to execute in this invocation.",
+    )
+    parser.add_argument(
+        "--sandbox",
+        default=None,
+        choices=SANDBOX_CHOICES,
+        help="Sandbox mode passed to Codex MCP sessions.",
+    )
+    parser.add_argument(
+        "--approval-policy",
+        default=None,
+        choices=APPROVAL_POLICY_CHOICES,
+        help="Approval policy passed to Codex MCP sessions.",
+    )
 
 
 def run_doctor(args: argparse.Namespace) -> int:
@@ -245,9 +361,76 @@ def run_doctor(args: argparse.Namespace) -> int:
     return 0 if report.selected and report.selected.usable else 1
 
 
-def run_prepare(args: argparse.Namespace) -> int:
-    from .config import load_project_config
+def _resolve_execution_config(
+    args: argparse.Namespace,
+    *,
+    cwd: Path,
+) -> dict[str, Any]:
     from .codex_discovery import choose_first_available_model, inspect_codex_environment
+    from .config import load_project_config
+
+    project_config = load_project_config(cwd=cwd, config_path=getattr(args, "config", None))
+    codex_bin = getattr(args, "codex_bin", None) or project_config.codex_bin
+    report = inspect_codex_environment(explicit_codex_bin=codex_bin)
+    if not report.selected:
+        raise ValueError("No usable Codex binary found. Run `c-orch doctor` for details.")
+
+    planner_models = (
+        [args.planner_model]
+        if getattr(args, "planner_model", None)
+        else project_config.planner_preferred_models
+    )
+    planner_model = choose_first_available_model(report.selected, planner_models)
+    if not planner_model:
+        raise ValueError(f"No planner model found in selected Codex binary: {report.selected.path}")
+
+    worker_model = args.worker_model or project_config.worker.model or DEFAULT_WORKER_MODEL
+    if not report.selected.has_model(worker_model):
+        raise ValueError(
+            f"Worker model {worker_model!r} was not found in selected Codex binary: {report.selected.path}"
+        )
+
+    return {
+        "project_config": project_config,
+        "codex_path": report.selected.path,
+        "planner_model": planner_model,
+        "worker_model": worker_model,
+        "runs_dir": _resolve_under_cwd(cwd, args.runs_dir or project_config.run.runs_dir),
+        "worktrees_dir": _resolve_under_cwd(cwd, args.worktrees_dir or project_config.run.worktrees_dir),
+        "planner_reasoning_effort": _first_value(
+            getattr(args, "planner_reasoning_effort", None),
+            project_config.planner.reasoning_effort,
+            DEFAULT_PLANNER_REASONING_EFFORT,
+        ),
+        "worker_reasoning_effort": _first_value(
+            getattr(args, "worker_reasoning_effort", None),
+            project_config.worker.reasoning_effort,
+        ),
+        "planner_service_tier": _first_value(
+            getattr(args, "planner_service_tier", None),
+            project_config.planner.service_tier,
+        ),
+        "worker_service_tier": _first_value(
+            getattr(args, "worker_service_tier", None),
+            project_config.worker.service_tier,
+        ),
+        "max_attempts": args.max_attempts or project_config.run.max_attempts,
+        "sandbox": args.sandbox or project_config.run.sandbox,
+        "approval_policy": args.approval_policy or project_config.run.approval_policy,
+    }
+
+
+def _default_queue_file(cwd: Path) -> Path:
+    return cwd / ".c-orch" / "tasks" / "queue.json"
+
+
+def _resolve_queue_path(cwd: Path, queue_file: Optional[str]) -> Path:
+    if not queue_file:
+        return _default_queue_file(cwd)
+    return _resolve_under_cwd(cwd, queue_file)
+
+
+def run_prepare(args: argparse.Namespace) -> int:
     from .mcp_driver import McpCodexDriver
     from .orchestrator import run_single_worker
     from .run_store import RunStore
@@ -255,76 +438,27 @@ def run_prepare(args: argparse.Namespace) -> int:
 
     cwd = Path(args.cwd).expanduser().resolve()
     try:
-        project_config = load_project_config(cwd=cwd, config_path=args.config)
+        config = _resolve_execution_config(args, cwd=cwd)
     except ValueError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
-
-    codex_bin = args.codex_bin or project_config.codex_bin
-    report = inspect_codex_environment(explicit_codex_bin=codex_bin)
-    if not report.selected:
-        print("No usable Codex binary found. Run `c-orch doctor` for details.", file=sys.stderr)
-        return 1
-
-    planner_models = [args.planner_model] if args.planner_model else project_config.planner_preferred_models
-    planner_model = choose_first_available_model(
-        report.selected,
-        planner_models,
-    )
-    if not planner_model:
-        print(
-            f"No planner model found in selected Codex binary: {report.selected.path}",
-            file=sys.stderr,
-        )
-        return 1
-    worker_model = args.worker_model or project_config.worker.model or DEFAULT_WORKER_MODEL
-    if not report.selected.has_model(worker_model):
-        print(
-            f"Worker model {worker_model!r} was not found in selected Codex binary: {report.selected.path}",
-            file=sys.stderr,
-        )
-        return 1
-
-    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.run.runs_dir)
-    worktrees_dir = _resolve_under_cwd(cwd, args.worktrees_dir or project_config.run.worktrees_dir)
-    planner_reasoning_effort = _first_value(
-        args.planner_reasoning_effort,
-        project_config.planner.reasoning_effort,
-        DEFAULT_PLANNER_REASONING_EFFORT,
-    )
-    worker_reasoning_effort = _first_value(
-        args.worker_reasoning_effort,
-        project_config.worker.reasoning_effort,
-    )
-    planner_service_tier = _first_value(
-        args.planner_service_tier,
-        project_config.planner.service_tier,
-    )
-    worker_service_tier = _first_value(
-        args.worker_service_tier,
-        project_config.worker.service_tier,
-    )
-    max_attempts = args.max_attempts or project_config.run.max_attempts
-    sandbox = args.sandbox or project_config.run.sandbox
-    approval_policy = args.approval_policy or project_config.run.approval_policy
-
-    store = RunStore(runs_dir)
+    store = RunStore(config["runs_dir"])
     manifest = store.create_run(
         cwd=cwd,
         user_task=args.task,
-        planner_model=planner_model,
-        worker_model=worker_model,
-        codex_binary_path=report.selected.path,
-        planner_reasoning_effort=planner_reasoning_effort,
-        worker_reasoning_effort=worker_reasoning_effort,
-        planner_service_tier=planner_service_tier,
-        worker_service_tier=worker_service_tier,
+        planner_model=config["planner_model"],
+        worker_model=config["worker_model"],
+        codex_binary_path=config["codex_path"],
+        planner_reasoning_effort=config["planner_reasoning_effort"],
+        worker_reasoning_effort=config["worker_reasoning_effort"],
+        planner_service_tier=config["planner_service_tier"],
+        worker_service_tier=config["worker_service_tier"],
     )
     worker = manifest.workers[0]
     worker.worktree_path = str(
         create_worker_worktree(
             repo_path=cwd,
-            worktrees_dir=worktrees_dir,
+            worktrees_dir=config["worktrees_dir"],
             run_id=manifest.run_id,
             worker_id=worker.id,
         )
@@ -333,14 +467,14 @@ def run_prepare(args: argparse.Namespace) -> int:
 
     if not args.prepare_only:
         try:
-            with McpCodexDriver(codex_bin=report.selected.path) as driver:
+            with McpCodexDriver(codex_bin=config["codex_path"]) as driver:
                 manifest = run_single_worker(
                     manifest=manifest,
                     store=store,
                     driver=driver,
-                    max_attempts=max_attempts,
-                    sandbox=sandbox,
-                    approval_policy=approval_policy,
+                    max_attempts=config["max_attempts"],
+                    sandbox=config["sandbox"],
+                    approval_policy=config["approval_policy"],
                     require_plan_approval=not args.auto_approve_plan,
                 )
         except Exception as exc:
@@ -350,9 +484,9 @@ def run_prepare(args: argparse.Namespace) -> int:
             _print_run_summary(
                 manifest=manifest,
                 manifest_path=store.manifest_path(manifest.run_id),
-                codex_path=report.selected.path,
-                planner_model=planner_model,
-                worker_model=worker_model,
+                codex_path=config["codex_path"],
+                planner_model=config["planner_model"],
+                worker_model=config["worker_model"],
             )
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -360,9 +494,9 @@ def run_prepare(args: argparse.Namespace) -> int:
     _print_run_summary(
         manifest=manifest,
         manifest_path=store.manifest_path(manifest.run_id),
-        codex_path=report.selected.path,
-        planner_model=planner_model,
-        worker_model=worker_model,
+        codex_path=config["codex_path"],
+        planner_model=config["planner_model"],
+        worker_model=config["worker_model"],
     )
     return 0
 
@@ -488,6 +622,132 @@ def run_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_queue_import(args: argparse.Namespace) -> int:
+    from .task_store import TaskStore
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    tasks_path = _resolve_under_cwd(cwd, args.tasks_json)
+    try:
+        payload = json.loads(tasks_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"failed to read tasks file: {exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"invalid tasks json: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, list):
+        print("tasks json must be an array", file=sys.stderr)
+        return 1
+
+    store = TaskStore(queue_path=queue_path)
+    try:
+        queue = store.import_tasks(payload)
+    except ValueError as exc:
+        print(f"queue import error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"queue_file: {queue_path}")
+    print(f"queue_id: {queue.queue_id}")
+    print(f"tasks: {len(queue.tasks)}")
+    return 0
+
+
+def run_queue_status(args: argparse.Namespace) -> int:
+    from .task_store import TaskStore
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    store = TaskStore(queue_path=queue_path)
+    try:
+        queue = store.load()
+    except OSError:
+        print(f"queue file not found: {queue_path}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"queue load error: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "queue_file": str(queue_path),
+        "queue": queue.to_dict(),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"queue_file: {queue_path}")
+    print(f"queue_id: {queue.queue_id}")
+    print(f"status: {queue.status}")
+    for task in queue.tasks:
+        print(
+            f"- {task.task_id} [{task.status}] run={task.active_run_id or '-'} "
+            f"title={task.title}"
+        )
+    return 0
+
+
+def run_queue_run(args: argparse.Namespace) -> int:
+    from .mcp_driver import McpCodexDriver
+    from .run_store import RunStore
+    from .scheduler import SchedulerConfig, TaskScheduler
+    from .task_store import TaskStore
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    try:
+        config = _resolve_execution_config(args, cwd=cwd)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+
+    task_store = TaskStore(queue_path=queue_path)
+    try:
+        task_store.load()
+    except OSError:
+        print(f"queue file not found: {queue_path}. run `c-orch queue import ...` first.", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"queue load error: {exc}", file=sys.stderr)
+        return 1
+
+    run_store = RunStore(config["runs_dir"])
+    scheduler_config = SchedulerConfig(
+        cwd=cwd,
+        runs_dir=config["runs_dir"],
+        worktrees_dir=config["worktrees_dir"],
+        planner_model=config["planner_model"],
+        worker_model=config["worker_model"],
+        codex_binary_path=config["codex_path"],
+        planner_reasoning_effort=config["planner_reasoning_effort"],
+        worker_reasoning_effort=config["worker_reasoning_effort"],
+        planner_service_tier=config["planner_service_tier"],
+        worker_service_tier=config["worker_service_tier"],
+        max_attempts=config["max_attempts"],
+        sandbox=config["sandbox"],
+        approval_policy=config["approval_policy"],
+        max_tasks=args.max_tasks,
+    )
+    try:
+        with McpCodexDriver(codex_bin=config["codex_path"]) as driver:
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=driver,
+                config=scheduler_config,
+            )
+            queue = scheduler.run()
+    except Exception as exc:
+        print(f"queue run error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"queue_file: {queue_path}")
+    print(f"status: {queue.status}")
+    for task in queue.tasks:
+        print(f"- {task.task_id} [{task.status}] run={task.active_run_id or '-'}")
+    return 0
+
+
 def run_ui(args: argparse.Namespace) -> int:
     from .config import load_project_config
     from .ui import serve_dashboard
@@ -499,11 +759,14 @@ def run_ui(args: argparse.Namespace) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
     runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.ui.runs_dir)
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
     host = args.host or project_config.ui.host
     port = args.port or project_config.ui.port
     print(f"c-orch UI: http://{host}:{port}", flush=True)
     print(f"runs_dir: {runs_dir}", flush=True)
-    serve_dashboard(runs_dir=runs_dir, host=host, port=port)
+    if args.queue_file is not None:
+        print(f"queue_file: {queue_path}", flush=True)
+    serve_dashboard(runs_dir=runs_dir, queue_path=queue_path, host=host, port=port)
     return 0
 
 
@@ -582,6 +845,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_resume(args)
     if args.command == "ui":
         return run_ui(args)
+    if args.command == "queue":
+        if args.queue_command == "import":
+            return run_queue_import(args)
+        if args.queue_command == "status":
+            return run_queue_status(args)
+        if args.queue_command in {"run", "resume"}:
+            return run_queue_run(args)
+        parser.error(f"unknown queue command: {args.queue_command}")
+        return 2
     parser.error(f"unknown command: {args.command}")
     return 2
 

@@ -78,13 +78,55 @@ class CliTests(unittest.TestCase):
 
     def test_ui_command_parses(self) -> None:
         args = build_parser().parse_args(
-            ["ui", "--cwd", "repo", "--runs-dir", "runs", "--host", "0.0.0.0", "--port", "7777"]
+            [
+                "ui",
+                "--cwd",
+                "repo",
+                "--runs-dir",
+                "runs",
+                "--queue-file",
+                ".c-orch/tasks/queue.json",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "7777",
+            ]
         )
         self.assertEqual(args.command, "ui")
         self.assertEqual(args.cwd, "repo")
         self.assertEqual(args.runs_dir, "runs")
+        self.assertEqual(args.queue_file, ".c-orch/tasks/queue.json")
         self.assertEqual(args.host, "0.0.0.0")
         self.assertEqual(args.port, 7777)
+
+    def test_queue_import_command_parses(self) -> None:
+        args = build_parser().parse_args(
+            ["queue", "import", "tasks.json", "--cwd", "repo", "--queue-file", "queue.json"]
+        )
+        self.assertEqual(args.command, "queue")
+        self.assertEqual(args.queue_command, "import")
+        self.assertEqual(args.tasks_json, "tasks.json")
+        self.assertEqual(args.cwd, "repo")
+        self.assertEqual(args.queue_file, "queue.json")
+
+    def test_queue_run_command_parses(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "queue",
+                "run",
+                "--cwd",
+                "repo",
+                "--max-tasks",
+                "2",
+                "--sandbox",
+                "read-only",
+            ]
+        )
+        self.assertEqual(args.command, "queue")
+        self.assertEqual(args.queue_command, "run")
+        self.assertEqual(args.cwd, "repo")
+        self.assertEqual(args.max_tasks, 2)
+        self.assertEqual(args.sandbox, "read-only")
 
 
 if __name__ == "__main__":
