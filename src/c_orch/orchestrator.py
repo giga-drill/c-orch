@@ -46,6 +46,12 @@ from .worktrees import (
 
 
 Pathish = Union[str, Path]
+RESTART_REQUIRED_PREFIXES = ("src/c_orch/",)
+RESTART_REQUIRED_EXACT_PATHS = {
+    "src/c_orch",
+    "pyproject.toml",
+    ".c-orch.toml",
+}
 
 
 class OrchestratorError(RuntimeError):
@@ -695,6 +701,15 @@ class RunOrchestrator:
                 manifest.review.evidence_files,
                 apply_report.evidence_files,
             )
+        restart_paths: List[str] = []
+        if apply_report.applied:
+            restart_paths = self._restart_trigger_paths(evidence.changed_paths)
+            if restart_paths:
+                manifest.requires_restart = True
+                manifest.restart_reason = (
+                    "Applied diff touched c-orch runtime code or critical config."
+                )
+                manifest.restart_paths = _append_unique(manifest.restart_paths, restart_paths)
         self._save(manifest)
         self._record_event(
             manifest,
@@ -703,7 +718,29 @@ class RunOrchestrator:
             applied=apply_report.applied,
             summary=apply_report.summary,
         )
+        if apply_report.applied and restart_paths:
+            self._record_event(
+                manifest,
+                "restart_required",
+                "Run applied self-modifying changes; restart before next queued work.",
+                restart_reason=manifest.restart_reason,
+                restart_paths=manifest.restart_paths,
+            )
         return apply_report
+
+    def _restart_trigger_paths(self, changed_paths: List[str]) -> List[str]:
+        matched: List[str] = []
+        seen = set()
+        for raw_path in changed_paths:
+            normalized = _normalize_repo_path(raw_path)
+            if (
+                normalized in RESTART_REQUIRED_EXACT_PATHS
+                or any(normalized.startswith(prefix) for prefix in RESTART_REQUIRED_PREFIXES)
+            ):
+                if raw_path not in seen:
+                    matched.append(raw_path)
+                    seen.add(raw_path)
+        return matched
 
 
 def run_single_worker(
@@ -821,6 +858,7 @@ def _evidence_from_review_record(review: ReviewRecord) -> DiffEvidence:
         patch_path=patch_path,
         summary=summary,
         patch=patch,
+        changed_paths=_changed_paths_from_patch(patch),
     )
 
 
@@ -860,3 +898,30 @@ def _append_unique(existing: List[str], new_values: List[str]) -> List[str]:
             values.append(value)
             seen.add(value)
     return values
+
+
+def _normalize_repo_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _changed_paths_from_patch(patch: str) -> List[str]:
+    paths: List[str] = []
+    seen = set()
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split(" ")
+        if len(parts) < 4:
+            continue
+        candidate = parts[3]
+        if candidate.startswith("b/"):
+            candidate = candidate[2:]
+        elif parts[2].startswith("a/"):
+            candidate = parts[2][2:]
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            paths.append(candidate)
+    return paths

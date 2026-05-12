@@ -252,6 +252,9 @@ def _summarize_manifest(
         "status": status,
         "status_index": RUN_STATUS_ORDER.get(status, 0),
         "terminal": status in TERMINAL_RUN_STATUSES,
+        "requires_restart": bool(manifest.get("requires_restart", False)),
+        "restart_reason": manifest.get("restart_reason"),
+        "restart_paths": _list_value(manifest.get("restart_paths")),
         "user_task": str(manifest.get("user_task", "")),
         "cwd": str(manifest.get("cwd", "")),
         "created_at": created_at,
@@ -787,6 +790,8 @@ INDEX_HTML = """<!doctype html>
       const run = payload.run;
       const manifest = payload.manifest;
       const events = Array.isArray(payload.events) ? payload.events : [];
+      const restartRequired = Boolean(manifest.requires_restart);
+      const restartPaths = Array.isArray(manifest.restart_paths) ? manifest.restart_paths : [];
       els.detailTitle.textContent = run.run_id;
       els.detailBadge.className = `badge ${run.status}`;
       els.detailBadge.textContent = formatStatus(run.status);
@@ -888,6 +893,9 @@ INDEX_HTML = """<!doctype html>
             ${kv("Planner 线程", (manifest.planner || {}).thread_id || "")}
             ${optionalKv("Planner 推理强度", (manifest.planner || {}).reasoning_effort)}
             ${optionalKv("Planner 响应速度", (manifest.planner || {}).service_tier)}
+            ${kv("需要重启", restartRequired ? "是" : "否")}
+            ${restartRequired && manifest.restart_reason ? kv("重启原因", manifest.restart_reason) : ""}
+            ${restartRequired && restartPaths.length ? kv("影响路径", restartPaths.join(", ")) : ""}
             ${kv("Codex", manifest.codex_binary_path || "")}
           </div>
         </div>

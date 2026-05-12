@@ -48,9 +48,15 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.workers[0].reasoning_effort, "medium")
             self.assertEqual(loaded.workers[0].service_tier, "flex")
             self.assertIsNone(loaded.plan)
+            self.assertFalse(loaded.requires_restart)
+            self.assertIsNone(loaded.restart_reason)
+            self.assertEqual(loaded.restart_paths, [])
 
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["run_id"], manifest.run_id)
+            self.assertFalse(raw["requires_restart"])
+            self.assertIsNone(raw["restart_reason"])
+            self.assertEqual(raw["restart_paths"], [])
 
     def test_save_updates_review_and_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,6 +182,28 @@ class RunStoreTests(unittest.TestCase):
             loaded = store.load_events("run-1")
             self.assertEqual(len(loaded), 2)
             self.assertEqual([event["type"] for event in loaded], ["planner_start", "worker_start"])
+
+    def test_load_legacy_manifest_defaults_restart_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Legacy manifest",
+                planner_model="planner-model",
+                worker_model="worker-model",
+            )
+            manifest_path = root / "runs" / manifest.run_id / "manifest.json"
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw.pop("requires_restart", None)
+            raw.pop("restart_reason", None)
+            raw.pop("restart_paths", None)
+            manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            loaded = store.load(manifest.run_id)
+            self.assertFalse(loaded.requires_restart)
+            self.assertIsNone(loaded.restart_reason)
+            self.assertEqual(loaded.restart_paths, [])
 
 
 if __name__ == "__main__":

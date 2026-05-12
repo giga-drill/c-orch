@@ -75,6 +75,8 @@ class WorktreeTests(unittest.TestCase):
             self.assertIn("new.txt", evidence.summary)
             self.assertIn("+changed", evidence.patch)
             self.assertIn("+new evidence", evidence.patch)
+            self.assertIn("README.md", evidence.changed_paths)
+            self.assertIn("new.txt", evidence.changed_paths)
             self.assertIn("?? new.txt", _git(worktree, ["status", "--short"]))
 
     def test_create_worker_worktree_requires_committed_base(self) -> None:

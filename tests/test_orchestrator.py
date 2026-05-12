@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import shlex
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +14,7 @@ from c_orch.drivers import SessionResult
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import RunStore
 from c_orch.verification import CommandVerification, VerificationReport
-from c_orch.worktrees import ApplyReport, DiffEvidence
+from c_orch.worktrees import ApplyReport, DiffEvidence, create_worker_worktree
 
 
 class FakeDriver:
@@ -57,8 +61,9 @@ class FakeDriver:
 
 
 class FakeEvidenceCollector:
-    def __init__(self) -> None:
+    def __init__(self, *, changed_paths: Optional[List[str]] = None) -> None:
         self.calls: List[Dict[str, Path]] = []
+        self.changed_paths = list(changed_paths or ["src/example.py"])
 
     def __call__(self, worktree_path: str, evidence_dir: Path) -> DiffEvidence:
         evidence_dir = Path(evidence_dir)
@@ -80,6 +85,7 @@ class FakeEvidenceCollector:
             patch_path=patch_path,
             summary=summary,
             patch=patch,
+            changed_paths=list(self.changed_paths),
         )
 
 
@@ -148,6 +154,74 @@ class FakeDiffApplier:
         )
 
 
+class RetryEndToEndDriver:
+    def __init__(self) -> None:
+        self.start_calls: List[Dict[str, Any]] = []
+        self.reply_calls: List[Dict[str, Any]] = []
+        self.worker_mutations: List[str] = []
+        self.review_count = 0
+        self.worker_cwd: Optional[Path] = None
+
+    def start_session(
+        self,
+        *,
+        role: str,
+        model: str,
+        cwd: str,
+        prompt: str,
+        sandbox: str,
+        approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.start_calls.append(
+            {
+                "role": role,
+                "model": model,
+                "cwd": cwd,
+                "prompt": prompt,
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
+        if role == "planner":
+            return _session("planner-thread", _retry_e2e_planner_plan())
+        if role == "worker":
+            self.worker_cwd = Path(cwd)
+            self._write_subtract_bug(self.worker_cwd)
+            return _session("worker-thread", _worker_result(summary="added subtract with a bug"))
+        raise AssertionError(f"unexpected role: {role}")
+
+    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
+        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+        if thread_id == "planner-thread":
+            self.review_count += 1
+            if self.review_count == 1:
+                return _session(
+                    "planner-thread",
+                    _review("needs_changes", "Fix subtract implementation so tests pass."),
+                )
+            return _session("planner-thread", _review("approved"))
+        if thread_id == "worker-thread":
+            if self.worker_cwd is None:
+                raise AssertionError("worker reply happened before worker start")
+            self._write_subtract_fix(self.worker_cwd)
+            return _session("worker-thread", _worker_result(summary="fixed subtract"))
+        raise AssertionError(f"unexpected thread_id: {thread_id}")
+
+    def _write_subtract_bug(self, worktree: Path) -> None:
+        _write_calculator(worktree / "calculator.py", subtract_expression="a - b - 1")
+        _write_calculator_tests(worktree / "tests" / "test_calculator.py", include_subtract=True)
+        self.worker_mutations.append("buggy-subtract")
+
+    def _write_subtract_fix(self, worktree: Path) -> None:
+        _write_calculator(worktree / "calculator.py", subtract_expression="a - b")
+        _write_calculator_tests(worktree / "tests" / "test_calculator.py", include_subtract=True)
+        self.worker_mutations.append("fixed-subtract")
+
+
 class OrchestratorTests(unittest.TestCase):
     def test_approved_flow_updates_manifest_and_uses_worker_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +282,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.review.decision, "approved")
             self.assertEqual(len(result.review.evidence_files), 4)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+            self.assertFalse(result.requires_restart)
+            self.assertIsNone(result.restart_reason)
+            self.assertEqual(result.restart_paths, [])
             self.assertEqual(len(result.workers[0].evidence_files), 4)
             self.assertEqual(len(applier.calls), 1)
             self.assertEqual(applier.calls[0]["target_repo_path"], Path(manifest.cwd))
@@ -220,6 +297,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(loaded.status, "APPROVED")
             self.assertEqual(loaded.review.decision, "approved")
             self.assertEqual(len(loaded.review.evidence_files), 4)
+            self.assertFalse(loaded.requires_restart)
+            self.assertIsNone(loaded.restart_reason)
+            self.assertEqual(loaded.restart_paths, [])
 
             events = store.load_events(manifest.run_id)
             self.assertEqual(
@@ -367,6 +447,124 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
 
+    @unittest.skipIf(shutil.which("git") is None, "git is not available")
+    def test_retry_flow_end_to_end_from_plan_gate_to_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _create_retry_e2e_repo(root / "repo")
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=repo,
+                user_task="Add subtract and tests, then fix review feedback.",
+                planner_model="planner-model",
+                worker_model="worker-model",
+            )
+            manifest.workers[0].worktree_path = str(
+                create_worker_worktree(
+                    repo,
+                    root / "worktrees",
+                    manifest.run_id,
+                    manifest.workers[0].id,
+                )
+            )
+            store.save(manifest)
+            driver = RetryEndToEndDriver()
+
+            paused = RunOrchestrator(
+                store=store,
+                driver=driver,
+                config=OrchestratorConfig(require_plan_approval=True, max_attempts=2),
+            ).run(manifest)
+            self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(paused.plan.approval_status, "pending")
+            self.assertEqual([call["role"] for call in driver.start_calls], ["planner"])
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                config=OrchestratorConfig(
+                    require_plan_approval=True,
+                    approve_plan=True,
+                    max_attempts=2,
+                ),
+            ).run(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(result.plan.approval_status, "approved")
+            self.assertEqual(result.workers[0].attempt, 2)
+            self.assertEqual(result.workers[0].thread_id, "worker-thread")
+            self.assertEqual(driver.worker_mutations, ["buggy-subtract", "fixed-subtract"])
+            self.assertEqual([call["role"] for call in driver.start_calls], ["planner", "worker"])
+            self.assertEqual(
+                [call["thread_id"] for call in driver.reply_calls],
+                ["planner-thread", "worker-thread", "planner-thread"],
+            )
+            self.assertIn("1 of 1 verification command(s) failed.", driver.reply_calls[0]["prompt"])
+            self.assertIn("Fix subtract implementation", driver.reply_calls[1]["prompt"])
+            self.assertIn("All 1 verification command(s) passed.", driver.reply_calls[2]["prompt"])
+            self.assertEqual(
+                [attempt.status for attempt in result.review_attempts],
+                ["NEEDS_CHANGES", "APPROVED"],
+            )
+            self.assertEqual(result.review.decision, "approved")
+
+            self.assertIn("def subtract(a, b):", (repo / "calculator.py").read_text(encoding="utf-8"))
+            self.assertIn(
+                "self.assertEqual(subtract(5, 3), 2)",
+                (repo / "tests" / "test_calculator.py").read_text(encoding="utf-8"),
+            )
+            self.assertIn("M calculator.py", _git(repo, ["status", "--short"]))
+            verification = subprocess.run(
+                _retry_e2e_verification_command(),
+                cwd=repo,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(verification.returncode, 0, verification.stdout + verification.stderr)
+
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertEqual(
+                event_types,
+                [
+                    "planner_start",
+                    "planner_plan_ready",
+                    "plan_review_required",
+                    "plan_approved",
+                    "worker_start",
+                    "worker_done",
+                    "evidence_collected",
+                    "verification_finished",
+                    "planner_review_start",
+                    "planner_review_completed",
+                    "worker_start",
+                    "worker_done",
+                    "evidence_collected",
+                    "verification_finished",
+                    "planner_review_start",
+                    "planner_review_completed",
+                    "apply_completed",
+                    "run_terminal_status",
+                ],
+            )
+            self.assertEqual(
+                [event.get("attempt") for event in events if event["type"] == "worker_start"],
+                [1, 2],
+            )
+            self.assertEqual(
+                [event.get("decision") for event in events if event["type"] == "planner_review_completed"],
+                ["needs_changes", "approved"],
+            )
+            self.assertEqual(
+                [event.get("summary") for event in events if event["type"] == "verification_finished"],
+                [
+                    "1 of 1 verification command(s) failed.",
+                    "All 1 verification command(s) passed.",
+                ],
+            )
+
     def test_needs_changes_after_max_attempts_fails_without_extra_worker_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -450,6 +648,84 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[-1]["type"], "run_terminal_status")
             self.assertEqual(events[-1]["status"], "FAILED")
             self.assertEqual(events[-1]["reason"], "apply_failed")
+            self.assertFalse(result.requires_restart)
+            self.assertIsNone(result.restart_reason)
+            self.assertEqual(result.restart_paths, [])
+
+    def test_self_modification_marks_restart_required_after_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("approved"))],
+            )
+            evidence = FakeEvidenceCollector(
+                changed_paths=[
+                    "src/c_orch/orchestrator.py",
+                    "docs/mcp-orchestrator-design.md",
+                ]
+            )
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertTrue(result.requires_restart)
+            self.assertEqual(
+                result.restart_reason,
+                "Applied diff touched c-orch runtime code or critical config.",
+            )
+            self.assertEqual(result.restart_paths, ["src/c_orch/orchestrator.py"])
+
+            events = store.load_events(manifest.run_id)
+            self.assertIn("restart_required", [event["type"] for event in events])
+            restart_event = next(event for event in events if event["type"] == "restart_required")
+            self.assertEqual(
+                restart_event["restart_paths"],
+                ["src/c_orch/orchestrator.py"],
+            )
+
+    def test_apply_failure_does_not_mark_restart_even_for_self_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("approved"))],
+            )
+            evidence = FakeEvidenceCollector(changed_paths=["src/c_orch/run_store.py"])
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier(applied=False)
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertFalse(result.requires_restart)
+            self.assertIsNone(result.restart_reason)
+            self.assertEqual(result.restart_paths, [])
+
+            events = store.load_events(manifest.run_id)
+            self.assertNotIn("restart_required", [event["type"] for event in events])
 
     def test_blocked_review_marks_run_blocked_and_logs_terminal_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +849,83 @@ def _create_manifest(root: Path):
     return store, manifest, worktree
 
 
+def _create_retry_e2e_repo(repo: Path) -> Path:
+    repo.mkdir()
+    (repo / "tests").mkdir()
+    _write_calculator(repo / "calculator.py", subtract_expression=None)
+    _write_calculator_tests(repo / "tests" / "test_calculator.py", include_subtract=False)
+    _git(repo, ["init"])
+    _git(repo, ["config", "user.email", "c-orch-test@example.com"])
+    _git(repo, ["config", "user.name", "c-orch test"])
+    _git(repo, ["add", "."])
+    _git(repo, ["commit", "-m", "initial"])
+    return repo
+
+
+def _write_calculator(path: Path, *, subtract_expression: Optional[str]) -> None:
+    lines = [
+        "def add(a, b):",
+        "    return a + b",
+        "",
+    ]
+    if subtract_expression is not None:
+        lines.extend(
+            [
+                "",
+                "def subtract(a, b):",
+                f"    return {subtract_expression}",
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_calculator_tests(path: Path, *, include_subtract: bool) -> None:
+    imports = "from calculator import add"
+    if include_subtract:
+        imports += ", subtract"
+    lines = [
+        "import unittest",
+        "",
+        imports,
+        "",
+        "",
+        "class CalculatorTests(unittest.TestCase):",
+        "    def test_add(self):",
+        "        self.assertEqual(add(2, 3), 5)",
+    ]
+    if include_subtract:
+        lines.extend(
+            [
+                "",
+                "    def test_subtract(self):",
+                "        self.assertEqual(subtract(5, 3), 2)",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    unittest.main()",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _git(cwd: Path, args: List[str]) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return completed.stdout
+
+
 def _session(thread_id: str, payload: str) -> SessionResult:
     return SessionResult(thread_id=thread_id, content=payload, raw={})
 
@@ -588,6 +941,26 @@ def _planner_plan() -> str:
             "risk_notes": [],
         }
     )
+
+
+def _retry_e2e_planner_plan() -> str:
+    return json.dumps(
+        {
+            "status": "plan_ready",
+            "summary": "Add subtract with tests",
+            "acceptance_criteria": [
+                "subtract(a, b) returns a - b",
+                "unit tests cover add and subtract",
+            ],
+            "worker_prompt": "Add subtract and tests.",
+            "verification_commands": [_retry_e2e_verification_command()],
+            "risk_notes": [],
+        }
+    )
+
+
+def _retry_e2e_verification_command() -> str:
+    return f"{shlex.quote(sys.executable)} -m unittest discover -s tests"
 
 
 def _worker_result(summary: str = "done") -> str:

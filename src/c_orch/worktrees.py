@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Union
 
@@ -16,6 +16,7 @@ class DiffEvidence:
     patch_path: Path
     summary: str
     patch: str
+    changed_paths: List[str] = field(default_factory=list)
 
     @property
     def evidence_files(self) -> List[str]:
@@ -79,6 +80,7 @@ def collect_diff_evidence(worktree_path: Pathish, evidence_dir: Pathish) -> Diff
             added_intent = True
         diff_stat = _git(["diff", "--stat", "HEAD", "--"], cwd=worktree)
         patch = _git(["diff", "--binary", "HEAD", "--"], cwd=worktree)
+        changed_paths = _git_z(["diff", "--name-only", "-z", "HEAD", "--"], cwd=worktree)
     finally:
         if added_intent:
             _git(["reset", "--mixed", "--", *untracked], cwd=worktree)
@@ -93,6 +95,7 @@ def collect_diff_evidence(worktree_path: Pathish, evidence_dir: Pathish) -> Diff
         patch_path=patch_path,
         summary=summary,
         patch=patch,
+        changed_paths=changed_paths,
     )
 
 

@@ -213,6 +213,9 @@ class RunManifest:
     created_at: str
     updated_at: str
     codex_binary_path: Optional[str] = None
+    requires_restart: bool = False
+    restart_reason: Optional[str] = None
+    restart_paths: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -230,6 +233,9 @@ class RunManifest:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "codex_binary_path": self.codex_binary_path,
+            "requires_restart": self.requires_restart,
+            "restart_reason": self.restart_reason,
+            "restart_paths": list(self.restart_paths),
         }
 
     @classmethod
@@ -258,6 +264,9 @@ class RunManifest:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             codex_binary_path=data.get("codex_binary_path"),
+            requires_restart=bool(data.get("requires_restart", False)),
+            restart_reason=data.get("restart_reason"),
+            restart_paths=_list_of_strings(data.get("restart_paths")),
         )
 
 

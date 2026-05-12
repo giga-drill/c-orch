@@ -65,6 +65,9 @@ class UiTests(unittest.TestCase):
             manifest.workers[0].evidence_files = [str(evidence_path)]
             manifest.workers[0].reasoning_effort = "medium"
             manifest.workers[0].service_tier = "flex"
+            manifest.requires_restart = True
+            manifest.restart_reason = "Touched runtime code"
+            manifest.restart_paths = ["src/c_orch/orchestrator.py"]
             manifest.review = ReviewRecord(
                 decision="approved",
                 reason="looks good",
@@ -90,6 +93,12 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
             self.assertEqual(payload["run"]["review_attempt_count"], 0)
             self.assertEqual(payload["run"]["evidence_count"], 1)
+            self.assertTrue(payload["run"]["requires_restart"])
+            self.assertEqual(payload["run"]["restart_reason"], "Touched runtime code")
+            self.assertEqual(payload["run"]["restart_paths"], ["src/c_orch/orchestrator.py"])
+            self.assertTrue(payload["manifest"]["requires_restart"])
+            self.assertEqual(payload["manifest"]["restart_reason"], "Touched runtime code")
+            self.assertEqual(payload["manifest"]["restart_paths"], ["src/c_orch/orchestrator.py"])
             self.assertEqual(payload["evidence_files"][0]["name"], "git-diff.patch")
             self.assertTrue(payload["evidence_files"][0]["exists"])
             self.assertEqual(payload["events"][0]["type"], "planner_start")
@@ -106,6 +115,9 @@ class UiTests(unittest.TestCase):
         self.assertIn("运行时间线", INDEX_HTML)
         self.assertIn("payload.events", INDEX_HTML)
         self.assertIn("Planner 推理强度", INDEX_HTML)
+        self.assertIn("需要重启", INDEX_HTML)
+        self.assertIn("重启原因", INDEX_HTML)
+        self.assertIn("影响路径", INDEX_HTML)
         self.assertIn("Worker 指令", INDEX_HTML)
         self.assertIn("Worker 活动", INDEX_HTML)
         self.assertIn("通过并启动 Worker", INDEX_HTML)
