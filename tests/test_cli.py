@@ -11,8 +11,8 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.command, "run")
         self.assertEqual(args.planner_model, None)
-        self.assertEqual(args.planner_reasoning_effort, "high")
-        self.assertEqual(args.worker_model, "gpt-5.3-codex-spark")
+        self.assertEqual(args.planner_reasoning_effort, None)
+        self.assertEqual(args.worker_model, None)
         self.assertFalse(args.auto_approve_plan)
 
     def test_run_command_parses_reasoning_and_service_tier(self) -> None:

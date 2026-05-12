@@ -16,13 +16,13 @@ and verification evidence, and asks the Planner to approve or request changes.
 Run from this repo without installing:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli doctor
+PYTHONPATH=src python3.11 -m c_orch.cli doctor
 ```
 
 Prepare a run without calling Codex:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli run \
+PYTHONPATH=src python3.11 -m c_orch.cli run \
   --prepare-only \
   --cwd /path/to/target-repo \
   "Implement feature X"
@@ -32,7 +32,7 @@ Run the single-worker MVP. By default this starts the Planner, saves the plan,
 and pauses for human approval before any Worker starts:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli run \
+PYTHONPATH=src python3.11 -m c_orch.cli run \
   --cwd /path/to/target-repo \
   "Implement feature X"
 ```
@@ -40,7 +40,7 @@ PYTHONPATH=src python3 -m c_orch.cli run \
 After reviewing the saved plan in the manifest or dashboard, continue:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli resume \
+PYTHONPATH=src python3.11 -m c_orch.cli resume \
   --cwd /path/to/target-repo \
   --approve-plan \
   <run_id>
@@ -49,7 +49,7 @@ PYTHONPATH=src python3 -m c_orch.cli resume \
 For smoke tests or trusted tiny changes, skip the approval gate:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli run \
+PYTHONPATH=src python3.11 -m c_orch.cli run \
   --auto-approve-plan \
   --cwd /path/to/target-repo \
   "Implement feature X"
@@ -58,7 +58,7 @@ PYTHONPATH=src python3 -m c_orch.cli run \
 Open the local run dashboard:
 
 ```bash
-PYTHONPATH=src python3 -m c_orch.cli ui \
+PYTHONPATH=src python3.11 -m c_orch.cli ui \
   --cwd /path/to/target-repo \
   --runs-dir runs
 ```
@@ -81,6 +81,31 @@ Common options:
 --approval-policy never
 --runs-dir runs
 --worktrees-dir .c-orch/worktrees
+```
+
+Project defaults can be stored in `.c-orch.toml` at the target repo root.
+Command-line flags override this file.
+
+```toml
+[planner]
+preferred_models = ["gpt-5.5", "gpt-5.4"]
+reasoning_effort = "high"
+service_tier = "fast"
+
+[worker]
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "medium"
+
+[run]
+max_attempts = 3
+sandbox = "workspace-write"
+approval_policy = "never"
+runs_dir = "runs"
+worktrees_dir = ".c-orch/worktrees"
+
+[ui]
+host = "127.0.0.1"
+port = 8765
 ```
 
 ## Codex Binary Selection

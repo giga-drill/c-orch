@@ -16,6 +16,26 @@ from .run_store import (
     RunStore,
     WorkerRecord,
 )
+from .settings import DEFAULT_APPROVAL_POLICY, DEFAULT_MAX_ATTEMPTS, DEFAULT_SANDBOX
+from .states import (
+    REVIEW_ATTEMPT_ACTIVE,
+    REVIEW_ATTEMPT_FAILED_RETRYABLE,
+    RUN_APPROVED,
+    RUN_BLOCKED,
+    RUN_FAILED,
+    RUN_NEEDS_CHANGES,
+    RUN_PLAN_APPROVED,
+    RUN_PLAN_READY,
+    RUN_PLAN_REVIEW_REQUIRED,
+    RUN_PLANNING,
+    RUN_REVIEW_RETRYABLE,
+    RUN_REVIEWING,
+    RUN_WORK_DONE,
+    RUN_WORKING,
+    TERMINAL_RUN_STATUSES,
+    WORKER_ACTIVE,
+    WORKER_DONE,
+)
 from .verification import VerificationReport, run_verification_commands
 from .worktrees import (
     ApplyReport,
@@ -26,9 +46,6 @@ from .worktrees import (
 
 
 Pathish = Union[str, Path]
-TERMINAL_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
-PLAN_REVIEW_REQUIRED = "PLAN_REVIEW_REQUIRED"
-REVIEW_RETRYABLE = "REVIEW_RETRYABLE"
 
 
 class OrchestratorError(RuntimeError):
@@ -63,9 +80,9 @@ class DiffApplier(Protocol):
 
 @dataclass(frozen=True)
 class OrchestratorConfig:
-    sandbox: str = "workspace-write"
-    approval_policy: str = "never"
-    max_attempts: int = 3
+    sandbox: str = DEFAULT_SANDBOX
+    approval_policy: str = DEFAULT_APPROVAL_POLICY
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     require_plan_approval: bool = False
     approve_plan: bool = False
 
@@ -96,8 +113,8 @@ class RunOrchestrator:
         try:
             return self._run(manifest)
         except Exception:
-            if manifest.status not in TERMINAL_STATUSES:
-                manifest.status = "FAILED"
+            if manifest.status not in TERMINAL_RUN_STATUSES:
+                manifest.status = RUN_FAILED
             try:
                 self._record_terminal_status(manifest, reason="exception")
             except Exception:
@@ -159,29 +176,29 @@ class RunOrchestrator:
                     evidence=evidence,
                 )
                 if apply_report.applied:
-                    manifest.status = "APPROVED"
-                    manifest.planner.status = "APPROVED"
-                    worker.status = "APPROVED"
+                    manifest.status = RUN_APPROVED
+                    manifest.planner.status = RUN_APPROVED
+                    worker.status = RUN_APPROVED
                     self._record_terminal_status(manifest)
                     self._save(manifest)
                     return manifest
-                manifest.status = "FAILED"
-                manifest.planner.status = "FAILED"
-                worker.status = "FAILED"
+                manifest.status = RUN_FAILED
+                manifest.planner.status = RUN_FAILED
+                worker.status = RUN_FAILED
                 self._record_terminal_status(manifest, reason="apply_failed")
                 self._save(manifest)
                 return manifest
 
             if decision.decision == "needs_changes":
                 if attempt >= self.config.max_attempts:
-                    manifest.status = "FAILED"
-                    manifest.planner.status = "FAILED"
-                    worker.status = "FAILED"
+                    manifest.status = RUN_FAILED
+                    manifest.planner.status = RUN_FAILED
+                    worker.status = RUN_FAILED
                     self._record_terminal_status(manifest, reason="max_attempts_reached")
                     self._save(manifest)
                     return manifest
-                manifest.status = "NEEDS_CHANGES"
-                worker.status = "NEEDS_CHANGES"
+                manifest.status = RUN_NEEDS_CHANGES
+                worker.status = RUN_NEEDS_CHANGES
                 self._save(manifest)
                 next_worker_prompt = _rework_worker_prompt(
                     decision.next_worker_prompt or "",
@@ -191,23 +208,23 @@ class RunOrchestrator:
                 continue
 
             if decision.decision == "blocked":
-                manifest.status = "BLOCKED"
-                manifest.planner.status = "BLOCKED"
-                worker.status = "BLOCKED"
+                manifest.status = RUN_BLOCKED
+                manifest.planner.status = RUN_BLOCKED
+                worker.status = RUN_BLOCKED
                 self._record_terminal_status(manifest, reason="review_blocked")
                 self._save(manifest)
                 return manifest
 
-            manifest.status = "FAILED"
-            manifest.planner.status = "FAILED"
-            worker.status = "FAILED"
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
             self._record_terminal_status(manifest, reason="review_failed")
             self._save(manifest)
             return manifest
 
         if worker_result is None:
             raise OrchestratorError("worker did not run")
-        manifest.status = "FAILED"
+        manifest.status = RUN_FAILED
         self._record_terminal_status(manifest, reason="fallthrough")
         self._save(manifest)
         return manifest
@@ -219,7 +236,7 @@ class RunOrchestrator:
 
     def retry_review(self, manifest: RunManifest) -> RunManifest:
         worker = _single_worker(manifest)
-        if manifest.status != REVIEW_RETRYABLE:
+        if manifest.status != RUN_REVIEW_RETRYABLE:
             raise OrchestratorError("run is not waiting for a retryable Planner review")
         if manifest.plan is None:
             raise OrchestratorError("cannot retry review without a saved plan")
@@ -253,7 +270,7 @@ class RunOrchestrator:
                 worker=worker,
                 evidence=evidence,
             )
-            manifest.status = "APPROVED" if apply_report.applied else "FAILED"
+            manifest.status = RUN_APPROVED if apply_report.applied else RUN_FAILED
             manifest.planner.status = manifest.status
             worker.status = manifest.status
             self._record_terminal_status(
@@ -265,22 +282,22 @@ class RunOrchestrator:
         if decision.decision == "needs_changes":
             return self._continue_after_needs_changes(manifest, worker, plan, decision)
         if decision.decision == "blocked":
-            manifest.status = "BLOCKED"
-            manifest.planner.status = "BLOCKED"
-            worker.status = "BLOCKED"
+            manifest.status = RUN_BLOCKED
+            manifest.planner.status = RUN_BLOCKED
+            worker.status = RUN_BLOCKED
             self._record_terminal_status(manifest, reason="review_blocked")
             self._save(manifest)
             return manifest
-        manifest.status = "FAILED"
-        manifest.planner.status = "FAILED"
-        worker.status = "FAILED"
+        manifest.status = RUN_FAILED
+        manifest.planner.status = RUN_FAILED
+        worker.status = RUN_FAILED
         self._record_terminal_status(manifest, reason="review_failed")
         self._save(manifest)
         return manifest
 
     def _start_planner(self, manifest: RunManifest, worker: WorkerRecord) -> PlannerPlan:
-        manifest.status = "PLANNING"
-        manifest.planner.status = "ACTIVE"
+        manifest.status = RUN_PLANNING
+        manifest.planner.status = WORKER_ACTIVE
         self._save(manifest)
         self._record_event(
             manifest,
@@ -314,8 +331,8 @@ class RunOrchestrator:
             raw=dict(plan.raw),
             approval_status="pending" if self.config.require_plan_approval else "not_required",
         )
-        manifest.status = "PLAN_READY"
-        manifest.planner.status = "PLAN_READY"
+        manifest.status = RUN_PLAN_READY
+        manifest.planner.status = RUN_PLAN_READY
         self._record_event(
             manifest,
             "planner_plan_ready",
@@ -326,8 +343,8 @@ class RunOrchestrator:
         return plan
 
     def _require_plan_review(self, manifest: RunManifest) -> None:
-        manifest.status = PLAN_REVIEW_REQUIRED
-        manifest.planner.status = PLAN_REVIEW_REQUIRED
+        manifest.status = RUN_PLAN_REVIEW_REQUIRED
+        manifest.planner.status = RUN_PLAN_REVIEW_REQUIRED
         self._save(manifest)
         if not self._has_event(manifest, "plan_review_required"):
             self._record_event(
@@ -344,8 +361,8 @@ class RunOrchestrator:
         manifest.plan.approval_status = "approved"
         manifest.plan.approved_at = self.store.now_iso()
         manifest.plan.approved_by = approved_by
-        manifest.status = "PLAN_APPROVED"
-        manifest.planner.status = "PLAN_APPROVED"
+        manifest.status = RUN_PLAN_APPROVED
+        manifest.planner.status = RUN_PLAN_APPROVED
         self._save(manifest)
         self._record_event(
             manifest,
@@ -363,8 +380,8 @@ class RunOrchestrator:
         worktree_path: str,
         is_initial_attempt: bool,
     ) -> WorkerResult:
-        manifest.status = "WORKING"
-        worker.status = "ACTIVE"
+        manifest.status = RUN_WORKING
+        worker.status = WORKER_ACTIVE
         self._save(manifest)
         self._record_event(
             manifest,
@@ -393,7 +410,7 @@ class RunOrchestrator:
 
         worker_result = WorkerResult.parse(result.content)
         worker.result = dict(worker_result.raw)
-        manifest.status = "WORK_DONE"
+        manifest.status = RUN_WORK_DONE
         worker.status = _worker_status_from_result(worker_result)
         self._save(manifest)
         self._record_event(
@@ -461,14 +478,14 @@ class RunOrchestrator:
         if not manifest.planner.thread_id:
             raise OrchestratorError("cannot review without planner thread_id")
 
-        manifest.status = "REVIEWING"
-        manifest.planner.status = "REVIEWING"
+        manifest.status = RUN_REVIEWING
+        manifest.planner.status = RUN_REVIEWING
         self._save(manifest)
         evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
         attempt = ReviewAttemptRecord(
             id=f"review-{len(manifest.review_attempts) + 1}",
             worker_id=worker.id,
-            status="ACTIVE",
+            status=REVIEW_ATTEMPT_ACTIVE,
             started_at=self.store.now_iso(),
             evidence_files=evidence_files,
         )
@@ -496,12 +513,12 @@ class RunOrchestrator:
             )
             decision = ReviewDecision.parse(result.content)
         except Exception as exc:
-            attempt.status = "FAILED_RETRYABLE"
+            attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
             attempt.completed_at = self.store.now_iso()
             attempt.error = str(exc)
-            manifest.status = REVIEW_RETRYABLE
-            manifest.planner.status = REVIEW_RETRYABLE
-            worker.status = "DONE" if worker.status == "DONE" else worker.status
+            manifest.status = RUN_REVIEW_RETRYABLE
+            manifest.planner.status = RUN_REVIEW_RETRYABLE
+            worker.status = WORKER_DONE if worker.status == WORKER_DONE else worker.status
             manifest.review = ReviewRecord(evidence_files=evidence_files)
             self._save(manifest)
             self._record_event(
@@ -526,7 +543,7 @@ class RunOrchestrator:
             evidence_files=evidence_files,
         )
         if decision.decision == "needs_changes":
-            worker.status = "NEEDS_CHANGES"
+            worker.status = RUN_NEEDS_CHANGES
         self._save(manifest)
         self._record_event(
             manifest,
@@ -545,9 +562,9 @@ class RunOrchestrator:
         decision: ReviewDecision,
     ) -> RunManifest:
         if worker.attempt >= self.config.max_attempts:
-            manifest.status = "FAILED"
-            manifest.planner.status = "FAILED"
-            worker.status = "FAILED"
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
             self._record_terminal_status(manifest, reason="max_attempts_reached")
             self._save(manifest)
             return manifest
@@ -592,7 +609,7 @@ class RunOrchestrator:
                 worker=worker,
                 evidence=evidence,
             )
-            manifest.status = "APPROVED" if apply_report.applied else "FAILED"
+            manifest.status = RUN_APPROVED if apply_report.applied else RUN_FAILED
             manifest.planner.status = manifest.status
             worker.status = manifest.status
             self._record_terminal_status(
@@ -602,14 +619,14 @@ class RunOrchestrator:
             self._save(manifest)
             return manifest
         if next_decision.decision == "blocked":
-            manifest.status = "BLOCKED"
-            manifest.planner.status = "BLOCKED"
-            worker.status = "BLOCKED"
+            manifest.status = RUN_BLOCKED
+            manifest.planner.status = RUN_BLOCKED
+            worker.status = RUN_BLOCKED
             self._record_terminal_status(manifest, reason="review_blocked")
         else:
-            manifest.status = "FAILED"
-            manifest.planner.status = "FAILED"
-            worker.status = "FAILED"
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
             self._record_terminal_status(manifest, reason="review_failed")
         self._save(manifest)
         return manifest
@@ -632,7 +649,7 @@ class RunOrchestrator:
         *,
         reason: Optional[str] = None,
     ) -> None:
-        if manifest.status not in TERMINAL_STATUSES:
+        if manifest.status not in TERMINAL_RUN_STATUSES:
             return
         events = self.store.load_events(manifest.run_id)
         if events:
@@ -696,9 +713,9 @@ def run_single_worker(
     driver: CodexDriver,
     evidence_collector: EvidenceCollector = collect_diff_evidence,
     verification_runner: VerificationRunner = run_verification_commands,
-    max_attempts: int = 3,
-    sandbox: str = "workspace-write",
-    approval_policy: str = "never",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sandbox: str = DEFAULT_SANDBOX,
+    approval_policy: str = DEFAULT_APPROVAL_POLICY,
     require_plan_approval: bool = False,
     approve_plan: bool = False,
 ) -> RunManifest:
@@ -790,7 +807,7 @@ def _plan_is_approved(manifest: RunManifest) -> bool:
 
 def _worker_status_from_result(result: WorkerResult) -> str:
     if result.status == "work_done":
-        return "DONE"
+        return WORKER_DONE
     return result.status.upper()
 
 

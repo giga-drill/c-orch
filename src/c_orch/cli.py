@@ -6,15 +6,21 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-
-DEFAULT_PLANNER_MODELS = ("gpt-5.5", "gpt-5.4")
-DEFAULT_PLANNER_REASONING_EFFORT = "high"
-DEFAULT_WORKER_MODEL = "gpt-5.3-codex-spark"
-REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
-SERVICE_TIER_CHOICES = ("flex", "fast")
-TERMINAL_MANIFEST_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
-PLAN_REVIEW_REQUIRED_STATUS = "PLAN_REVIEW_REQUIRED"
-REVIEW_RETRYABLE_STATUS = "REVIEW_RETRYABLE"
+from .settings import (
+    APPROVAL_POLICY_CHOICES,
+    DEFAULT_PLANNER_MODELS,
+    DEFAULT_PLANNER_REASONING_EFFORT,
+    DEFAULT_WORKER_MODEL,
+    REASONING_EFFORT_CHOICES,
+    SANDBOX_CHOICES,
+    SERVICE_TIER_CHOICES,
+)
+from .states import (
+    RUN_FAILED,
+    RUN_PLAN_REVIEW_REQUIRED,
+    RUN_REVIEW_RETRYABLE,
+    TERMINAL_RUN_STATUSES,
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -53,11 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("task", help="User task to orchestrate.")
     run.add_argument("--cwd", default=".", help="Target repository path.")
+    run.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
     run.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
-    run.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
+    run.add_argument("--runs-dir", default=None, help="Run manifest directory.")
     run.add_argument(
         "--worktrees-dir",
-        default=".c-orch/worktrees",
+        default=None,
         help="Worker worktree root. Relative paths resolve under --cwd.",
     )
     run.add_argument(
@@ -70,12 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--worker-model",
-        default=DEFAULT_WORKER_MODEL,
+        default=None,
         help=f"Worker model (default: {DEFAULT_WORKER_MODEL}).",
     )
     run.add_argument(
         "--planner-reasoning-effort",
-        default=DEFAULT_PLANNER_REASONING_EFFORT,
+        default=None,
         choices=REASONING_EFFORT_CHOICES,
         help=(
             "Planner reasoning effort passed as Codex model_reasoning_effort "
@@ -103,19 +110,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--max-attempts",
         type=int,
-        default=3,
+        default=None,
         help="Maximum Worker attempts including the initial attempt.",
     )
     run.add_argument(
         "--sandbox",
-        default="workspace-write",
-        choices=("read-only", "workspace-write", "danger-full-access"),
+        default=None,
+        choices=SANDBOX_CHOICES,
         help="Sandbox mode passed to Codex MCP sessions.",
     )
     run.add_argument(
         "--approval-policy",
-        default="never",
-        choices=("untrusted", "on-failure", "on-request", "never"),
+        default=None,
+        choices=APPROVAL_POLICY_CHOICES,
         help="Approval policy passed to Codex MCP sessions.",
     )
     run.add_argument(
@@ -135,7 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("run_id", help="Existing run ID to resume.")
     resume.add_argument("--cwd", default=".", help="Target repository path.")
-    resume.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
+    resume.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    resume.add_argument("--runs-dir", default=None, help="Run manifest directory.")
     resume.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
     resume.add_argument(
         "--planner-reasoning-effort",
@@ -164,19 +172,19 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--max-attempts",
         type=int,
-        default=3,
+        default=None,
         help="Maximum Worker attempts including the initial attempt.",
     )
     resume.add_argument(
         "--sandbox",
-        default="workspace-write",
-        choices=("read-only", "workspace-write", "danger-full-access"),
+        default=None,
+        choices=SANDBOX_CHOICES,
         help="Sandbox mode passed to Codex MCP sessions.",
     )
     resume.add_argument(
         "--approval-policy",
-        default="never",
-        choices=("untrusted", "on-failure", "on-request", "never"),
+        default=None,
+        choices=APPROVAL_POLICY_CHOICES,
         help="Approval policy passed to Codex MCP sessions.",
     )
     resume.add_argument(
@@ -195,12 +203,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Serve a local web dashboard for c-orch runs.",
     )
     ui.add_argument("--cwd", default=".", help="Target repository path.")
-    ui.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
-    ui.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
+    ui.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    ui.add_argument("--runs-dir", default=None, help="Run manifest directory.")
+    ui.add_argument("--host", default=None, help="Host interface to bind.")
     ui.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=None,
         help="Port for the local dashboard.",
     )
 
@@ -237,20 +246,30 @@ def run_doctor(args: argparse.Namespace) -> int:
 
 
 def run_prepare(args: argparse.Namespace) -> int:
+    from .config import load_project_config
     from .codex_discovery import choose_first_available_model, inspect_codex_environment
     from .mcp_driver import McpCodexDriver
     from .orchestrator import run_single_worker
     from .run_store import RunStore
     from .worktrees import create_worker_worktree
 
-    report = inspect_codex_environment(explicit_codex_bin=args.codex_bin)
+    cwd = Path(args.cwd).expanduser().resolve()
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+
+    codex_bin = args.codex_bin or project_config.codex_bin
+    report = inspect_codex_environment(explicit_codex_bin=codex_bin)
     if not report.selected:
         print("No usable Codex binary found. Run `c-orch doctor` for details.", file=sys.stderr)
         return 1
 
-    planner_model = args.planner_model or choose_first_available_model(
+    planner_models = [args.planner_model] if args.planner_model else project_config.planner_preferred_models
+    planner_model = choose_first_available_model(
         report.selected,
-        DEFAULT_PLANNER_MODELS,
+        planner_models,
     )
     if not planner_model:
         print(
@@ -258,7 +277,7 @@ def run_prepare(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    worker_model = args.worker_model
+    worker_model = args.worker_model or project_config.worker.model or DEFAULT_WORKER_MODEL
     if not report.selected.has_model(worker_model):
         print(
             f"Worker model {worker_model!r} was not found in selected Codex binary: {report.selected.path}",
@@ -266,9 +285,28 @@ def run_prepare(args: argparse.Namespace) -> int:
         )
         return 1
 
-    cwd = Path(args.cwd).expanduser().resolve()
-    runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
-    worktrees_dir = _resolve_under_cwd(cwd, args.worktrees_dir)
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.run.runs_dir)
+    worktrees_dir = _resolve_under_cwd(cwd, args.worktrees_dir or project_config.run.worktrees_dir)
+    planner_reasoning_effort = _first_value(
+        args.planner_reasoning_effort,
+        project_config.planner.reasoning_effort,
+        DEFAULT_PLANNER_REASONING_EFFORT,
+    )
+    worker_reasoning_effort = _first_value(
+        args.worker_reasoning_effort,
+        project_config.worker.reasoning_effort,
+    )
+    planner_service_tier = _first_value(
+        args.planner_service_tier,
+        project_config.planner.service_tier,
+    )
+    worker_service_tier = _first_value(
+        args.worker_service_tier,
+        project_config.worker.service_tier,
+    )
+    max_attempts = args.max_attempts or project_config.run.max_attempts
+    sandbox = args.sandbox or project_config.run.sandbox
+    approval_policy = args.approval_policy or project_config.run.approval_policy
 
     store = RunStore(runs_dir)
     manifest = store.create_run(
@@ -277,10 +315,10 @@ def run_prepare(args: argparse.Namespace) -> int:
         planner_model=planner_model,
         worker_model=worker_model,
         codex_binary_path=report.selected.path,
-        planner_reasoning_effort=args.planner_reasoning_effort,
-        worker_reasoning_effort=args.worker_reasoning_effort,
-        planner_service_tier=args.planner_service_tier,
-        worker_service_tier=args.worker_service_tier,
+        planner_reasoning_effort=planner_reasoning_effort,
+        worker_reasoning_effort=worker_reasoning_effort,
+        planner_service_tier=planner_service_tier,
+        worker_service_tier=worker_service_tier,
     )
     worker = manifest.workers[0]
     worker.worktree_path = str(
@@ -300,14 +338,14 @@ def run_prepare(args: argparse.Namespace) -> int:
                     manifest=manifest,
                     store=store,
                     driver=driver,
-                    max_attempts=args.max_attempts,
-                    sandbox=args.sandbox,
-                    approval_policy=args.approval_policy,
+                    max_attempts=max_attempts,
+                    sandbox=sandbox,
+                    approval_policy=approval_policy,
                     require_plan_approval=not args.auto_approve_plan,
                 )
         except Exception as exc:
             if not _is_terminal_manifest_status(manifest.status):
-                manifest.status = "FAILED"
+                manifest.status = RUN_FAILED
             store.save(manifest)
             _print_run_summary(
                 manifest=manifest,
@@ -330,12 +368,18 @@ def run_prepare(args: argparse.Namespace) -> int:
 
 
 def run_resume(args: argparse.Namespace) -> int:
+    from .config import load_project_config
     from .mcp_driver import McpCodexDriver
     from .orchestrator import OrchestratorConfig, RunOrchestrator
     from .run_store import RunStore
 
     cwd = Path(args.cwd).expanduser().resolve()
-    runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.run.runs_dir)
     store = RunStore(runs_dir)
     manifest = store.load(args.run_id)
     worker = manifest.workers[0]
@@ -343,6 +387,7 @@ def run_resume(args: argparse.Namespace) -> int:
     worker_model = worker.model
     summary_codex_path = (
         args.codex_bin
+        or project_config.codex_bin
         or manifest.codex_binary_path
         or manifest.planner.codex_binary_path
         or "unknown"
@@ -358,7 +403,7 @@ def run_resume(args: argparse.Namespace) -> int:
         )
         return 0
 
-    if manifest.status == PLAN_REVIEW_REQUIRED_STATUS and not args.approve_plan:
+    if manifest.status == RUN_PLAN_REVIEW_REQUIRED and not args.approve_plan:
         _print_run_summary(
             manifest=manifest,
             manifest_path=store.manifest_path(manifest.run_id),
@@ -369,7 +414,7 @@ def run_resume(args: argparse.Namespace) -> int:
         print("next: rerun resume with --approve-plan after human review")
         return 0
 
-    if manifest.status == REVIEW_RETRYABLE_STATUS and not args.retry_review:
+    if manifest.status == RUN_REVIEW_RETRYABLE and not args.retry_review:
         _print_run_summary(
             manifest=manifest,
             manifest_path=store.manifest_path(manifest.run_id),
@@ -389,6 +434,7 @@ def run_resume(args: argparse.Namespace) -> int:
 
     codex_path = (
         args.codex_bin
+        or project_config.codex_bin
         or manifest.codex_binary_path
         or manifest.planner.codex_binary_path
     )
@@ -407,9 +453,9 @@ def run_resume(args: argparse.Namespace) -> int:
                 store=store,
                 driver=driver,
                 config=OrchestratorConfig(
-                    max_attempts=args.max_attempts,
-                    sandbox=args.sandbox,
-                    approval_policy=args.approval_policy,
+                    max_attempts=args.max_attempts or project_config.run.max_attempts,
+                    sandbox=args.sandbox or project_config.run.sandbox,
+                    approval_policy=args.approval_policy or project_config.run.approval_policy,
                     require_plan_approval=True,
                     approve_plan=args.approve_plan,
                 ),
@@ -420,7 +466,7 @@ def run_resume(args: argparse.Namespace) -> int:
                 manifest = orchestrator.run(manifest)
     except Exception as exc:
         if not _is_terminal_manifest_status(manifest.status):
-            manifest.status = "FAILED"
+            manifest.status = RUN_FAILED
         store.save(manifest)
         _print_run_summary(
             manifest=manifest,
@@ -443,13 +489,21 @@ def run_resume(args: argparse.Namespace) -> int:
 
 
 def run_ui(args: argparse.Namespace) -> int:
+    from .config import load_project_config
     from .ui import serve_dashboard
 
     cwd = Path(args.cwd).expanduser().resolve()
-    runs_dir = _resolve_under_cwd(cwd, args.runs_dir)
-    print(f"c-orch UI: http://{args.host}:{args.port}", flush=True)
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.ui.runs_dir)
+    host = args.host or project_config.ui.host
+    port = args.port or project_config.ui.port
+    print(f"c-orch UI: http://{host}:{port}", flush=True)
     print(f"runs_dir: {runs_dir}", flush=True)
-    serve_dashboard(runs_dir=runs_dir, host=args.host, port=args.port)
+    serve_dashboard(runs_dir=runs_dir, host=host, port=port)
     return 0
 
 
@@ -461,7 +515,14 @@ def _resolve_under_cwd(cwd: Path, value: str) -> Path:
 
 
 def _is_terminal_manifest_status(status: str) -> bool:
-    return status in TERMINAL_MANIFEST_STATUSES
+    return status in TERMINAL_RUN_STATUSES
+
+
+def _first_value(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _apply_resume_session_overrides(manifest: Any, args: argparse.Namespace) -> None:

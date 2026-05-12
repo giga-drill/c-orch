@@ -7,20 +7,11 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
+from .settings import INTERESTING_MODEL_SLUGS
 
 C_ORCH_CODEX_BIN_ENV = "C_ORCH_CODEX_BIN"
 MACOS_CODEX_PATH = "/Applications/Codex.app/Contents/Resources/codex"
 SUBPROCESS_TIMEOUT_SECONDS = 10.0
-
-INTERESTING_MODEL_SLUGS = frozenset(
-    {
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-    }
-)
 
 _MODEL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 _MODEL_FIELD_NAMES = frozenset({"slug", "id", "model"})

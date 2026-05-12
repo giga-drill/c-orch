@@ -6,11 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "c-orch"
 version = "0.1.0"
 description = "Codex-native Planner/Worker workflow orchestrator."
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 [project.scripts]
 c-orch = "c_orch.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -71,6 +71,76 @@ class CliRunTests(unittest.TestCase):
             self.assertEqual(manifest.workers[0].worktree_path, str(worktree_path))
             self.assertEqual(manifest.status, "NEW")
 
+    def test_run_prepare_only_uses_project_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            (cwd / ".c-orch.toml").write_text(
+                """
+[planner]
+preferred_models = ["gpt-5.4", "gpt-5.5"]
+reasoning_effort = "high"
+service_tier = "fast"
+
+[worker]
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "medium"
+service_tier = "flex"
+
+[run]
+runs_dir = "configured-runs"
+worktrees_dir = "configured-worktrees"
+max_attempts = 2
+sandbox = "read-only"
+approval_policy = "on-request"
+""".strip(),
+                encoding="utf-8",
+            )
+            worktree_path = cwd / "configured-worktrees" / "run" / "worker-1"
+            report = CodexEnvironmentReport(
+                candidates=(),
+                selected=CodexCandidateReport(
+                    path="/Applications/Codex.app/Contents/Resources/codex",
+                    source="macos_app",
+                    version="codex-cli test",
+                    interesting_models=("gpt-5.4", "gpt-5.5", "gpt-5.3-codex-spark"),
+                    usable=True,
+                ),
+            )
+
+            with mock.patch(
+                "c_orch.codex_discovery.inspect_codex_environment",
+                return_value=report,
+            ), mock.patch(
+                "c_orch.worktrees.create_worker_worktree",
+                return_value=worktree_path,
+            ) as create_worktree, redirect_stdout(StringIO()):
+                exit_code = main(
+                    [
+                        "run",
+                        "--prepare-only",
+                        "--cwd",
+                        str(cwd),
+                        "Implement feature X",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            create_worktree.assert_called_once()
+            self.assertEqual(
+                create_worktree.call_args.kwargs["worktrees_dir"],
+                (cwd / "configured-worktrees").resolve(),
+            )
+            run_ids = [path.name for path in (cwd / "configured-runs").iterdir()]
+            manifest = RunStore(cwd / "configured-runs").load(run_ids[0])
+            self.assertEqual(manifest.planner.model, "gpt-5.4")
+            self.assertEqual(manifest.planner.reasoning_effort, "high")
+            self.assertEqual(manifest.planner.service_tier, "fast")
+            self.assertEqual(manifest.workers[0].model, "gpt-5.3-codex-spark")
+            self.assertEqual(manifest.workers[0].reasoning_effort, "medium")
+            self.assertEqual(manifest.workers[0].service_tier, "flex")
+
     def test_run_executes_single_worker_with_mcp_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -10,33 +10,18 @@ from urllib.parse import unquote
 
 from .codex_session_logs import CodexSessionLogStore
 from .run_store import RunStore
+from .settings import DEFAULT_UI_HOST, DEFAULT_UI_PORT
+from .states import RUN_STATUS_ORDER, TERMINAL_RUN_STATUSES
 
 
 Pathish = Union[str, Path]
-
-STATUS_ORDER = {
-    "NEW": 0,
-    "PLANNING": 1,
-    "PLAN_READY": 2,
-    "PLAN_REVIEW_REQUIRED": 3,
-    "PLAN_APPROVED": 4,
-    "WORKING": 5,
-    "WORK_DONE": 6,
-    "REVIEWING": 7,
-    "NEEDS_CHANGES": 8,
-    "REVIEW_RETRYABLE": 8,
-    "APPROVED": 9,
-    "BLOCKED": 9,
-    "FAILED": 9,
-}
-TERMINAL_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
 
 
 def serve_dashboard(
     *,
     runs_dir: Pathish,
-    host: str = "127.0.0.1",
-    port: int = 8765,
+    host: str = DEFAULT_UI_HOST,
+    port: int = DEFAULT_UI_PORT,
 ) -> None:
     server = build_server(runs_dir=runs_dir, host=host, port=port)
     try:
@@ -50,8 +35,8 @@ def serve_dashboard(
 def build_server(
     *,
     runs_dir: Pathish,
-    host: str = "127.0.0.1",
-    port: int = 8765,
+    host: str = DEFAULT_UI_HOST,
+    port: int = DEFAULT_UI_PORT,
 ) -> ThreadingHTTPServer:
     runs_path = Path(runs_dir).expanduser().resolve()
     handler = make_dashboard_handler(runs_path)
@@ -265,8 +250,8 @@ def _summarize_manifest(
     return {
         "run_id": str(manifest.get("run_id", "")),
         "status": status,
-        "status_index": STATUS_ORDER.get(status, 0),
-        "terminal": status in TERMINAL_STATUSES,
+        "status_index": RUN_STATUS_ORDER.get(status, 0),
+        "terminal": status in TERMINAL_RUN_STATUSES,
         "user_task": str(manifest.get("user_task", "")),
         "cwd": str(manifest.get("cwd", "")),
         "created_at": created_at,
