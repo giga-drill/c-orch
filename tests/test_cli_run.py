@@ -9,7 +9,7 @@ from unittest import mock
 
 from c_orch.cli import main
 from c_orch.codex_discovery import CodexCandidateReport, CodexEnvironmentReport
-from c_orch.run_store import RunStore
+from c_orch.run_store import PlanRecord, RunStore
 
 
 class CliRunTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class CliRunTests(unittest.TestCase):
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
                     usable=True,
                 ),
             )
@@ -46,6 +46,14 @@ class CliRunTests(unittest.TestCase):
                         str(cwd),
                         "--runs-dir",
                         str(runs_dir),
+                        "--planner-reasoning-effort",
+                        "high",
+                        "--worker-reasoning-effort",
+                        "medium",
+                        "--planner-service-tier",
+                        "fast",
+                        "--worker-service-tier",
+                        "flex",
                         "Implement feature X",
                     ]
                 )
@@ -55,7 +63,11 @@ class CliRunTests(unittest.TestCase):
             self.assertEqual(len(run_ids), 1)
             manifest = RunStore(runs_dir).load(run_ids[0])
             self.assertEqual(manifest.planner.model, "gpt-5.5")
-            self.assertEqual(manifest.workers[0].model, "gpt-5.3-codex")
+            self.assertEqual(manifest.planner.reasoning_effort, "high")
+            self.assertEqual(manifest.planner.service_tier, "fast")
+            self.assertEqual(manifest.workers[0].model, "gpt-5.3-codex-spark")
+            self.assertEqual(manifest.workers[0].reasoning_effort, "medium")
+            self.assertEqual(manifest.workers[0].service_tier, "flex")
             self.assertEqual(manifest.workers[0].worktree_path, str(worktree_path))
             self.assertEqual(manifest.status, "NEW")
 
@@ -72,7 +84,7 @@ class CliRunTests(unittest.TestCase):
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
                     usable=True,
                 ),
             )
@@ -113,6 +125,8 @@ class CliRunTests(unittest.TestCase):
                         "2",
                         "--sandbox",
                         "read-only",
+                        "--planner-service-tier",
+                        "fast",
                         "Implement feature X",
                     ]
                 )
@@ -124,8 +138,10 @@ class CliRunTests(unittest.TestCase):
             self.assertEqual(fake_run_single_worker.kwargs["max_attempts"], 2)
             self.assertEqual(fake_run_single_worker.kwargs["sandbox"], "read-only")
             self.assertEqual(fake_run_single_worker.kwargs["approval_policy"], "never")
+            self.assertTrue(fake_run_single_worker.kwargs["require_plan_approval"])
             output = stdout.getvalue()
             self.assertIn("status: APPROVED", output)
+            self.assertIn("planner_service_tier: fast", output)
             self.assertIn("planner_thread: planner-thread", output)
             self.assertIn("worker_thread: worker-thread", output)
 
@@ -142,7 +158,7 @@ class CliRunTests(unittest.TestCase):
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
                     usable=True,
                 ),
             )
@@ -277,6 +293,14 @@ class CliRunTests(unittest.TestCase):
                         "read-only",
                         "--approval-policy",
                         "on-request",
+                        "--planner-reasoning-effort",
+                        "high",
+                        "--worker-reasoning-effort",
+                        "low",
+                        "--planner-service-tier",
+                        "fast",
+                        "--worker-service-tier",
+                        "flex",
                     ]
                 )
 
@@ -286,21 +310,132 @@ class CliRunTests(unittest.TestCase):
             self.assertTrue(driver.entered)
             self.assertTrue(driver.exited)
             self.assertEqual(orchestrator.run.call_count, 1)
-            self.assertEqual(orchestrator.run.call_args.args[0].run_id, manifest.run_id)
+            resumed_manifest = orchestrator.run.call_args.args[0]
+            self.assertEqual(resumed_manifest.run_id, manifest.run_id)
+            self.assertEqual(resumed_manifest.planner.reasoning_effort, "high")
+            self.assertEqual(resumed_manifest.planner.service_tier, "fast")
+            self.assertEqual(resumed_manifest.workers[0].reasoning_effort, "low")
+            self.assertEqual(resumed_manifest.workers[0].service_tier, "flex")
             config = orchestrator_cls.call_args.kwargs["config"]
             self.assertEqual(config.max_attempts, 2)
             self.assertEqual(config.sandbox, "read-only")
             self.assertEqual(config.approval_policy, "on-request")
+            self.assertTrue(config.require_plan_approval)
+            self.assertFalse(config.approve_plan)
 
             run_dirs = [path.name for path in runs_dir.iterdir()]
             self.assertEqual(run_dirs, [manifest.run_id])
 
             persisted = store.load(manifest.run_id)
             self.assertEqual(persisted.status, "APPROVED")
+            self.assertEqual(persisted.planner.reasoning_effort, "high")
+            self.assertEqual(persisted.workers[0].reasoning_effort, "low")
             self.assertEqual(persisted.planner.thread_id, "planner-resume-thread")
             self.assertEqual(persisted.workers[0].thread_id, "worker-resume-thread")
             output = stdout.getvalue()
             self.assertIn("status: APPROVED", output)
+
+    def test_resume_plan_review_required_without_approval_prints_next_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = cwd / "runs"
+            store = RunStore(runs_dir)
+            manifest = store.create_run(
+                cwd=cwd,
+                user_task="Implement feature X",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/custom/codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.planner.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Build the feature",
+                approval_status="pending",
+            )
+            store.save(manifest)
+
+            with mock.patch(
+                "c_orch.mcp_driver.McpCodexDriver",
+            ) as driver_cls, mock.patch(
+                "c_orch.orchestrator.RunOrchestrator",
+            ) as orchestrator_cls, redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "resume",
+                        manifest.run_id,
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            driver_cls.assert_not_called()
+            orchestrator_cls.assert_not_called()
+            output = stdout.getvalue()
+            self.assertIn("status: PLAN_REVIEW_REQUIRED", output)
+            self.assertIn("plan_approval: pending", output)
+            self.assertIn("next: rerun resume with --approve-plan", output)
+
+    def test_resume_approve_plan_passes_approval_to_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = cwd / "runs"
+            store = RunStore(runs_dir)
+            manifest = store.create_run(
+                cwd=cwd,
+                user_task="Implement feature X",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/custom/codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.planner.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Build the feature",
+                approval_status="pending",
+            )
+            store.save(manifest)
+
+            driver = FakeDriver()
+
+            def fake_orchestrator_run(loaded_manifest):
+                loaded_manifest.status = "APPROVED"
+                store.save(loaded_manifest)
+                return loaded_manifest
+
+            with mock.patch(
+                "c_orch.mcp_driver.McpCodexDriver",
+                return_value=driver,
+            ), mock.patch(
+                "c_orch.orchestrator.RunOrchestrator",
+            ) as orchestrator_cls, redirect_stdout(StringIO()):
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.run.side_effect = fake_orchestrator_run
+                exit_code = main(
+                    [
+                        "resume",
+                        manifest.run_id,
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                        "--approve-plan",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            config = orchestrator_cls.call_args.kwargs["config"]
+            self.assertTrue(config.require_plan_approval)
+            self.assertTrue(config.approve_plan)
 
     def test_ui_serves_resolved_runs_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

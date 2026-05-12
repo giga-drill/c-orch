@@ -60,6 +60,8 @@ class McpCodexDriver:
         prompt: str,
         sandbox: str,
         approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
     ) -> SessionResult:
         del role
         self._ensure_required_tools()
@@ -72,6 +74,8 @@ class McpCodexDriver:
                 prompt=prompt,
                 sandbox=sandbox,
                 approval_policy=approval_policy,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
             ),
             thread_id=None,
             cwd=cwd,
@@ -202,11 +206,21 @@ def _codex_arguments(
     prompt: str,
     sandbox: str,
     approval_policy: str,
+    reasoning_effort: Optional[str] = None,
+    service_tier: Optional[str] = None,
 ) -> Mapping[str, Any]:
-    return {
+    arguments: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
         "cwd": cwd,
         "sandbox": sandbox,
         "approval-policy": approval_policy,
     }
+    config: dict[str, str] = {}
+    if reasoning_effort:
+        config["model_reasoning_effort"] = reasoning_effort
+    if service_tier:
+        config["service_tier"] = service_tier
+    if config:
+        arguments["config"] = config
+    return arguments

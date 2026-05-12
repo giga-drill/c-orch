@@ -11,7 +11,7 @@
 核心目标：
 
 - Planner 使用最强可用模型，负责方案、任务拆分、验收标准和 Worker 结果 review。
-- Worker 默认使用 `gpt-5.3-codex`，负责执行 Planner 下发的具体任务。
+- Worker 默认使用 `gpt-5.3-codex-spark`，负责执行 Planner 下发的具体任务。
 - Planner 和 Worker 都应作为 Codex session/thread 保留，便于在 Codex Session 列表中查看过程。
 - 总控负责状态机、thread 映射、重试、结果传递和本地 run manifest。
 - 第一版先用 MCP 快速闭环，后续可把底层 driver 换成 Codex App Server 以获得更细粒度控制。
@@ -62,6 +62,8 @@
 User task
   -> c-orch creates Planner Codex thread through codex()
   -> Planner returns plan, acceptance criteria, worker prompt
+  -> c-orch records the plan and waits for human approval
+  -> Human reviews and approves the plan
   -> c-orch creates Worker Codex thread through codex()
   -> Worker implements and returns result evidence
   -> c-orch sends Worker result to Planner through codex-reply()
@@ -79,7 +81,9 @@ User task
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`needs_changes` 返工和最大尝试次数。
 - `c-orch run --prepare-only` 只建 manifest/worktree，不调用 Codex。
-- `c-orch run` 会通过 MCP 创建 Planner/Worker Codex sessions，并把 `planner.thread_id`、`worker.thread_id` 写入 manifest。
+- `c-orch run` 默认会通过 MCP 创建 Planner Codex session，把方案写入 manifest，然后暂停在 `PLAN_REVIEW_REQUIRED`。
+- `c-orch resume --approve-plan <run_id>` 会标记人类已通过 Planner 方案，然后创建 Worker Codex session。
+- `c-orch run --auto-approve-plan` 可跳过人类方案审批点，直接延续旧的一次性执行流程。
 
 ## 组件
 
@@ -119,6 +123,7 @@ Planner 是一个 Codex thread，不是普通 SDK agent。它的职责：
 
 - 优先使用 `gpt-5.5`，如果本机 model catalog 不可用则回退到 `gpt-5.4`。
 - 第一版可通过配置项 `planner_model` 指定。
+- 新建 run 默认使用 `model_reasoning_effort=high`；`resume` 只在显式传参时覆盖已有 manifest。
 - 注意 Codex Desktop 当前会话模型可用性和 PATH 中 `codex` 的 model catalog 不是同一个边界。2026-05-11 本机 `/opt/homebrew/bin/codex` 是 `codex-cli 0.122.0`，未列出 `gpt-5.5`；直接运行 `codex exec -m gpt-5.5` 会失败，错误为该模型需要更新版本的 Codex。同机 `/Applications/Codex.app/Contents/Resources/codex` 是 `codex-cli 0.130.0-alpha.5`，列出并成功调用 `gpt-5.5`。因此实现必须支持 Codex binary 探测、模型探测和 fallback。
 
 ### Worker
@@ -132,7 +137,7 @@ Worker 也是 Codex thread。它的职责：
 
 模型选择：
 
-- 默认 `gpt-5.3-codex`。
+- 默认 `gpt-5.3-codex-spark`。
 - 返工超过阈值时，可升级到更强模型或拆任务。
 
 工作区隔离：
@@ -207,6 +212,8 @@ AppServerCodexDriver
 NEW
 PLANNING
 PLAN_READY
+PLAN_REVIEW_REQUIRED
+PLAN_APPROVED
 WORKING
 WORK_DONE
 REVIEWING
@@ -221,6 +228,9 @@ BLOCKED
 ```text
 NEW -> PLANNING
 PLANNING -> PLAN_READY
+PLAN_READY -> PLAN_REVIEW_REQUIRED
+PLAN_REVIEW_REQUIRED -> PLAN_APPROVED
+PLAN_APPROVED -> WORKING
 PLAN_READY -> WORKING
 WORKING -> WORK_DONE
 WORK_DONE -> REVIEWING
@@ -258,7 +268,7 @@ BLOCKED -> FAILED
     {
       "id": "worker-1",
       "thread_id": "019...",
-      "model": "gpt-5.3-codex",
+      "model": "gpt-5.3-codex-spark",
       "worktree_path": "/Users/mac/projs/.c-orch/worktrees/2026-05-11-001/worker-1",
       "status": "DONE",
       "attempt": 1
@@ -410,7 +420,7 @@ c-orch run --cwd /Users/mac/projs/example "Implement feature X"
 ```text
 --codex-bin /Applications/Codex.app/Contents/Resources/codex
 --planner-model gpt-5.4
---worker-model gpt-5.3-codex
+--worker-model gpt-5.3-codex-spark
 --max-rework 3
 --sandbox workspace-write
 --approval-policy never

@@ -25,6 +25,8 @@ class PlannerRecord:
     model: str
     thread_id: Optional[str] = None
     codex_binary_path: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    service_tier: Optional[str] = None
     status: str = "PENDING"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -32,6 +34,8 @@ class PlannerRecord:
             "thread_id": self.thread_id,
             "model": self.model,
             "codex_binary_path": self.codex_binary_path,
+            "reasoning_effort": self.reasoning_effort,
+            "service_tier": self.service_tier,
             "status": self.status,
         }
 
@@ -41,6 +45,8 @@ class PlannerRecord:
             thread_id=data.get("thread_id"),
             model=str(data.get("model", "")),
             codex_binary_path=data.get("codex_binary_path"),
+            reasoning_effort=data.get("reasoning_effort"),
+            service_tier=data.get("service_tier"),
             status=str(data.get("status", "PENDING")),
         )
 
@@ -51,6 +57,8 @@ class WorkerRecord:
     model: str
     thread_id: Optional[str] = None
     worktree_path: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    service_tier: Optional[str] = None
     status: str = "PENDING"
     attempt: int = 1
     evidence_files: List[str] = field(default_factory=list)
@@ -61,6 +69,8 @@ class WorkerRecord:
             "thread_id": self.thread_id,
             "model": self.model,
             "worktree_path": self.worktree_path,
+            "reasoning_effort": self.reasoning_effort,
+            "service_tier": self.service_tier,
             "status": self.status,
             "attempt": self.attempt,
             "evidence_files": list(self.evidence_files),
@@ -73,6 +83,8 @@ class WorkerRecord:
             thread_id=data.get("thread_id"),
             model=str(data.get("model", "")),
             worktree_path=data.get("worktree_path"),
+            reasoning_effort=data.get("reasoning_effort"),
+            service_tier=data.get("service_tier"),
             status=str(data.get("status", "PENDING")),
             attempt=int(data.get("attempt", 1)),
             evidence_files=_list_of_strings(data.get("evidence_files")),
@@ -105,6 +117,41 @@ class ReviewRecord:
 
 
 @dataclass
+class PlanRecord:
+    summary: str
+    worker_prompt: str
+    risk_notes: List[str] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict)
+    approval_status: str = "pending"
+    approved_at: Optional[str] = None
+    approved_by: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "worker_prompt": self.worker_prompt,
+            "risk_notes": list(self.risk_notes),
+            "raw": dict(self.raw),
+            "approval_status": self.approval_status,
+            "approved_at": self.approved_at,
+            "approved_by": self.approved_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlanRecord":
+        raw = data.get("raw")
+        return cls(
+            summary=str(data.get("summary", "")),
+            worker_prompt=str(data.get("worker_prompt", "")),
+            risk_notes=_list_of_strings(data.get("risk_notes")),
+            raw=dict(raw) if isinstance(raw, dict) else {},
+            approval_status=str(data.get("approval_status", "pending")),
+            approved_at=data.get("approved_at"),
+            approved_by=data.get("approved_by"),
+        )
+
+
+@dataclass
 class RunManifest:
     run_id: str
     cwd: str
@@ -114,6 +161,7 @@ class RunManifest:
     workers: List[WorkerRecord]
     acceptance_criteria: List[str]
     verification_commands: List[str]
+    plan: Optional[PlanRecord]
     review: Optional[ReviewRecord]
     created_at: str
     updated_at: str
@@ -129,6 +177,7 @@ class RunManifest:
             "workers": [worker.to_dict() for worker in self.workers],
             "acceptance_criteria": list(self.acceptance_criteria),
             "verification_commands": list(self.verification_commands),
+            "plan": self.plan.to_dict() if self.plan is not None else None,
             "review": self.review.to_dict() if self.review is not None else None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -150,6 +199,7 @@ class RunManifest:
             ],
             acceptance_criteria=_list_of_strings(data.get("acceptance_criteria")),
             verification_commands=_list_of_strings(data.get("verification_commands")),
+            plan=PlanRecord.from_dict(data["plan"]) if isinstance(data.get("plan"), dict) else None,
             review=ReviewRecord.from_dict(review_data) if review_data else None,
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
@@ -161,11 +211,17 @@ class RunStore:
     def __init__(self, runs_dir: Pathish = "runs") -> None:
         self.runs_dir = Path(runs_dir)
 
+    def now_iso(self) -> str:
+        return _now_iso()
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / run_id
 
     def manifest_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "manifest.json"
+
+    def event_log_path(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "events.jsonl"
 
     def create_run(
         self,
@@ -174,6 +230,10 @@ class RunStore:
         planner_model: str,
         worker_model: str,
         codex_binary_path: Optional[Pathish] = None,
+        planner_reasoning_effort: Optional[str] = None,
+        worker_reasoning_effort: Optional[str] = None,
+        planner_service_tier: Optional[str] = None,
+        worker_service_tier: Optional[str] = None,
     ) -> RunManifest:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = self._new_run_id()
@@ -187,15 +247,20 @@ class RunStore:
             planner=PlannerRecord(
                 model=planner_model,
                 codex_binary_path=codex_path,
+                reasoning_effort=planner_reasoning_effort,
+                service_tier=planner_service_tier,
             ),
             workers=[
                 WorkerRecord(
                     id="worker-1",
                     model=worker_model,
+                    reasoning_effort=worker_reasoning_effort,
+                    service_tier=worker_service_tier,
                 )
             ],
             acceptance_criteria=[],
             verification_commands=[],
+            plan=None,
             review=None,
             created_at=now,
             updated_at=now,
@@ -228,6 +293,56 @@ class RunStore:
             file_obj.write("\n")
         tmp_path.replace(path)
         return path
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        message: str,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        event: Dict[str, Any] = {
+            "timestamp": _now_iso(),
+            "type": str(event_type),
+            "message": str(message),
+        }
+        for key, value in fields.items():
+            if value is None:
+                continue
+            event[str(key)] = value
+        line = json.dumps(
+            event,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        path = self.event_log_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file_obj:
+            file_obj.write(line)
+            file_obj.write("\n")
+        return json.loads(line)
+
+    def load_events(self, run_id: str) -> List[Dict[str, Any]]:
+        path = self.event_log_path(run_id)
+        if not path.exists():
+            return []
+        events: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as file_obj:
+                for raw_line in file_obj:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, dict):
+                        events.append(data)
+        except OSError:
+            return []
+        return events
 
     def _new_run_id(self) -> str:
         base = datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")

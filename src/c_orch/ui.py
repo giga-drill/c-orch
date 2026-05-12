@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 from urllib.parse import unquote
 
+from .run_store import RunStore
+
 
 Pathish = Union[str, Path]
 
@@ -15,13 +17,15 @@ STATUS_ORDER = {
     "NEW": 0,
     "PLANNING": 1,
     "PLAN_READY": 2,
-    "WORKING": 3,
-    "WORK_DONE": 4,
-    "REVIEWING": 5,
-    "NEEDS_CHANGES": 6,
-    "APPROVED": 7,
-    "BLOCKED": 7,
-    "FAILED": 7,
+    "PLAN_REVIEW_REQUIRED": 3,
+    "PLAN_APPROVED": 4,
+    "WORKING": 5,
+    "WORK_DONE": 6,
+    "REVIEWING": 7,
+    "NEEDS_CHANGES": 8,
+    "APPROVED": 9,
+    "BLOCKED": 9,
+    "FAILED": 9,
 }
 TERMINAL_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
 
@@ -117,10 +121,12 @@ def build_run_payload(runs_dir: Pathish, run_id: str) -> Optional[Dict[str, Any]
     manifest = _load_manifest(manifest_path)
     if manifest is None:
         return None
+    events = RunStore(runs_path).load_events(run_id)
     return {
         "run": _summarize_manifest(manifest),
         "manifest": manifest,
         "evidence_files": _evidence_details(manifest),
+        "events": events,
     }
 
 
@@ -149,6 +155,7 @@ def _summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     planner = _dict_value(manifest.get("planner"))
     workers = [_summarize_worker(worker) for worker in _list_value(manifest.get("workers"))]
     review = _dict_value(manifest.get("review"))
+    plan = _dict_value(manifest.get("plan"))
     status = str(manifest.get("status", "UNKNOWN"))
     evidence_files = _unique_strings(
         _flatten(
@@ -176,12 +183,18 @@ def _summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             "status": str(planner.get("status", "PENDING")),
             "model": str(planner.get("model", "")),
             "thread_id": planner.get("thread_id"),
+            "reasoning_effort": planner.get("reasoning_effort"),
+            "service_tier": planner.get("service_tier"),
         },
         "workers": workers,
         "review": {
             "decision": review.get("decision"),
             "reason": review.get("reason"),
         } if review else None,
+        "plan": {
+            "approval_status": plan.get("approval_status"),
+            "summary": plan.get("summary"),
+        } if plan else None,
         "acceptance_count": len(_list_value(manifest.get("acceptance_criteria"))),
         "verification_count": len(_list_value(manifest.get("verification_commands"))),
         "evidence_count": len(evidence_files),
@@ -196,6 +209,8 @@ def _summarize_worker(worker: Any) -> Dict[str, Any]:
         "status": str(data.get("status", "PENDING")),
         "model": str(data.get("model", "")),
         "thread_id": data.get("thread_id"),
+        "reasoning_effort": data.get("reasoning_effort"),
+        "service_tier": data.get("service_tier"),
         "attempt": data.get("attempt", 1),
         "worktree_path": data.get("worktree_path"),
         "evidence_count": len(evidence_files),
@@ -371,7 +386,8 @@ INDEX_HTML = """<!doctype html>
     .APPROVED { color: var(--green); border-color: rgba(17,122,85,.3); background: rgba(17,122,85,.08); }
     .FAILED { color: var(--red); border-color: rgba(189,47,47,.3); background: rgba(189,47,47,.08); }
     .BLOCKED, .NEEDS_CHANGES { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
-    .WORKING, .REVIEWING, .PLANNING, .WORK_DONE, .PLAN_READY { color: var(--blue); border-color: rgba(37,111,146,.3); background: rgba(37,111,146,.08); }
+    .WORKING, .REVIEWING, .PLANNING, .WORK_DONE, .PLAN_READY, .PLAN_APPROVED { color: var(--blue); border-color: rgba(37,111,146,.3); background: rgba(37,111,146,.08); }
+    .PLAN_REVIEW_REQUIRED { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     main {
       padding: 22px;
       min-width: 0;
@@ -412,7 +428,7 @@ INDEX_HTML = """<!doctype html>
     }
     .steps {
       display: grid;
-      grid-template-columns: repeat(8, minmax(54px, 1fr));
+      grid-template-columns: repeat(10, minmax(42px, 1fr));
       gap: 6px;
     }
     .step {
@@ -434,6 +450,11 @@ INDEX_HTML = """<!doctype html>
       min-width: 0;
       background: #fff;
     }
+    .stack {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
     .kv {
       display: grid;
       grid-template-columns: 128px minmax(0, 1fr);
@@ -446,11 +467,44 @@ INDEX_HTML = """<!doctype html>
       font-family: "SFMono-Regular", Consolas, monospace;
       overflow-wrap: anywhere;
     }
+    .planPrompt {
+      margin-top: 8px;
+      padding: 10px;
+      border: 1px solid #edf0ea;
+      border-radius: 6px;
+      background: #fafcf8;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
     ul {
       margin: 8px 0 0;
       padding-left: 18px;
     }
     li { margin: 5px 0; }
+    .timeline {
+      list-style: none;
+      margin: 8px 0 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .timelineItem {
+      border: 1px solid #e7ece3;
+      border-radius: 8px;
+      padding: 8px;
+      background: #fafcf8;
+      display: grid;
+      gap: 4px;
+    }
+    .timelineTop {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
     .empty {
       height: 100%;
       min-height: 320px;
@@ -466,7 +520,7 @@ INDEX_HTML = """<!doctype html>
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
       main { padding: 14px; }
       .grid, .twoCol { grid-template-columns: 1fr; }
-      .steps { grid-template-columns: repeat(4, 1fr); }
+      .steps { grid-template-columns: repeat(5, 1fr); }
     }
   </style>
 </head>
@@ -495,7 +549,18 @@ INDEX_HTML = """<!doctype html>
     </main>
   </div>
   <script>
-    const statusLabels = ["NEW","PLANNING","PLAN_READY","WORKING","WORK_DONE","REVIEWING","NEEDS_CHANGES","DONE"];
+    const statusLabels = [
+      "NEW",
+      "PLANNING",
+      "PLAN_READY",
+      "PLAN_REVIEW_REQUIRED",
+      "PLAN_APPROVED",
+      "WORKING",
+      "WORK_DONE",
+      "REVIEWING",
+      "NEEDS_CHANGES",
+      "DONE"
+    ];
     let runs = [];
     let selected = null;
 
@@ -561,6 +626,7 @@ INDEX_HTML = """<!doctype html>
     function renderDetail(payload) {
       const run = payload.run;
       const manifest = payload.manifest;
+      const events = Array.isArray(payload.events) ? payload.events : [];
       els.detailTitle.textContent = run.run_id;
       els.detailBadge.className = `badge ${run.status}`;
       els.detailBadge.textContent = run.status;
@@ -572,6 +638,8 @@ INDEX_HTML = """<!doctype html>
           <h3>${escapeHtml(worker.id || "worker")}</h3>
           ${kv("Status", worker.status)}
           ${kv("Model", worker.model)}
+          ${optionalKv("Reasoning", worker.reasoning_effort)}
+          ${optionalKv("Speed", worker.service_tier)}
           ${kv("Thread", worker.thread_id || "")}
           ${kv("Attempt", String(worker.attempt || ""))}
           ${kv("Worktree", worker.worktree_path || "")}
@@ -582,8 +650,23 @@ INDEX_HTML = """<!doctype html>
         `<li><span class="mono">${escapeHtml(file.name)}</span> <span class="meta">${file.exists ? `${file.size || 0} bytes` : "missing"}</span></li>`
       )).join("");
 
+      const plan = manifest.plan || null;
+      const riskNotes = plan ? (plan.risk_notes || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") : "";
       const criteria = (manifest.acceptance_criteria || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
       const commands = (manifest.verification_commands || []).map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("");
+      const timeline = events.map(event => {
+        const details = eventDetails(event);
+        return `
+          <li class="timelineItem">
+            <div class="timelineTop">
+              <span class="mono">${escapeHtml(event.timestamp || "")}</span>
+              <span class="badge">${escapeHtml(event.type || "")}</span>
+            </div>
+            <div>${escapeHtml(event.message || "")}</div>
+            ${details ? `<div class="meta mono">${escapeHtml(details)}</div>` : ""}
+          </li>
+        `;
+      }).join("");
 
       els.detail.innerHTML = `
         <div class="grid">
@@ -596,6 +679,14 @@ INDEX_HTML = """<!doctype html>
           <div class="section">
             <h3>Task</h3>
             <p>${escapeHtml(manifest.user_task || "")}</p>
+            ${plan ? `
+              <h3 style="margin-top:14px">Plan</h3>
+              ${kv("Approval", plan.approval_status || "")}
+              ${plan.approved_at ? kv("Approved", plan.approved_at) : ""}
+              ${plan.summary ? `<p>${escapeHtml(plan.summary)}</p>` : ""}
+              ${riskNotes ? `<h3 style="margin-top:14px">Risks</h3><ul>${riskNotes}</ul>` : ""}
+              ${plan.worker_prompt ? `<h3 style="margin-top:14px">Worker Prompt</h3><div class="planPrompt">${escapeHtml(plan.worker_prompt)}</div>` : ""}
+            ` : ""}
             ${criteria ? `<h3 style="margin-top:14px">Acceptance</h3><ul>${criteria}</ul>` : ""}
             ${commands ? `<h3 style="margin-top:14px">Verification</h3><ul>${commands}</ul>` : ""}
           </div>
@@ -605,14 +696,22 @@ INDEX_HTML = """<!doctype html>
             ${kv("Created", manifest.created_at)}
             ${kv("Updated", manifest.updated_at)}
             ${kv("Planner Thread", (manifest.planner || {}).thread_id || "")}
+            ${optionalKv("Planner Reasoning", (manifest.planner || {}).reasoning_effort)}
+            ${optionalKv("Planner Speed", (manifest.planner || {}).service_tier)}
             ${kv("Codex", manifest.codex_binary_path || "")}
           </div>
         </div>
         <div class="twoCol">
           <div>${workerRows}</div>
-          <div class="section">
-            <h3>Evidence</h3>
-            ${evidence ? `<ul>${evidence}</ul>` : `<p class="meta">No evidence yet.</p>`}
+          <div class="stack">
+            <div class="section">
+              <h3>Evidence</h3>
+              ${evidence ? `<ul>${evidence}</ul>` : `<p class="meta">No evidence yet.</p>`}
+            </div>
+            <div class="section">
+              <h3>Timeline</h3>
+              ${timeline ? `<ul class="timeline">${timeline}</ul>` : `<p class="meta">No events yet.</p>`}
+            </div>
           </div>
         </div>
       `;
@@ -620,7 +719,7 @@ INDEX_HTML = """<!doctype html>
 
     function renderSteps(run) {
       els.steps.innerHTML = "";
-      const max = run.terminal ? 7 : run.status_index;
+      const max = run.terminal ? statusLabels.length - 1 : run.status_index;
       statusLabels.forEach((label, index) => {
         const item = document.createElement("div");
         item.className = "step" + (index <= max ? " on" : "");
@@ -640,6 +739,32 @@ INDEX_HTML = """<!doctype html>
 
     function kv(key, value) {
       return `<div class="kv"><span class="meta">${escapeHtml(key)}</span><span class="mono">${escapeHtml(value || "")}</span></div>`;
+    }
+
+    function optionalKv(key, value) {
+      return value ? kv(key, value) : "";
+    }
+
+    function eventDetails(event) {
+      const details = {};
+      Object.keys(event || {}).forEach(key => {
+        if (key === "timestamp" || key === "type" || key === "message") {
+          return;
+        }
+        const value = event[key];
+        if (value === null || value === undefined) {
+          return;
+        }
+        details[key] = value;
+      });
+      if (!Object.keys(details).length) {
+        return "";
+      }
+      try {
+        return JSON.stringify(details);
+      } catch (_error) {
+        return String(details);
+      }
     }
 
     function escapeHtml(value) {

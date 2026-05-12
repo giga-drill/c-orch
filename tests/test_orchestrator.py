@@ -34,6 +34,8 @@ class FakeDriver:
         prompt: str,
         sandbox: str,
         approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
     ) -> SessionResult:
         self.start_calls.append(
             {
@@ -43,6 +45,8 @@ class FakeDriver:
                 "prompt": prompt,
                 "sandbox": sandbox,
                 "approval_policy": approval_policy,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
             }
         )
         return self.start_results.pop(0)
@@ -149,6 +153,10 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, manifest, worktree = _create_manifest(root)
+            manifest.planner.reasoning_effort = "high"
+            manifest.planner.service_tier = "fast"
+            manifest.workers[0].reasoning_effort = "medium"
+            manifest.workers[0].service_tier = "flex"
             driver = FakeDriver(
                 start_results=[
                     _session("planner-thread", _planner_plan()),
@@ -177,8 +185,12 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.workers[0].status, "APPROVED")
             self.assertEqual(driver.start_calls[0]["role"], "planner")
             self.assertEqual(driver.start_calls[0]["cwd"], manifest.cwd)
+            self.assertEqual(driver.start_calls[0]["reasoning_effort"], "high")
+            self.assertEqual(driver.start_calls[0]["service_tier"], "fast")
             self.assertEqual(driver.start_calls[1]["role"], "worker")
             self.assertEqual(driver.start_calls[1]["cwd"], str(worktree))
+            self.assertEqual(driver.start_calls[1]["reasoning_effort"], "medium")
+            self.assertEqual(driver.start_calls[1]["service_tier"], "flex")
             self.assertIn("Build the feature", driver.start_calls[1]["prompt"])
             self.assertIn("python -m unittest", driver.start_calls[1]["prompt"])
             self.assertEqual(driver.reply_calls[0]["thread_id"], "planner-thread")
@@ -208,6 +220,102 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(loaded.status, "APPROVED")
             self.assertEqual(loaded.review.decision, "approved")
             self.assertEqual(len(loaded.review.evidence_files), 4)
+
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(
+                [event["type"] for event in events],
+                [
+                    "planner_start",
+                    "planner_plan_ready",
+                    "worker_start",
+                    "worker_done",
+                    "evidence_collected",
+                    "verification_finished",
+                    "planner_review_completed",
+                    "apply_completed",
+                    "run_terminal_status",
+                ],
+            )
+            self.assertEqual(events[2]["attempt"], 1)
+            self.assertEqual(events[2]["worker_id"], "worker-1")
+            self.assertEqual(events[3]["status"], "DONE")
+            self.assertEqual(events[6]["decision"], "approved")
+            self.assertTrue(events[7]["applied"])
+            self.assertEqual(events[8]["status"], "APPROVED")
+
+    def test_plan_review_required_pauses_before_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[_session("planner-thread", _planner_plan())],
+                reply_results=[],
+            )
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                config=OrchestratorConfig(require_plan_approval=True),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(result.planner.status, "PLAN_REVIEW_REQUIRED")
+            self.assertIsNotNone(result.plan)
+            self.assertEqual(result.plan.approval_status, "pending")
+            self.assertEqual(result.plan.summary, "Plan it")
+            self.assertEqual(result.plan.worker_prompt, "Build the feature")
+            self.assertIsNone(result.workers[0].thread_id)
+            self.assertEqual(result.workers[0].status, "PENDING")
+            self.assertEqual(len(driver.start_calls), 1)
+            self.assertEqual(driver.start_calls[0]["role"], "planner")
+            self.assertEqual(driver.reply_calls, [])
+
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(
+                [event["type"] for event in events],
+                ["planner_start", "planner_plan_ready", "plan_review_required"],
+            )
+
+    def test_approved_plan_resume_reuses_saved_plan_and_starts_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, worktree = _create_manifest(root)
+            planner_driver = FakeDriver(
+                start_results=[_session("planner-thread", _planner_plan())],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=planner_driver,
+                config=OrchestratorConfig(require_plan_approval=True),
+            ).run(manifest)
+            self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
+
+            worker_driver = FakeDriver(
+                start_results=[_session("worker-thread", _worker_result())],
+                reply_results=[_session("planner-thread", _review("approved"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=worker_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+                config=OrchestratorConfig(require_plan_approval=True, approve_plan=True),
+            ).run(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertIsNotNone(result.plan)
+            self.assertEqual(result.plan.approval_status, "approved")
+            self.assertEqual(result.plan.approved_by, "human")
+            self.assertEqual(len(worker_driver.start_calls), 1)
+            self.assertEqual(worker_driver.start_calls[0]["role"], "worker")
+            self.assertEqual(worker_driver.start_calls[0]["cwd"], str(worktree))
+            self.assertEqual(worker_driver.reply_calls[0]["thread_id"], "planner-thread")
+
+            events = store.load_events(manifest.run_id)
+            self.assertIn("plan_approved", [event["type"] for event in events])
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
 
     def test_needs_changes_reuses_worker_thread_then_reviews_again(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +402,11 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.review.decision, "needs_changes")
             self.assertEqual(len(applier.calls), 0)
 
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "FAILED")
+            self.assertEqual(events[-1]["reason"], "max_attempts_reached")
+
     def test_apply_failure_after_approved_review_marks_run_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -331,6 +444,44 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(loaded.planner.status, "FAILED")
             self.assertEqual(loaded.workers[0].status, "FAILED")
             self.assertEqual(loaded.review.decision, "approved")
+
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "FAILED")
+            self.assertEqual(events[-1]["reason"], "apply_failed")
+
+    def test_blocked_review_marks_run_blocked_and_logs_terminal_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("blocked"))],
+            )
+            evidence = FakeEvidenceCollector()
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "BLOCKED")
+            self.assertEqual(result.planner.status, "BLOCKED")
+            self.assertEqual(result.workers[0].status, "BLOCKED")
+            self.assertEqual(len(applier.calls), 0)
+
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "BLOCKED")
+            self.assertEqual(events[-1]["reason"], "review_blocked")
 
 
 def _create_manifest(root: Path):

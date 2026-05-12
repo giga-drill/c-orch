@@ -28,10 +28,29 @@ PYTHONPATH=src python3 -m c_orch.cli run \
   "Implement feature X"
 ```
 
-Run the single-worker MVP:
+Run the single-worker MVP. By default this starts the Planner, saves the plan,
+and pauses for human approval before any Worker starts:
 
 ```bash
 PYTHONPATH=src python3 -m c_orch.cli run \
+  --cwd /path/to/target-repo \
+  "Implement feature X"
+```
+
+After reviewing the saved plan in the manifest or dashboard, continue:
+
+```bash
+PYTHONPATH=src python3 -m c_orch.cli resume \
+  --cwd /path/to/target-repo \
+  --approve-plan \
+  <run_id>
+```
+
+For smoke tests or trusted tiny changes, skip the approval gate:
+
+```bash
+PYTHONPATH=src python3 -m c_orch.cli run \
+  --auto-approve-plan \
   --cwd /path/to/target-repo \
   "Implement feature X"
 ```
@@ -44,12 +63,19 @@ PYTHONPATH=src python3 -m c_orch.cli ui \
   --runs-dir runs
 ```
 
+When run events are available, the local run dashboard shows a per-run Timeline.
+
 Common options:
 
 ```bash
 --codex-bin /Applications/Codex.app/Contents/Resources/codex
 --planner-model gpt-5.5
---worker-model gpt-5.3-codex
+--worker-model gpt-5.3-codex-spark
+--planner-reasoning-effort high
+--worker-reasoning-effort medium
+--planner-service-tier fast
+--worker-service-tier flex
+--auto-approve-plan
 --max-attempts 3
 --sandbox workspace-write
 --approval-policy never
@@ -72,7 +98,8 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 
 - The target repo must have a committed base ref before `c-orch run` can create
   Worker git worktrees.
-- The current MVP supports one Worker thread with retry-on-review.
+- The current MVP supports one Worker thread with human plan approval before
+  Worker start and retry-on-review after Worker execution.
 - Planner/Worker sessions are created through Codex MCP and written into Codex
   session logs with `source=mcp`.
 - Thread naming and richer live progress are left for a future Codex App Server

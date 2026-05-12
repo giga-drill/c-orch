@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from c_orch.run_store import ReviewRecord, RunStore
+from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.ui import INDEX_HTML, build_run_payload, build_runs_payload
 
 
@@ -54,13 +54,29 @@ class UiTests(unittest.TestCase):
             evidence_path.parent.mkdir(parents=True)
             evidence_path.write_text("diff\n", encoding="utf-8")
             manifest.status = "APPROVED"
+            manifest.planner.reasoning_effort = "high"
+            manifest.planner.service_tier = "fast"
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Build the feature",
+                risk_notes=["Risk note"],
+                approval_status="approved",
+            )
             manifest.workers[0].evidence_files = [str(evidence_path)]
+            manifest.workers[0].reasoning_effort = "medium"
+            manifest.workers[0].service_tier = "flex"
             manifest.review = ReviewRecord(
                 decision="approved",
                 reason="looks good",
                 evidence_files=[str(evidence_path)],
             )
             store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "planner_start",
+                "Planner started",
+                attempt=1,
+            )
 
             payload = build_run_payload(root / "runs", manifest.run_id)
 
@@ -68,9 +84,15 @@ class UiTests(unittest.TestCase):
             assert payload is not None
             self.assertEqual(payload["manifest"]["run_id"], manifest.run_id)
             self.assertEqual(payload["run"]["review"]["decision"], "approved")
+            self.assertEqual(payload["run"]["planner"]["reasoning_effort"], "high")
+            self.assertEqual(payload["run"]["plan"]["approval_status"], "approved")
+            self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
+            self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
             self.assertEqual(payload["run"]["evidence_count"], 1)
             self.assertEqual(payload["evidence_files"][0]["name"], "git-diff.patch")
             self.assertTrue(payload["evidence_files"][0]["exists"])
+            self.assertEqual(payload["events"][0]["type"], "planner_start")
+            self.assertEqual(payload["events"][0]["attempt"], 1)
 
     def test_build_run_payload_rejects_path_traversal_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +102,10 @@ class UiTests(unittest.TestCase):
         self.assertIn('id="runList"', INDEX_HTML)
         self.assertIn("/api/runs", INDEX_HTML)
         self.assertIn('id="detail"', INDEX_HTML)
+        self.assertIn("Timeline", INDEX_HTML)
+        self.assertIn("payload.events", INDEX_HTML)
+        self.assertIn("Planner Reasoning", INDEX_HTML)
+        self.assertIn("Worker Prompt", INDEX_HTML)
 
 
 if __name__ == "__main__":

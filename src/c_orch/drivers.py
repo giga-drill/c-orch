@@ -21,6 +21,8 @@ class CodexDriver(Protocol):
         prompt: str,
         sandbox: str,
         approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
     ) -> SessionResult:
         ...
 
@@ -60,4 +62,3 @@ def _content_text(payload: Dict[str, Any]) -> Optional[str]:
         if parts:
             return "\n".join(parts)
     return None
-

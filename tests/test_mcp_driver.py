@@ -31,6 +31,8 @@ class McpCodexDriverTests(unittest.TestCase):
             prompt="Implement feature",
             sandbox="workspace-write",
             approval_policy="never",
+            reasoning_effort="high",
+            service_tier="fast",
         )
 
         self.assertEqual(result.thread_id, "thr_worker")
@@ -46,6 +48,10 @@ class McpCodexDriverTests(unittest.TestCase):
                         "cwd": "/repo",
                         "sandbox": "workspace-write",
                         "approval-policy": "never",
+                        "config": {
+                            "model_reasoning_effort": "high",
+                            "service_tier": "fast",
+                        },
                     },
                 )
             ],

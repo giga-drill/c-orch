@@ -8,8 +8,12 @@ from typing import Any, Optional, Sequence
 
 
 DEFAULT_PLANNER_MODELS = ("gpt-5.5", "gpt-5.4")
-DEFAULT_WORKER_MODEL = "gpt-5.3-codex"
+DEFAULT_PLANNER_REASONING_EFFORT = "high"
+DEFAULT_WORKER_MODEL = "gpt-5.3-codex-spark"
+REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
+SERVICE_TIER_CHOICES = ("flex", "fast")
 TERMINAL_MANIFEST_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
+PLAN_REVIEW_REQUIRED_STATUS = "PLAN_REVIEW_REQUIRED"
 
 
 def _json_default(value: Any) -> Any:
@@ -55,8 +59,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=".c-orch/worktrees",
         help="Worker worktree root. Relative paths resolve under --cwd.",
     )
-    run.add_argument("--planner-model", default=None, help="Planner model override.")
-    run.add_argument("--worker-model", default=DEFAULT_WORKER_MODEL, help="Worker model.")
+    run.add_argument(
+        "--planner-model",
+        default=None,
+        help=(
+            "Planner model override "
+            f"(default: first available of {', '.join(DEFAULT_PLANNER_MODELS)})."
+        ),
+    )
+    run.add_argument(
+        "--worker-model",
+        default=DEFAULT_WORKER_MODEL,
+        help=f"Worker model (default: {DEFAULT_WORKER_MODEL}).",
+    )
+    run.add_argument(
+        "--planner-reasoning-effort",
+        default=DEFAULT_PLANNER_REASONING_EFFORT,
+        choices=REASONING_EFFORT_CHOICES,
+        help=(
+            "Planner reasoning effort passed as Codex model_reasoning_effort "
+            f"(default: {DEFAULT_PLANNER_REASONING_EFFORT})."
+        ),
+    )
+    run.add_argument(
+        "--worker-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help="Worker reasoning effort passed as Codex model_reasoning_effort.",
+    )
+    run.add_argument(
+        "--planner-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Planner service tier. Use fast for quicker responses that may consume more usage.",
+    )
+    run.add_argument(
+        "--worker-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Worker service tier. Use fast for quicker responses that may consume more usage.",
+    )
     run.add_argument(
         "--max-attempts",
         type=int,
@@ -80,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create manifest and worker worktree without calling Codex MCP.",
     )
+    run.add_argument(
+        "--auto-approve-plan",
+        action="store_true",
+        help="Skip the human Planner plan review gate and start the Worker immediately.",
+    )
 
     resume = subparsers.add_parser(
         "resume",
@@ -89,6 +136,30 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--cwd", default=".", help="Target repository path.")
     resume.add_argument("--runs-dir", default="runs", help="Run manifest directory.")
     resume.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
+    resume.add_argument(
+        "--planner-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help="Override the saved Planner reasoning effort for this resume.",
+    )
+    resume.add_argument(
+        "--worker-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help="Override the saved Worker reasoning effort for this resume.",
+    )
+    resume.add_argument(
+        "--planner-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Override the saved Planner service tier for this resume.",
+    )
+    resume.add_argument(
+        "--worker-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Override the saved Worker service tier for this resume.",
+    )
     resume.add_argument(
         "--max-attempts",
         type=int,
@@ -106,6 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="never",
         choices=("untrusted", "on-failure", "on-request", "never"),
         help="Approval policy passed to Codex MCP sessions.",
+    )
+    resume.add_argument(
+        "--approve-plan",
+        action="store_true",
+        help="Approve a PLAN_REVIEW_REQUIRED run and continue to the Worker.",
     )
 
     ui = subparsers.add_parser(
@@ -195,6 +271,10 @@ def run_prepare(args: argparse.Namespace) -> int:
         planner_model=planner_model,
         worker_model=worker_model,
         codex_binary_path=report.selected.path,
+        planner_reasoning_effort=args.planner_reasoning_effort,
+        worker_reasoning_effort=args.worker_reasoning_effort,
+        planner_service_tier=args.planner_service_tier,
+        worker_service_tier=args.worker_service_tier,
     )
     worker = manifest.workers[0]
     worker.worktree_path = str(
@@ -217,6 +297,7 @@ def run_prepare(args: argparse.Namespace) -> int:
                     max_attempts=args.max_attempts,
                     sandbox=args.sandbox,
                     approval_policy=args.approval_policy,
+                    require_plan_approval=not args.auto_approve_plan,
                 )
         except Exception as exc:
             if not _is_terminal_manifest_status(manifest.status):
@@ -271,6 +352,24 @@ def run_resume(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if manifest.status == PLAN_REVIEW_REQUIRED_STATUS and not args.approve_plan:
+        _print_run_summary(
+            manifest=manifest,
+            manifest_path=store.manifest_path(manifest.run_id),
+            codex_path=summary_codex_path,
+            planner_model=planner_model,
+            worker_model=worker_model,
+        )
+        print("next: rerun resume with --approve-plan after human review")
+        return 0
+
+    if args.approve_plan and manifest.plan is None:
+        print("Cannot approve plan: this run does not have a saved Planner plan yet.", file=sys.stderr)
+        return 1
+
+    _apply_resume_session_overrides(manifest, args)
+    store.save(manifest)
+
     codex_path = (
         args.codex_bin
         or manifest.codex_binary_path
@@ -294,6 +393,8 @@ def run_resume(args: argparse.Namespace) -> int:
                     max_attempts=args.max_attempts,
                     sandbox=args.sandbox,
                     approval_policy=args.approval_policy,
+                    require_plan_approval=True,
+                    approve_plan=args.approve_plan,
                 ),
             )
             manifest = orchestrator.run(manifest)
@@ -343,6 +444,18 @@ def _is_terminal_manifest_status(status: str) -> bool:
     return status in TERMINAL_MANIFEST_STATUSES
 
 
+def _apply_resume_session_overrides(manifest: Any, args: argparse.Namespace) -> None:
+    worker = manifest.workers[0]
+    if args.planner_reasoning_effort is not None:
+        manifest.planner.reasoning_effort = args.planner_reasoning_effort
+    if args.worker_reasoning_effort is not None:
+        worker.reasoning_effort = args.worker_reasoning_effort
+    if args.planner_service_tier is not None:
+        manifest.planner.service_tier = args.planner_service_tier
+    if args.worker_service_tier is not None:
+        worker.service_tier = args.worker_service_tier
+
+
 def _print_run_summary(
     *,
     manifest: Any,
@@ -357,6 +470,18 @@ def _print_run_summary(
     print(f"codex: {codex_path}")
     print(f"planner_model: {planner_model}")
     print(f"worker_model: {worker_model}")
+    if manifest.planner.reasoning_effort:
+        print(f"planner_reasoning_effort: {manifest.planner.reasoning_effort}")
+    if worker.reasoning_effort:
+        print(f"worker_reasoning_effort: {worker.reasoning_effort}")
+    if manifest.planner.service_tier:
+        print(f"planner_service_tier: {manifest.planner.service_tier}")
+    if worker.service_tier:
+        print(f"worker_service_tier: {worker.service_tier}")
+    if manifest.plan is not None:
+        print(f"plan_approval: {manifest.plan.approval_status}")
+        if manifest.plan.summary:
+            print(f"plan_summary: {manifest.plan.summary}")
     print(f"worker_worktree: {worker.worktree_path}")
     print(f"status: {manifest.status}")
     if manifest.planner.thread_id:
