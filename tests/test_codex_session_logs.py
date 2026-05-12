@@ -129,6 +129,59 @@ class CodexSessionLogStoreTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot.final_content, '{"decision":"approved"}')
 
+    def test_load_recent_activity_summarizes_worker_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions_root = root / "sessions"
+            session_path = (
+                sessions_root
+                / "2026"
+                / "05"
+                / "12"
+                / "rollout-2026-05-12T10-00-00-thread-worker.jsonl"
+            )
+            _write_jsonl(
+                session_path,
+                [
+                    _session_meta(
+                        timestamp="2026-05-12T10:00:00Z",
+                        thread_id="thread-worker",
+                        cwd="/repo",
+                    ),
+                    {
+                        "timestamp": "2026-05-12T10:00:01Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "message": "reading files",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-05-12T10:00:02Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-05-12T10:00:03Z",
+                        "type": "event_msg",
+                        "payload": {"type": "turn_aborted"},
+                    },
+                ],
+            )
+
+            activity = CodexSessionLogStore(sessions_root).load_recent_activity(
+                thread_id="thread-worker",
+                limit=10,
+            )
+
+            self.assertEqual([item.kind for item in activity], ["message", "tool_call", "aborted"])
+            self.assertEqual(activity[0].detail, "reading files")
+            self.assertEqual(activity[1].label, "调用工具: exec_command")
+            self.assertEqual(activity[2].label, "回合中断")
+
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

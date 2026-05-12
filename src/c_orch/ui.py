@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 from urllib.parse import unquote
 
+from .codex_session_logs import CodexSessionLogStore
 from .run_store import RunStore
 
 
@@ -23,6 +24,7 @@ STATUS_ORDER = {
     "WORK_DONE": 6,
     "REVIEWING": 7,
     "NEEDS_CHANGES": 8,
+    "REVIEW_RETRYABLE": 8,
     "APPROVED": 9,
     "BLOCKED": 9,
     "FAILED": 9,
@@ -76,6 +78,32 @@ def make_dashboard_handler(runs_dir: Path) -> Type[BaseHTTPRequestHandler]:
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
+        def do_POST(self) -> None:
+            path = self.path.split("?", 1)[0]
+            prefix = "/api/runs/"
+            suffix = "/actions"
+            if not path.startswith(prefix) or not path.endswith(suffix):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            run_id = unquote(path[len(prefix):-len(suffix)])
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
+                return
+            action = data.get("action")
+            result = _run_action(runs_dir, run_id, action)
+            if result is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
+                return
+            status, payload = result
+            self._send_json(status, payload)
+
         def log_message(self, format: str, *args: Any) -> None:
             return
 
@@ -100,9 +128,68 @@ def make_dashboard_handler(runs_dir: Path) -> Type[BaseHTTPRequestHandler]:
     return DashboardHandler
 
 
+def _run_action(
+    runs_dir: Path,
+    run_id: str,
+    action: Any,
+) -> Optional[Tuple[HTTPStatus, Dict[str, Any]]]:
+    if not _valid_run_id(run_id):
+        return None
+    store = RunStore(runs_dir)
+    try:
+        manifest = store.load(run_id)
+    except OSError:
+        return None
+    if action not in {"approve-plan", "retry-review"}:
+        return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+
+    from .mcp_driver import McpCodexDriver
+    from .orchestrator import OrchestratorConfig, RunOrchestrator
+
+    codex_path = (
+        manifest.codex_binary_path
+        or manifest.planner.codex_binary_path
+    )
+    if not codex_path:
+        return HTTPStatus.BAD_REQUEST, {"error": "missing codex binary path"}
+
+    try:
+        with McpCodexDriver(codex_bin=codex_path) as driver:
+            orchestrator = RunOrchestrator(
+                store=store,
+                driver=driver,
+                config=OrchestratorConfig(
+                    require_plan_approval=True,
+                    approve_plan=action == "approve-plan",
+                ),
+            )
+            if action == "retry-review":
+                manifest = orchestrator.retry_review(manifest)
+            else:
+                manifest = orchestrator.run(manifest)
+    except Exception as exc:
+        store.append_event(
+            run_id,
+            "ui_action_failed",
+            "Dashboard action failed",
+            action=action,
+            error=str(exc),
+        )
+        return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+    payload = build_run_payload(runs_dir, run_id)
+    return HTTPStatus.OK, payload or {"ok": True}
+
+
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     runs_path = Path(runs_dir).expanduser().resolve()
-    runs = [_summarize_manifest(manifest) for manifest in _load_manifests(runs_path)]
+    store = RunStore(runs_path)
+    runs = [
+        _summarize_manifest(
+            manifest,
+            events=store.load_events(str(manifest.get("run_id", ""))),
+        )
+        for manifest in _load_manifests(runs_path)
+    ]
     runs.sort(key=lambda item: item["sort_key"], reverse=True)
     for run in runs:
         run.pop("sort_key", None)
@@ -123,10 +210,11 @@ def build_run_payload(runs_dir: Pathish, run_id: str) -> Optional[Dict[str, Any]
         return None
     events = RunStore(runs_path).load_events(run_id)
     return {
-        "run": _summarize_manifest(manifest),
+        "run": _summarize_manifest(manifest, events=events),
         "manifest": manifest,
         "evidence_files": _evidence_details(manifest),
         "events": events,
+        "worker_activity": _worker_activity(manifest),
     }
 
 
@@ -151,10 +239,15 @@ def _load_manifest(path: Path) -> Optional[Dict[str, Any]]:
     return data
 
 
-def _summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+def _summarize_manifest(
+    manifest: Dict[str, Any],
+    *,
+    events: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     planner = _dict_value(manifest.get("planner"))
     workers = [_summarize_worker(worker) for worker in _list_value(manifest.get("workers"))]
     review = _dict_value(manifest.get("review"))
+    review_attempts = [_dict_value(attempt) for attempt in _list_value(manifest.get("review_attempts"))]
     plan = _dict_value(manifest.get("plan"))
     status = str(manifest.get("status", "UNKNOWN"))
     evidence_files = _unique_strings(
@@ -191,6 +284,10 @@ def _summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             "decision": review.get("decision"),
             "reason": review.get("reason"),
         } if review else None,
+        "review_attempt_count": len(review_attempts),
+        "last_review_attempt": _review_attempt_summary(review_attempts[-1]) if review_attempts else None,
+        "last_event": _event_summary(events[-1]) if events else None,
+        "last_error_event": _last_error_event(events or []),
         "plan": {
             "approval_status": plan.get("approval_status"),
             "summary": plan.get("summary"),
@@ -199,6 +296,36 @@ def _summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         "verification_count": len(_list_value(manifest.get("verification_commands"))),
         "evidence_count": len(evidence_files),
     }
+
+
+def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": attempt.get("id"),
+        "status": attempt.get("status"),
+        "decision": attempt.get("decision"),
+        "reason": attempt.get("reason"),
+        "error": attempt.get("error"),
+        "completed_at": attempt.get("completed_at"),
+    }
+
+
+def _event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "timestamp": event.get("timestamp"),
+        "type": event.get("type"),
+        "message": event.get("message"),
+        "worker_id": event.get("worker_id"),
+        "attempt": event.get("attempt"),
+        "decision": event.get("decision"),
+        "error": event.get("error"),
+    }
+
+
+def _last_error_event(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for event in reversed(events):
+        if "error" in event or str(event.get("type", "")).endswith("_failed"):
+            return _event_summary(event)
+    return None
 
 
 def _summarize_worker(worker: Any) -> Dict[str, Any]:
@@ -238,6 +365,21 @@ def _evidence_details(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     return details
 
 
+def _worker_activity(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    store = CodexSessionLogStore()
+    activities: List[Dict[str, Any]] = []
+    for worker in _list_value(manifest.get("workers")):
+        data = _dict_value(worker)
+        thread_id = data.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            continue
+        for item in store.load_recent_activity(thread_id=thread_id, limit=60):
+            value = item.to_dict()
+            value["worker_id"] = str(data.get("id", "worker"))
+            activities.append(value)
+    return activities[-80:]
+
+
 def _valid_run_id(value: str) -> bool:
     return bool(value) and Path(value).name == value and value not in {".", ".."}
 
@@ -273,11 +415,11 @@ def _unique_strings(values: Sequence[Any]) -> List[str]:
 
 
 INDEX_HTML = """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>c-orch Runs</title>
+  <title>c-orch 运行面板</title>
   <style>
     :root {
       color-scheme: light;
@@ -385,7 +527,7 @@ INDEX_HTML = """<!doctype html>
     }
     .APPROVED { color: var(--green); border-color: rgba(17,122,85,.3); background: rgba(17,122,85,.08); }
     .FAILED { color: var(--red); border-color: rgba(189,47,47,.3); background: rgba(189,47,47,.08); }
-    .BLOCKED, .NEEDS_CHANGES { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
+    .BLOCKED, .NEEDS_CHANGES, .REVIEW_RETRYABLE { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     .WORKING, .REVIEWING, .PLANNING, .WORK_DONE, .PLAN_READY, .PLAN_APPROVED { color: var(--blue); border-color: rgba(37,111,146,.3); background: rgba(37,111,146,.08); }
     .PLAN_REVIEW_REQUIRED { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     main {
@@ -532,14 +674,14 @@ INDEX_HTML = """<!doctype html>
           <h1>c-orch</h1>
           <p class="meta" id="runsDir"></p>
         </div>
-        <button id="refreshBtn" type="button">Refresh</button>
+        <button id="refreshBtn" type="button">刷新</button>
       </div>
       <div class="list" id="runList"></div>
     </aside>
     <main>
       <div class="detailTop">
         <div>
-          <h2 id="detailTitle">Runs</h2>
+          <h2 id="detailTitle">运行</h2>
           <p class="meta" id="updatedAt"></p>
         </div>
         <span class="badge" id="detailBadge">WAITING</span>
@@ -559,8 +701,24 @@ INDEX_HTML = """<!doctype html>
       "WORK_DONE",
       "REVIEWING",
       "NEEDS_CHANGES",
+      "REVIEW_RETRYABLE",
       "DONE"
     ];
+    const statusText = {
+      NEW: "新建",
+      PLANNING: "规划中",
+      PLAN_READY: "方案已生成",
+      PLAN_REVIEW_REQUIRED: "等待人工审方案",
+      PLAN_APPROVED: "方案已通过",
+      WORKING: "Worker 执行中",
+      WORK_DONE: "Worker 已完成",
+      REVIEWING: "Planner 复核中",
+      NEEDS_CHANGES: "需要返工",
+      REVIEW_RETRYABLE: "复核可重试",
+      APPROVED: "已通过",
+      BLOCKED: "阻塞",
+      FAILED: "失败"
+    };
     let runs = [];
     let selected = null;
 
@@ -604,7 +762,7 @@ INDEX_HTML = """<!doctype html>
         item.innerHTML = `
           <div class="runTitle">
             <span class="runId">${escapeHtml(run.run_id)}</span>
-            <span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>
+            <span class="badge ${escapeHtml(run.status)}">${escapeHtml(formatStatus(run.status))}</span>
           </div>
           <div class="task">${escapeHtml(run.user_task || "")}</div>
           <div class="meta">${escapeHtml(run.updated_at || "")}</div>
@@ -623,34 +781,80 @@ INDEX_HTML = """<!doctype html>
       renderDetail(payload);
     }
 
+    async function runAction(runId, action) {
+      const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/actions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ action })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        alert(text);
+        return;
+      }
+      const payload = await response.json();
+      renderDetail(payload);
+      await loadRuns(false);
+    }
+
     function renderDetail(payload) {
       const run = payload.run;
       const manifest = payload.manifest;
       const events = Array.isArray(payload.events) ? payload.events : [];
       els.detailTitle.textContent = run.run_id;
       els.detailBadge.className = `badge ${run.status}`;
-      els.detailBadge.textContent = run.status;
-      els.updatedAt.textContent = `Updated ${run.updated_at || ""}`;
+      els.detailBadge.textContent = formatStatus(run.status);
+      els.updatedAt.textContent = `更新于 ${run.updated_at || ""}`;
       renderSteps(run);
 
       const workerRows = (manifest.workers || []).map(worker => `
         <div class="section">
           <h3>${escapeHtml(worker.id || "worker")}</h3>
-          ${kv("Status", worker.status)}
-          ${kv("Model", worker.model)}
-          ${optionalKv("Reasoning", worker.reasoning_effort)}
-          ${optionalKv("Speed", worker.service_tier)}
-          ${kv("Thread", worker.thread_id || "")}
-          ${kv("Attempt", String(worker.attempt || ""))}
-          ${kv("Worktree", worker.worktree_path || "")}
+          ${kv("状态", formatStatus(worker.status))}
+          ${kv("模型", worker.model)}
+          ${optionalKv("推理强度", worker.reasoning_effort)}
+          ${optionalKv("响应速度", worker.service_tier)}
+          ${kv("线程", worker.thread_id || "")}
+          ${kv("尝试次数", String(worker.attempt || ""))}
+          ${kv("工作区", worker.worktree_path || "")}
         </div>
       `).join("");
 
       const evidence = (payload.evidence_files || []).map(file => (
-        `<li><span class="mono">${escapeHtml(file.name)}</span> <span class="meta">${file.exists ? `${file.size || 0} bytes` : "missing"}</span></li>`
+        `<li><span class="mono">${escapeHtml(file.name)}</span> <span class="meta">${file.exists ? `${file.size || 0} bytes` : "缺失"}</span></li>`
       )).join("");
 
       const plan = manifest.plan || null;
+      const actionButtons = [
+        run.status === "PLAN_REVIEW_REQUIRED" && plan
+          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'approve-plan')">通过并启动 Worker</button>`
+          : "",
+        run.status === "REVIEW_RETRYABLE"
+          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'retry-review')">重新让 Planner 复核</button>`
+          : ""
+      ].filter(Boolean).join(" ");
+      const reviewAttempts = (manifest.review_attempts || []).map(attempt => `
+        <li class="timelineItem">
+          <div class="timelineTop">
+            <span class="badge">${escapeHtml(attempt.status || "")}</span>
+            <span class="mono">${escapeHtml(attempt.id || "")}</span>
+            <span class="meta">${escapeHtml(attempt.completed_at || attempt.started_at || "")}</span>
+          </div>
+          ${attempt.reason ? `<div>${escapeHtml(attempt.reason)}</div>` : ""}
+          ${attempt.error ? `<div class="meta mono">${escapeHtml(attempt.error)}</div>` : ""}
+        </li>
+      `).join("");
+      const activity = (payload.worker_activity || []).map(item => `
+        <li class="timelineItem">
+          <div class="timelineTop">
+            <span class="mono">${escapeHtml(item.timestamp || "")}</span>
+            <span class="badge">${escapeHtml(item.label || item.kind || "")}</span>
+            <span class="meta">${escapeHtml(item.worker_id || "")}</span>
+          </div>
+          ${item.detail ? `<div class="meta mono">${escapeHtml(item.detail)}</div>` : ""}
+        </li>
+      `).join("");
       const riskNotes = plan ? (plan.risk_notes || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") : "";
       const criteria = (manifest.acceptance_criteria || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
       const commands = (manifest.verification_commands || []).map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("");
@@ -669,35 +873,36 @@ INDEX_HTML = """<!doctype html>
       }).join("");
 
       els.detail.innerHTML = `
+        ${actionButtons ? `<div class="section">${actionButtons}</div>` : ""}
         <div class="grid">
-          <div class="metric"><div class="meta">Planner</div><div class="value">${escapeHtml(run.planner.status || "")}</div></div>
-          <div class="metric"><div class="meta">Worker</div><div class="value">${escapeHtml((run.workers[0] || {}).status || "")}</div></div>
-          <div class="metric"><div class="meta">Review</div><div class="value">${escapeHtml((run.review && run.review.decision) || "none")}</div></div>
-          <div class="metric"><div class="meta">Evidence</div><div class="value">${run.evidence_count}</div></div>
+          <div class="metric"><div class="meta">Planner</div><div class="value">${escapeHtml(formatStatus(run.planner.status || ""))}</div></div>
+          <div class="metric"><div class="meta">Worker</div><div class="value">${escapeHtml(formatStatus((run.workers[0] || {}).status || ""))}</div></div>
+          <div class="metric"><div class="meta">复核</div><div class="value">${escapeHtml((run.review && run.review.decision) || "暂无")}</div></div>
+          <div class="metric"><div class="meta">证据</div><div class="value">${run.evidence_count}</div></div>
         </div>
         <div class="twoCol">
           <div class="section">
-            <h3>Task</h3>
+            <h3>任务</h3>
             <p>${escapeHtml(manifest.user_task || "")}</p>
             ${plan ? `
-              <h3 style="margin-top:14px">Plan</h3>
-              ${kv("Approval", plan.approval_status || "")}
-              ${plan.approved_at ? kv("Approved", plan.approved_at) : ""}
+              <h3 style="margin-top:14px">方案</h3>
+              ${kv("审批", plan.approval_status || "")}
+              ${plan.approved_at ? kv("通过时间", plan.approved_at) : ""}
               ${plan.summary ? `<p>${escapeHtml(plan.summary)}</p>` : ""}
-              ${riskNotes ? `<h3 style="margin-top:14px">Risks</h3><ul>${riskNotes}</ul>` : ""}
-              ${plan.worker_prompt ? `<h3 style="margin-top:14px">Worker Prompt</h3><div class="planPrompt">${escapeHtml(plan.worker_prompt)}</div>` : ""}
+              ${riskNotes ? `<h3 style="margin-top:14px">风险</h3><ul>${riskNotes}</ul>` : ""}
+              ${plan.worker_prompt ? `<h3 style="margin-top:14px">Worker 指令</h3><div class="planPrompt">${escapeHtml(plan.worker_prompt)}</div>` : ""}
             ` : ""}
-            ${criteria ? `<h3 style="margin-top:14px">Acceptance</h3><ul>${criteria}</ul>` : ""}
-            ${commands ? `<h3 style="margin-top:14px">Verification</h3><ul>${commands}</ul>` : ""}
+            ${criteria ? `<h3 style="margin-top:14px">验收标准</h3><ul>${criteria}</ul>` : ""}
+            ${commands ? `<h3 style="margin-top:14px">验证命令</h3><ul>${commands}</ul>` : ""}
           </div>
           <div class="section">
-            <h3>Run</h3>
+            <h3>运行信息</h3>
             ${kv("CWD", manifest.cwd)}
-            ${kv("Created", manifest.created_at)}
-            ${kv("Updated", manifest.updated_at)}
-            ${kv("Planner Thread", (manifest.planner || {}).thread_id || "")}
-            ${optionalKv("Planner Reasoning", (manifest.planner || {}).reasoning_effort)}
-            ${optionalKv("Planner Speed", (manifest.planner || {}).service_tier)}
+            ${kv("创建时间", manifest.created_at)}
+            ${kv("更新时间", manifest.updated_at)}
+            ${kv("Planner 线程", (manifest.planner || {}).thread_id || "")}
+            ${optionalKv("Planner 推理强度", (manifest.planner || {}).reasoning_effort)}
+            ${optionalKv("Planner 响应速度", (manifest.planner || {}).service_tier)}
             ${kv("Codex", manifest.codex_binary_path || "")}
           </div>
         </div>
@@ -705,12 +910,20 @@ INDEX_HTML = """<!doctype html>
           <div>${workerRows}</div>
           <div class="stack">
             <div class="section">
-              <h3>Evidence</h3>
-              ${evidence ? `<ul>${evidence}</ul>` : `<p class="meta">No evidence yet.</p>`}
+              <h3>证据文件</h3>
+              ${evidence ? `<ul>${evidence}</ul>` : `<p class="meta">暂无证据。</p>`}
             </div>
             <div class="section">
-              <h3>Timeline</h3>
-              ${timeline ? `<ul class="timeline">${timeline}</ul>` : `<p class="meta">No events yet.</p>`}
+              <h3>Worker 活动</h3>
+              ${activity ? `<ul class="timeline">${activity}</ul>` : `<p class="meta">暂无 Worker 活动。</p>`}
+            </div>
+            <div class="section">
+              <h3>复核记录</h3>
+              ${reviewAttempts ? `<ul class="timeline">${reviewAttempts}</ul>` : `<p class="meta">暂无复核记录。</p>`}
+            </div>
+            <div class="section">
+              <h3>运行时间线</h3>
+              ${timeline ? `<ul class="timeline">${timeline}</ul>` : `<p class="meta">暂无事件。</p>`}
             </div>
           </div>
         </div>
@@ -729,12 +942,12 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderEmpty() {
-      els.detailTitle.textContent = "Runs";
+      els.detailTitle.textContent = "运行";
       els.detailBadge.className = "badge";
-      els.detailBadge.textContent = "EMPTY";
+      els.detailBadge.textContent = "空";
       els.updatedAt.textContent = "";
       els.steps.innerHTML = "";
-      els.detail.innerHTML = `<div class="empty">No runs found.</div>`;
+      els.detail.innerHTML = `<div class="empty">没有找到运行记录。</div>`;
     }
 
     function kv(key, value) {
@@ -743,6 +956,10 @@ INDEX_HTML = """<!doctype html>
 
     function optionalKv(key, value) {
       return value ? kv(key, value) : "";
+    }
+
+    function formatStatus(value) {
+      return statusText[value] || value || "";
     }
 
     function eventDetails(event) {
@@ -773,6 +990,10 @@ INDEX_HTML = """<!doctype html>
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    }
+
+    function escapeJs(value) {
+      return String(value).replace(/\\\\/g, "\\\\\\\\").replace(/'/g, "\\\\'");
     }
   </script>
 </body>

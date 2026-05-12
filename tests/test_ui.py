@@ -88,6 +88,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["run"]["plan"]["approval_status"], "approved")
             self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
             self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
+            self.assertEqual(payload["run"]["review_attempt_count"], 0)
             self.assertEqual(payload["run"]["evidence_count"], 1)
             self.assertEqual(payload["evidence_files"][0]["name"], "git-diff.patch")
             self.assertTrue(payload["evidence_files"][0]["exists"])
@@ -102,10 +103,13 @@ class UiTests(unittest.TestCase):
         self.assertIn('id="runList"', INDEX_HTML)
         self.assertIn("/api/runs", INDEX_HTML)
         self.assertIn('id="detail"', INDEX_HTML)
-        self.assertIn("Timeline", INDEX_HTML)
+        self.assertIn("运行时间线", INDEX_HTML)
         self.assertIn("payload.events", INDEX_HTML)
-        self.assertIn("Planner Reasoning", INDEX_HTML)
-        self.assertIn("Worker Prompt", INDEX_HTML)
+        self.assertIn("Planner 推理强度", INDEX_HTML)
+        self.assertIn("Worker 指令", INDEX_HTML)
+        self.assertIn("Worker 活动", INDEX_HTML)
+        self.assertIn("通过并启动 Worker", INDEX_HTML)
+        self.assertIn("重新让 Planner 复核", INDEX_HTML)
 
 
 if __name__ == "__main__":

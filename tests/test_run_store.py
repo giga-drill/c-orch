@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
+from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 
 
 class RunStoreTests(unittest.TestCase):
@@ -79,6 +79,18 @@ class RunStoreTests(unittest.TestCase):
                 next_worker_prompt="Add coverage",
                 evidence_files=["runs/example/evidence/git-diff.patch"],
             )
+            manifest.review_attempts.append(
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-12T09:01:00+08:00",
+                    completed_at="2026-05-12T09:02:00+08:00",
+                    error="Timed out",
+                    evidence_files=["runs/example/evidence/git-diff.patch"],
+                )
+            )
+            manifest.workers[0].result = {"status": "work_done", "summary": "done"}
 
             store.save(manifest)
             loaded = store.load(manifest.run_id)
@@ -99,6 +111,9 @@ class RunStoreTests(unittest.TestCase):
                 loaded.review.evidence_files,
                 ["runs/example/evidence/git-diff.patch"],
             )
+            self.assertEqual(loaded.review_attempts[0].status, "FAILED_RETRYABLE")
+            self.assertEqual(loaded.review_attempts[0].error, "Timed out")
+            self.assertEqual(loaded.workers[0].result["summary"], "done")
 
     def test_append_event_and_load_events_preserve_order_and_optional_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

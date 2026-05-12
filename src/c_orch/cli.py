@@ -14,6 +14,7 @@ REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
 SERVICE_TIER_CHOICES = ("flex", "fast")
 TERMINAL_MANIFEST_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
 PLAN_REVIEW_REQUIRED_STATUS = "PLAN_REVIEW_REQUIRED"
+REVIEW_RETRYABLE_STATUS = "REVIEW_RETRYABLE"
 
 
 def _json_default(value: Any) -> Any:
@@ -182,6 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--approve-plan",
         action="store_true",
         help="Approve a PLAN_REVIEW_REQUIRED run and continue to the Worker.",
+    )
+    resume.add_argument(
+        "--retry-review",
+        action="store_true",
+        help="Retry a saved Planner review after Worker evidence has been preserved.",
     )
 
     ui = subparsers.add_parser(
@@ -363,6 +369,17 @@ def run_resume(args: argparse.Namespace) -> int:
         print("next: rerun resume with --approve-plan after human review")
         return 0
 
+    if manifest.status == REVIEW_RETRYABLE_STATUS and not args.retry_review:
+        _print_run_summary(
+            manifest=manifest,
+            manifest_path=store.manifest_path(manifest.run_id),
+            codex_path=summary_codex_path,
+            planner_model=planner_model,
+            worker_model=worker_model,
+        )
+        print("next: rerun resume with --retry-review to reuse saved Worker evidence")
+        return 0
+
     if args.approve_plan and manifest.plan is None:
         print("Cannot approve plan: this run does not have a saved Planner plan yet.", file=sys.stderr)
         return 1
@@ -397,7 +414,10 @@ def run_resume(args: argparse.Namespace) -> int:
                     approve_plan=args.approve_plan,
                 ),
             )
-            manifest = orchestrator.run(manifest)
+            if args.retry_review:
+                manifest = orchestrator.retry_review(manifest)
+            else:
+                manifest = orchestrator.run(manifest)
     except Exception as exc:
         if not _is_terminal_manifest_status(manifest.status):
             manifest.status = "FAILED"

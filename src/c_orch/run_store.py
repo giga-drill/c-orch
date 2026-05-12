@@ -62,6 +62,7 @@ class WorkerRecord:
     status: str = "PENDING"
     attempt: int = 1
     evidence_files: List[str] = field(default_factory=list)
+    result: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,6 +75,7 @@ class WorkerRecord:
             "status": self.status,
             "attempt": self.attempt,
             "evidence_files": list(self.evidence_files),
+            "result": dict(self.result) if isinstance(self.result, dict) else None,
         }
 
     @classmethod
@@ -88,6 +90,7 @@ class WorkerRecord:
             status=str(data.get("status", "PENDING")),
             attempt=int(data.get("attempt", 1)),
             evidence_files=_list_of_strings(data.get("evidence_files")),
+            result=dict(data["result"]) if isinstance(data.get("result"), dict) else None,
         )
 
 
@@ -112,6 +115,49 @@ class ReviewRecord:
             decision=data.get("decision"),
             reason=data.get("reason"),
             next_worker_prompt=data.get("next_worker_prompt"),
+            evidence_files=_list_of_strings(data.get("evidence_files")),
+        )
+
+
+@dataclass
+class ReviewAttemptRecord:
+    id: str
+    worker_id: str
+    status: str
+    started_at: str
+    completed_at: Optional[str] = None
+    decision: Optional[str] = None
+    reason: Optional[str] = None
+    next_worker_prompt: Optional[str] = None
+    error: Optional[str] = None
+    evidence_files: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "worker_id": self.worker_id,
+            "status": self.status,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "decision": self.decision,
+            "reason": self.reason,
+            "next_worker_prompt": self.next_worker_prompt,
+            "error": self.error,
+            "evidence_files": list(self.evidence_files),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReviewAttemptRecord":
+        return cls(
+            id=str(data.get("id", "")),
+            worker_id=str(data.get("worker_id", "")),
+            status=str(data.get("status", "")),
+            started_at=str(data.get("started_at", "")),
+            completed_at=data.get("completed_at"),
+            decision=data.get("decision"),
+            reason=data.get("reason"),
+            next_worker_prompt=data.get("next_worker_prompt"),
+            error=data.get("error"),
             evidence_files=_list_of_strings(data.get("evidence_files")),
         )
 
@@ -163,6 +209,7 @@ class RunManifest:
     verification_commands: List[str]
     plan: Optional[PlanRecord]
     review: Optional[ReviewRecord]
+    review_attempts: List[ReviewAttemptRecord]
     created_at: str
     updated_at: str
     codex_binary_path: Optional[str] = None
@@ -179,6 +226,7 @@ class RunManifest:
             "verification_commands": list(self.verification_commands),
             "plan": self.plan.to_dict() if self.plan is not None else None,
             "review": self.review.to_dict() if self.review is not None else None,
+            "review_attempts": [attempt.to_dict() for attempt in self.review_attempts],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "codex_binary_path": self.codex_binary_path,
@@ -187,6 +235,7 @@ class RunManifest:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunManifest":
         review_data = data.get("review")
+        review_attempts = data.get("review_attempts")
         return cls(
             run_id=str(data.get("run_id", "")),
             cwd=str(data.get("cwd", "")),
@@ -201,6 +250,11 @@ class RunManifest:
             verification_commands=_list_of_strings(data.get("verification_commands")),
             plan=PlanRecord.from_dict(data["plan"]) if isinstance(data.get("plan"), dict) else None,
             review=ReviewRecord.from_dict(review_data) if review_data else None,
+            review_attempts=[
+                ReviewAttemptRecord.from_dict(attempt)
+                for attempt in review_attempts
+                if isinstance(attempt, dict)
+            ] if isinstance(review_attempts, list) else [],
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             codex_binary_path=data.get("codex_binary_path"),
@@ -262,6 +316,7 @@ class RunStore:
             verification_commands=[],
             plan=None,
             review=None,
+            review_attempts=[],
             created_at=now,
             updated_at=now,
             codex_binary_path=codex_path,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Protocol, Union
@@ -7,7 +8,14 @@ from typing import Any, Iterable, List, Optional, Protocol, Union
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver
 from .prompts import planner_initial_prompt, planner_review_prompt, worker_prompt
-from .run_store import PlanRecord, ReviewRecord, RunManifest, RunStore, WorkerRecord
+from .run_store import (
+    PlanRecord,
+    ReviewAttemptRecord,
+    ReviewRecord,
+    RunManifest,
+    RunStore,
+    WorkerRecord,
+)
 from .verification import VerificationReport, run_verification_commands
 from .worktrees import (
     ApplyReport,
@@ -20,6 +28,7 @@ from .worktrees import (
 Pathish = Union[str, Path]
 TERMINAL_STATUSES = {"APPROVED", "BLOCKED", "FAILED"}
 PLAN_REVIEW_REQUIRED = "PLAN_REVIEW_REQUIRED"
+REVIEW_RETRYABLE = "REVIEW_RETRYABLE"
 
 
 class OrchestratorError(RuntimeError):
@@ -140,6 +149,8 @@ class RunOrchestrator:
                 evidence=evidence,
                 verification=verification,
             )
+            if decision is None:
+                return manifest
 
             if decision.decision == "approved":
                 apply_report = self._apply_reviewed_diff(
@@ -205,6 +216,67 @@ class RunOrchestrator:
         if manifest.plan is not None:
             return _planner_plan_from_record(manifest.plan, manifest)
         return self._start_planner(manifest, worker)
+
+    def retry_review(self, manifest: RunManifest) -> RunManifest:
+        worker = _single_worker(manifest)
+        if manifest.status != REVIEW_RETRYABLE:
+            raise OrchestratorError("run is not waiting for a retryable Planner review")
+        if manifest.plan is None:
+            raise OrchestratorError("cannot retry review without a saved plan")
+        if not worker.result:
+            raise OrchestratorError("cannot retry review without saved Worker result")
+        if not manifest.review:
+            raise OrchestratorError("cannot retry review without saved evidence")
+        plan = _planner_plan_from_record(manifest.plan, manifest)
+        worker_result = WorkerResult.parse(json_dumps(worker.result))
+        evidence = _evidence_from_review_record(manifest.review)
+        verification = _verification_from_review_record(manifest.review)
+        self._record_event(
+            manifest,
+            "planner_review_retry_started",
+            "Planner review retry started",
+            worker_id=worker.id,
+        )
+        decision = self._review_attempt(
+            manifest=manifest,
+            worker=worker,
+            plan=plan,
+            worker_result=worker_result,
+            evidence=evidence,
+            verification=verification,
+        )
+        if decision is None:
+            return manifest
+        if decision.decision == "approved":
+            apply_report = self._apply_reviewed_diff(
+                manifest=manifest,
+                worker=worker,
+                evidence=evidence,
+            )
+            manifest.status = "APPROVED" if apply_report.applied else "FAILED"
+            manifest.planner.status = manifest.status
+            worker.status = manifest.status
+            self._record_terminal_status(
+                manifest,
+                reason=None if apply_report.applied else "apply_failed",
+            )
+            self._save(manifest)
+            return manifest
+        if decision.decision == "needs_changes":
+            return self._continue_after_needs_changes(manifest, worker, plan, decision)
+        if decision.decision == "blocked":
+            manifest.status = "BLOCKED"
+            manifest.planner.status = "BLOCKED"
+            worker.status = "BLOCKED"
+            self._record_terminal_status(manifest, reason="review_blocked")
+            self._save(manifest)
+            return manifest
+        manifest.status = "FAILED"
+        manifest.planner.status = "FAILED"
+        worker.status = "FAILED"
+        self._record_terminal_status(manifest, reason="review_failed")
+        self._save(manifest)
+        return manifest
 
     def _start_planner(self, manifest: RunManifest, worker: WorkerRecord) -> PlannerPlan:
         manifest.status = "PLANNING"
@@ -320,6 +392,7 @@ class RunOrchestrator:
             result = self.driver.reply(thread_id=worker.thread_id, prompt=prompt)
 
         worker_result = WorkerResult.parse(result.content)
+        worker.result = dict(worker_result.raw)
         manifest.status = "WORK_DONE"
         worker.status = _worker_status_from_result(worker_result)
         self._save(manifest)
@@ -384,27 +457,68 @@ class RunOrchestrator:
         worker_result: WorkerResult,
         evidence: DiffEvidence,
         verification: VerificationReport,
-    ) -> ReviewDecision:
+    ) -> Optional[ReviewDecision]:
         if not manifest.planner.thread_id:
             raise OrchestratorError("cannot review without planner thread_id")
 
         manifest.status = "REVIEWING"
         manifest.planner.status = "REVIEWING"
         self._save(manifest)
-
-        result = self.driver.reply(
-            thread_id=manifest.planner.thread_id,
-            prompt=planner_review_prompt(
-                original_plan_json=plan.raw,
-                worker_result_json=worker_result.raw,
-                diff_summary=evidence.summary,
-                diff_path=str(evidence.patch_path),
-                test_summary=verification.summary,
-                test_output_path=str(verification.output_path),
-            ),
-        )
         evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
-        decision = ReviewDecision.parse(result.content)
+        attempt = ReviewAttemptRecord(
+            id=f"review-{len(manifest.review_attempts) + 1}",
+            worker_id=worker.id,
+            status="ACTIVE",
+            started_at=self.store.now_iso(),
+            evidence_files=evidence_files,
+        )
+        manifest.review_attempts.append(attempt)
+        self._save(manifest)
+        self._record_event(
+            manifest,
+            "planner_review_start",
+            "Planner review started",
+            review_attempt_id=attempt.id,
+            worker_id=worker.id,
+        )
+
+        try:
+            result = self.driver.reply(
+                thread_id=manifest.planner.thread_id,
+                prompt=planner_review_prompt(
+                    original_plan_json=plan.raw,
+                    worker_result_json=worker_result.raw,
+                    diff_summary=evidence.summary,
+                    diff_path=str(evidence.patch_path),
+                    test_summary=verification.summary,
+                    test_output_path=str(verification.output_path),
+                ),
+            )
+            decision = ReviewDecision.parse(result.content)
+        except Exception as exc:
+            attempt.status = "FAILED_RETRYABLE"
+            attempt.completed_at = self.store.now_iso()
+            attempt.error = str(exc)
+            manifest.status = REVIEW_RETRYABLE
+            manifest.planner.status = REVIEW_RETRYABLE
+            worker.status = "DONE" if worker.status == "DONE" else worker.status
+            manifest.review = ReviewRecord(evidence_files=evidence_files)
+            self._save(manifest)
+            self._record_event(
+                manifest,
+                "planner_review_failed",
+                "Planner review failed after Worker evidence was saved",
+                review_attempt_id=attempt.id,
+                worker_id=worker.id,
+                error=str(exc),
+            )
+            return None
+
+        attempt.status = decision.decision.upper()
+        attempt.completed_at = self.store.now_iso()
+        attempt.decision = decision.decision
+        attempt.reason = decision.reason
+        attempt.next_worker_prompt = decision.next_worker_prompt
         manifest.review = ReviewRecord(
             decision=decision.decision,
             reason=decision.reason,
@@ -418,9 +532,87 @@ class RunOrchestrator:
             manifest,
             "planner_review_completed",
             "Planner review completed",
+            review_attempt_id=attempt.id,
             decision=decision.decision,
         )
         return decision
+
+    def _continue_after_needs_changes(
+        self,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        plan: PlannerPlan,
+        decision: ReviewDecision,
+    ) -> RunManifest:
+        if worker.attempt >= self.config.max_attempts:
+            manifest.status = "FAILED"
+            manifest.planner.status = "FAILED"
+            worker.status = "FAILED"
+            self._record_terminal_status(manifest, reason="max_attempts_reached")
+            self._save(manifest)
+            return manifest
+        next_worker_prompt = _rework_worker_prompt(
+            decision.next_worker_prompt or "",
+            plan.acceptance_criteria,
+            plan.verification_commands,
+        )
+        worker.attempt += 1
+        worker_result = self._run_worker_attempt(
+            manifest=manifest,
+            worker=worker,
+            prompt=next_worker_prompt,
+            worktree_path=_required_worktree_path(worker),
+            is_initial_attempt=False,
+        )
+        evidence = self._collect_evidence(
+            manifest=manifest,
+            worker=worker,
+            worktree_path=_required_worktree_path(worker),
+        )
+        verification = self._run_verification(
+            manifest=manifest,
+            worker=worker,
+            worktree_path=_required_worktree_path(worker),
+        )
+        next_decision = self._review_attempt(
+            manifest=manifest,
+            worker=worker,
+            plan=plan,
+            worker_result=worker_result,
+            evidence=evidence,
+            verification=verification,
+        )
+        if next_decision is None:
+            return manifest
+        if next_decision.decision == "needs_changes":
+            return self._continue_after_needs_changes(manifest, worker, plan, next_decision)
+        if next_decision.decision == "approved":
+            apply_report = self._apply_reviewed_diff(
+                manifest=manifest,
+                worker=worker,
+                evidence=evidence,
+            )
+            manifest.status = "APPROVED" if apply_report.applied else "FAILED"
+            manifest.planner.status = manifest.status
+            worker.status = manifest.status
+            self._record_terminal_status(
+                manifest,
+                reason=None if apply_report.applied else "apply_failed",
+            )
+            self._save(manifest)
+            return manifest
+        if next_decision.decision == "blocked":
+            manifest.status = "BLOCKED"
+            manifest.planner.status = "BLOCKED"
+            worker.status = "BLOCKED"
+            self._record_terminal_status(manifest, reason="review_blocked")
+        else:
+            manifest.status = "FAILED"
+            manifest.planner.status = "FAILED"
+            worker.status = "FAILED"
+            self._record_terminal_status(manifest, reason="review_failed")
+        self._save(manifest)
+        return manifest
 
     def _save(self, manifest: RunManifest) -> None:
         self.store.save(manifest)
@@ -600,6 +792,47 @@ def _worker_status_from_result(result: WorkerResult) -> str:
     if result.status == "work_done":
         return "DONE"
     return result.status.upper()
+
+
+def _evidence_from_review_record(review: ReviewRecord) -> DiffEvidence:
+    summary_path = _first_existing_path(review.evidence_files, "git-diff-summary.md")
+    patch_path = _first_existing_path(review.evidence_files, "git-diff.patch")
+    summary = _read_text(summary_path)
+    patch = _read_text(patch_path)
+    return DiffEvidence(
+        summary_path=summary_path,
+        patch_path=patch_path,
+        summary=summary,
+        patch=patch,
+    )
+
+
+def _verification_from_review_record(review: ReviewRecord) -> VerificationReport:
+    output_path = _first_existing_path(review.evidence_files, "verification-output.txt")
+    return VerificationReport(
+        summary=_read_text(output_path) or "Saved verification output is available.",
+        output_path=output_path,
+        results=[],
+    )
+
+
+def _first_existing_path(paths: List[str], name: str) -> Path:
+    for value in paths:
+        path = Path(value)
+        if path.name == name:
+            return path
+    return Path(paths[0]) if paths else Path(name)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _append_unique(existing: List[str], new_values: List[str]) -> List[str]:

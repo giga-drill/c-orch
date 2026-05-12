@@ -231,6 +231,7 @@ class OrchestratorTests(unittest.TestCase):
                     "worker_done",
                     "evidence_collected",
                     "verification_finished",
+                    "planner_review_start",
                     "planner_review_completed",
                     "apply_completed",
                     "run_terminal_status",
@@ -239,9 +240,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[2]["attempt"], 1)
             self.assertEqual(events[2]["worker_id"], "worker-1")
             self.assertEqual(events[3]["status"], "DONE")
-            self.assertEqual(events[6]["decision"], "approved")
-            self.assertTrue(events[7]["applied"])
-            self.assertEqual(events[8]["status"], "APPROVED")
+            self.assertEqual(events[7]["decision"], "approved")
+            self.assertTrue(events[8]["applied"])
+            self.assertEqual(events[9]["status"], "APPROVED")
 
     def test_plan_review_required_pauses_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -482,6 +483,77 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[-1]["type"], "run_terminal_status")
             self.assertEqual(events[-1]["status"], "BLOCKED")
             self.assertEqual(events[-1]["reason"], "review_blocked")
+
+    def test_review_failure_preserves_worker_result_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "REVIEW_RETRYABLE")
+            self.assertEqual(result.planner.status, "REVIEW_RETRYABLE")
+            self.assertEqual(result.workers[0].status, "DONE")
+            self.assertIsNotNone(result.workers[0].result)
+            self.assertEqual(result.review_attempts[-1].status, "FAILED_RETRYABLE")
+            self.assertIn("pop from empty list", result.review_attempts[-1].error)
+            self.assertIsNotNone(result.review)
+            self.assertIn("git-diff.patch", result.review.evidence_files[1])
+
+            events = store.load_events(manifest.run_id)
+            self.assertIn("planner_review_failed", [event["type"] for event in events])
+
+    def test_retry_review_reuses_saved_worker_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            first_driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=first_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+            self.assertEqual(paused.status, "REVIEW_RETRYABLE")
+
+            retry_driver = FakeDriver(
+                start_results=[],
+                reply_results=[_session("planner-thread", _review("approved"))],
+            )
+            applier = FakeDiffApplier()
+            result = RunOrchestrator(
+                store=store,
+                driver=retry_driver,
+                diff_applier=applier,
+            ).retry_review(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(retry_driver.start_calls, [])
+            self.assertEqual(retry_driver.reply_calls[0]["thread_id"], "planner-thread")
+            self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(
+                [attempt.status for attempt in result.review_attempts],
+                ["FAILED_RETRYABLE", "APPROVED"],
+            )
 
 
 def _create_manifest(root: Path):

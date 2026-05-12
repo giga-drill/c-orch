@@ -21,6 +21,22 @@ class CodexSessionSnapshot:
     final_epoch: Optional[float]
 
 
+@dataclass(frozen=True)
+class CodexSessionActivity:
+    timestamp: Optional[str]
+    kind: str
+    label: str
+    detail: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Optional[str]]:
+        return {
+            "timestamp": self.timestamp,
+            "kind": self.kind,
+            "label": self.label,
+            "detail": self.detail,
+        }
+
+
 class CodexSessionLogStore:
     def __init__(self, sessions_root: Optional[Pathish] = None) -> None:
         self.sessions_root = (
@@ -56,6 +72,17 @@ class CodexSessionLogStore:
         if not candidates:
             return None
         return max(candidates, key=_snapshot_sort_key)
+
+    def load_recent_activity(
+        self,
+        *,
+        thread_id: str,
+        limit: int = 50,
+    ) -> List[CodexSessionActivity]:
+        snapshot = self.find_latest_session(thread_id=thread_id, source=None)
+        if snapshot is None:
+            return []
+        return _read_session_activity(snapshot.path, limit=limit)
 
     def _candidate_paths(
         self,
@@ -132,6 +159,97 @@ def _read_session_snapshot(
         final_content=final_content,
         final_epoch=final_epoch,
     )
+
+
+def _read_session_activity(path: Path, *, limit: int) -> List[CodexSessionActivity]:
+    activities: List[CodexSessionActivity] = []
+    try:
+        with path.open("r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                activity = _activity_from_record(record)
+                if activity is not None:
+                    activities.append(activity)
+    except OSError:
+        return []
+    if limit <= 0:
+        return activities
+    return activities[-limit:]
+
+
+def _activity_from_record(record: Dict[str, Any]) -> Optional[CodexSessionActivity]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
+    record_type = record.get("type")
+    payload_type = payload.get("type")
+    if record_type == "event_msg":
+        if payload_type == "agent_message":
+            return CodexSessionActivity(
+                timestamp=timestamp,
+                kind="message",
+                label="中间消息",
+                detail=_trim(payload.get("message")),
+            )
+        if payload_type == "task_complete":
+            return CodexSessionActivity(
+                timestamp=timestamp,
+                kind="complete",
+                label="任务完成",
+                detail=_trim(payload.get("last_agent_message")),
+            )
+        if payload_type == "turn_aborted":
+            return CodexSessionActivity(
+                timestamp=timestamp,
+                kind="aborted",
+                label="回合中断",
+                detail=None,
+            )
+        return None
+    if record_type != "response_item":
+        return None
+    item_type = payload.get("type")
+    if item_type in {"function_call", "custom_tool_call"}:
+        name = payload.get("name") or payload.get("call_id") or "tool"
+        return CodexSessionActivity(
+            timestamp=timestamp,
+            kind="tool_call",
+            label=f"调用工具: {name}",
+            detail=_trim(payload.get("arguments") or payload.get("input")),
+        )
+    if item_type in {"function_call_output", "custom_tool_call_output"}:
+        return CodexSessionActivity(
+            timestamp=timestamp,
+            kind="tool_output",
+            label="工具返回",
+            detail=_trim(payload.get("output")),
+        )
+    if item_type == "message" and payload.get("role") == "assistant":
+        return CodexSessionActivity(
+            timestamp=timestamp,
+            kind="message",
+            label="Assistant 消息",
+            detail=_trim(_content_text(payload.get("content"))),
+        )
+    return None
+
+
+def _trim(value: Any, *, max_chars: int = 600) -> Optional[str]:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
 
 
 def _final_content(record: Dict[str, Any]) -> Optional[str]:
