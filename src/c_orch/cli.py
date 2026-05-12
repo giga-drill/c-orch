@@ -193,6 +193,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approve a PLAN_REVIEW_REQUIRED run and continue to the Worker.",
     )
     resume.add_argument(
+        "--revise-plan",
+        default=None,
+        help="Human feedback for revising a PLAN_REVIEW_REQUIRED plan in the same Planner thread.",
+    )
+    resume.add_argument(
+        "--revise-plan-file",
+        default=None,
+        help="Path to a UTF-8 text file containing plan revision feedback.",
+    )
+    resume.add_argument(
         "--retry-review",
         action="store_true",
         help="Retry a saved Planner review after Worker evidence has been preserved.",
@@ -526,6 +536,18 @@ def run_resume(args: argparse.Namespace) -> int:
         or manifest.planner.codex_binary_path
         or "unknown"
     )
+    revise_feedback: Optional[str] = None
+    try:
+        revise_feedback = _resolve_plan_revision_feedback(args, cwd=cwd)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if revise_feedback and args.retry_review:
+        print("--revise-plan/--revise-plan-file cannot be combined with --retry-review", file=sys.stderr)
+        return 1
+    if revise_feedback and args.approve_plan:
+        print("--revise-plan/--revise-plan-file cannot be combined with --approve-plan", file=sys.stderr)
+        return 1
 
     if _is_terminal_manifest_status(manifest.status):
         _print_run_summary(
@@ -537,7 +559,7 @@ def run_resume(args: argparse.Namespace) -> int:
         )
         return 0
 
-    if manifest.status == RUN_PLAN_REVIEW_REQUIRED and not args.approve_plan:
+    if manifest.status == RUN_PLAN_REVIEW_REQUIRED and not args.approve_plan and not revise_feedback:
         _print_run_summary(
             manifest=manifest,
             manifest_path=store.manifest_path(manifest.run_id),
@@ -545,7 +567,7 @@ def run_resume(args: argparse.Namespace) -> int:
             planner_model=planner_model,
             worker_model=worker_model,
         )
-        print("next: rerun resume with --approve-plan after human review")
+        print("next: rerun resume with --approve-plan or --revise-plan after human review")
         return 0
 
     if manifest.status == RUN_REVIEW_RETRYABLE and not args.retry_review:
@@ -594,12 +616,14 @@ def run_resume(args: argparse.Namespace) -> int:
                     approve_plan=args.approve_plan,
                 ),
             )
-            if args.retry_review:
+            if revise_feedback:
+                manifest = orchestrator.revise_plan(manifest, revise_feedback)
+            elif args.retry_review:
                 manifest = orchestrator.retry_review(manifest)
             else:
                 manifest = orchestrator.run(manifest)
     except Exception as exc:
-        if not _is_terminal_manifest_status(manifest.status):
+        if not revise_feedback and not _is_terminal_manifest_status(manifest.status):
             manifest.status = RUN_FAILED
         store.save(manifest)
         _print_run_summary(
@@ -786,6 +810,24 @@ def _first_value(*values: Optional[str]) -> Optional[str]:
         if value is not None:
             return value
     return None
+
+
+def _resolve_plan_revision_feedback(args: argparse.Namespace, *, cwd: Path) -> Optional[str]:
+    values = []
+    if args.revise_plan is not None:
+        values.append(args.revise_plan)
+    if args.revise_plan_file is not None:
+        path = _resolve_under_cwd(cwd, args.revise_plan_file)
+        try:
+            values.append(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"failed to read revise plan file: {exc}") from exc
+    if not values:
+        return None
+    feedback = "\n\n".join(part.strip() for part in values if part.strip()).strip()
+    if not feedback:
+        raise ValueError("plan revision feedback cannot be empty")
+    return feedback
 
 
 def _apply_resume_session_overrides(manifest: Any, args: argparse.Namespace) -> None:

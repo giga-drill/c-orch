@@ -450,7 +450,7 @@ approval_policy = "on-request"
             output = stdout.getvalue()
             self.assertIn("status: PLAN_REVIEW_REQUIRED", output)
             self.assertIn("plan_approval: pending", output)
-            self.assertIn("next: rerun resume with --approve-plan", output)
+            self.assertIn("next: rerun resume with --approve-plan or --revise-plan", output)
 
     def test_resume_approve_plan_passes_approval_to_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -506,6 +506,60 @@ approval_policy = "on-request"
             config = orchestrator_cls.call_args.kwargs["config"]
             self.assertTrue(config.require_plan_approval)
             self.assertTrue(config.approve_plan)
+
+    def test_resume_revise_plan_calls_orchestrator_revise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = cwd / "runs"
+            store = RunStore(runs_dir)
+            manifest = store.create_run(
+                cwd=cwd,
+                user_task="Implement feature X",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/custom/codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.planner.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Build the feature",
+                approval_status="pending",
+            )
+            store.save(manifest)
+
+            driver = FakeDriver()
+            revised_manifest = store.load(manifest.run_id)
+            revised_manifest.status = "PLAN_REVIEW_REQUIRED"
+
+            with mock.patch(
+                "c_orch.mcp_driver.McpCodexDriver",
+                return_value=driver,
+            ), mock.patch(
+                "c_orch.orchestrator.RunOrchestrator",
+            ) as orchestrator_cls, redirect_stdout(StringIO()):
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.revise_plan.return_value = revised_manifest
+                exit_code = main(
+                    [
+                        "resume",
+                        manifest.run_id,
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                        "--revise-plan",
+                        "Please tighten acceptance criteria",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(orchestrator.revise_plan.call_count, 1)
+            call = orchestrator.revise_plan.call_args
+            self.assertEqual(call.args[0].run_id, manifest.run_id)
+            self.assertEqual(call.args[1], "Please tighten acceptance criteria")
 
     def test_ui_serves_resolved_runs_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

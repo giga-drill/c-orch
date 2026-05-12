@@ -398,6 +398,85 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("plan_approved", [event["type"] for event in events])
             self.assertEqual(events[-1]["type"], "run_terminal_status")
 
+    def test_revise_plan_reuses_planner_thread_and_replaces_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            planner_driver = FakeDriver(
+                start_results=[_session("planner-thread", _planner_plan())],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=planner_driver,
+                config=OrchestratorConfig(require_plan_approval=True),
+            ).run(manifest)
+            self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(len(planner_driver.start_calls), 1)
+
+            revise_driver = FakeDriver(
+                start_results=[],
+                reply_results=[_session("planner-thread", _planner_plan_revised())],
+            )
+            revised = RunOrchestrator(
+                store=store,
+                driver=revise_driver,
+                config=OrchestratorConfig(require_plan_approval=True),
+            ).revise_plan(store.load(manifest.run_id), "Please tighten scope.")
+
+            self.assertEqual(revised.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(revised.planner.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(revised.plan.summary, "Revised plan")
+            self.assertEqual(revised.plan.worker_prompt, "Build only the scheduler path")
+            self.assertEqual(revised.plan.approval_status, "pending")
+            self.assertEqual(revised.plan.approved_at, None)
+            self.assertEqual(revised.plan.approved_by, None)
+            self.assertEqual(revised.acceptance_criteria, ["Queue does not create duplicate runs"])
+            self.assertEqual(revised.verification_commands, ["python -m unittest tests/test_scheduler.py"])
+            self.assertEqual(len(revise_driver.start_calls), 0)
+            self.assertEqual(len(revise_driver.reply_calls), 1)
+            self.assertEqual(revise_driver.reply_calls[0]["thread_id"], "planner-thread")
+            self.assertIn("Please tighten scope.", revise_driver.reply_calls[0]["prompt"])
+            self.assertEqual(len(revised.plan_revisions), 1)
+            self.assertEqual(revised.plan_revisions[0].id, "plan-revision-1")
+            self.assertEqual(revised.plan_revisions[0].human_feedback, "Please tighten scope.")
+            self.assertEqual(revised.plan_revisions[0].previous_plan["summary"], "Plan it")
+            self.assertEqual(revised.plan_revisions[0].new_plan["summary"], "Revised plan")
+
+            events = store.load_events(manifest.run_id)
+            self.assertIn("planner_plan_revision_started", [event["type"] for event in events])
+            self.assertIn("planner_plan_revised", [event["type"] for event in events])
+
+    def test_revise_plan_failure_preserves_plan_review_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            paused = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(
+                    start_results=[_session("planner-thread", _planner_plan())],
+                    reply_results=[],
+                ),
+                config=OrchestratorConfig(require_plan_approval=True),
+            ).run(manifest)
+            self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
+
+            failing_driver = FakeDriver(start_results=[], reply_results=[])
+            with self.assertRaises(IndexError):
+                RunOrchestrator(
+                    store=store,
+                    driver=failing_driver,
+                    config=OrchestratorConfig(require_plan_approval=True),
+                ).revise_plan(store.load(manifest.run_id), "Please tighten scope.")
+
+            loaded = store.load(manifest.run_id)
+            self.assertEqual(loaded.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(loaded.planner.status, "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(loaded.plan.summary, "Plan it")
+            self.assertEqual(loaded.plan_revisions, [])
+            events = store.load_events(manifest.run_id)
+            self.assertIn("planner_plan_revision_failed", [event["type"] for event in events])
+
     def test_needs_changes_reuses_worker_thread_then_reviews_again(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -939,6 +1018,19 @@ def _planner_plan() -> str:
             "worker_prompt": "Build the feature",
             "verification_commands": ["python -m unittest"],
             "risk_notes": [],
+        }
+    )
+
+
+def _planner_plan_revised() -> str:
+    return json.dumps(
+        {
+            "status": "plan_ready",
+            "summary": "Revised plan",
+            "acceptance_criteria": ["Queue does not create duplicate runs"],
+            "worker_prompt": "Build only the scheduler path",
+            "verification_commands": ["python -m unittest tests/test_scheduler.py"],
+            "risk_notes": ["Avoid touching unrelated queue states"],
         }
     )
 

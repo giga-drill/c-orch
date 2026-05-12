@@ -7,7 +7,7 @@ from typing import Callable, Optional, Protocol
 from .drivers import CodexDriver
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
-from .states import RUN_APPROVED, RUN_BLOCKED, RUN_FAILED
+from .states import RUN_APPROVED, RUN_BLOCKED, RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -84,6 +84,18 @@ class TaskScheduler:
                 queue.status = QUEUE_APPROVED
                 self.task_store.save(queue)
                 return queue
+            if task.active_run_id:
+                active = self._load_active_run(task.active_run_id)
+                if active is not None and active.status == RUN_PLAN_REVIEW_REQUIRED:
+                    queue.status = QUEUE_RUNNING
+                    self.task_store.update_task(
+                        queue,
+                        task.task_id,
+                        status=TASK_RUNNING,
+                        reason="plan_review_required",
+                    )
+                    self.task_store.save(queue)
+                    return queue
             if task.status == TASK_FAILED:
                 queue.status = QUEUE_FAILED
                 self.task_store.save(queue)
@@ -192,6 +204,17 @@ class TaskScheduler:
                 processed += 1
                 continue
 
+            if manifest.status == RUN_PLAN_REVIEW_REQUIRED:
+                queue.status = QUEUE_RUNNING
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_RUNNING,
+                    reason="plan_review_required",
+                )
+                self.task_store.save(queue)
+                return queue
+
             if manifest.status == RUN_BLOCKED:
                 queue.status = QUEUE_BLOCKED
                 self.task_store.update_task(
@@ -227,7 +250,13 @@ class TaskScheduler:
                 sandbox=self.config.sandbox,
                 approval_policy=self.config.approval_policy,
                 max_attempts=self.config.max_attempts,
-                require_plan_approval=False,
+                require_plan_approval=True,
                 approve_plan=False,
             ),
         )
+
+    def _load_active_run(self, run_id: str) -> Optional[RunManifest]:
+        try:
+            return self.run_store.load(run_id)
+        except OSError:
+            return None

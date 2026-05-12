@@ -76,6 +76,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "resume")
         self.assertTrue(args.approve_plan)
 
+    def test_resume_command_parses_revise_plan(self) -> None:
+        args = build_parser().parse_args(
+            ["resume", "run-123", "--revise-plan", "Please reduce scope"]
+        )
+        self.assertEqual(args.command, "resume")
+        self.assertEqual(args.revise_plan, "Please reduce scope")
+        self.assertEqual(args.revise_plan_file, None)
+
     def test_ui_command_parses(self) -> None:
         args = build_parser().parse_args(
             [

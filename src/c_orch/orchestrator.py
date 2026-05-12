@@ -7,9 +7,15 @@ from typing import Any, Iterable, List, Optional, Protocol, Union
 
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver
-from .prompts import planner_initial_prompt, planner_review_prompt, worker_prompt
+from .prompts import (
+    planner_initial_prompt,
+    planner_revision_prompt,
+    planner_review_prompt,
+    worker_prompt,
+)
 from .run_store import (
     PlanRecord,
+    PlanRevisionRecord,
     ReviewAttemptRecord,
     ReviewRecord,
     RunManifest,
@@ -26,6 +32,7 @@ from .states import (
     RUN_NEEDS_CHANGES,
     RUN_PLAN_APPROVED,
     RUN_PLAN_READY,
+    RUN_PLAN_REVISING,
     RUN_PLAN_REVIEW_REQUIRED,
     RUN_PLANNING,
     RUN_REVIEW_RETRYABLE,
@@ -299,6 +306,77 @@ class RunOrchestrator:
         worker.status = RUN_FAILED
         self._record_terminal_status(manifest, reason="review_failed")
         self._save(manifest)
+        return manifest
+
+    def revise_plan(self, manifest: RunManifest, feedback: str) -> RunManifest:
+        normalized_feedback = feedback.strip()
+        if not normalized_feedback:
+            raise OrchestratorError("plan revision feedback cannot be empty")
+        if manifest.status != RUN_PLAN_REVIEW_REQUIRED:
+            raise OrchestratorError("run is not waiting for plan revision")
+        if manifest.plan is None:
+            raise OrchestratorError("cannot revise plan before planner has produced one")
+        if not manifest.planner.thread_id:
+            raise OrchestratorError("cannot revise plan without planner thread_id")
+
+        previous_plan = manifest.plan.to_dict()
+        manifest.status = RUN_PLAN_REVISING
+        manifest.planner.status = RUN_PLAN_REVISING
+        self._save(manifest)
+        self._record_event(
+            manifest,
+            "planner_plan_revision_started",
+            "Planner plan revision started",
+        )
+
+        try:
+            result = self.driver.reply(
+                thread_id=manifest.planner.thread_id,
+                prompt=planner_revision_prompt(human_feedback=normalized_feedback),
+            )
+            revised = PlannerPlan.parse(result.content)
+        except Exception as exc:
+            manifest.status = RUN_PLAN_REVIEW_REQUIRED
+            manifest.planner.status = RUN_PLAN_REVIEW_REQUIRED
+            self._save(manifest)
+            self._record_event(
+                manifest,
+                "planner_plan_revision_failed",
+                "Planner plan revision failed",
+                error=str(exc),
+            )
+            raise
+        manifest.acceptance_criteria = list(revised.acceptance_criteria)
+        manifest.verification_commands = list(revised.verification_commands)
+        manifest.plan = PlanRecord(
+            summary=revised.summary,
+            worker_prompt=revised.worker_prompt,
+            risk_notes=list(revised.risk_notes),
+            raw=dict(revised.raw),
+            approval_status="pending",
+            approved_at=None,
+            approved_by=None,
+        )
+        revision = PlanRevisionRecord(
+            id=f"plan-revision-{len(manifest.plan_revisions) + 1}",
+            created_at=self.store.now_iso(),
+            human_feedback=normalized_feedback,
+            previous_plan=previous_plan,
+            new_plan=manifest.plan.to_dict(),
+        )
+        manifest.plan_revisions.append(revision)
+        manifest.status = RUN_PLAN_READY
+        manifest.planner.status = RUN_PLAN_READY
+        self._save(manifest)
+        self._record_event(
+            manifest,
+            "planner_plan_revised",
+            "Planner plan revised",
+            revision_id=revision.id,
+            acceptance_count=len(manifest.acceptance_criteria),
+            verification_count=len(manifest.verification_commands),
+        )
+        self._require_plan_review(manifest)
         return manifest
 
     def _start_planner(self, manifest: RunManifest, worker: WorkerRecord) -> PlannerPlan:

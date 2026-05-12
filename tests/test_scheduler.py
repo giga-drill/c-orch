@@ -35,6 +35,75 @@ class _FakeOrchestrator:
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_active_run_waiting_plan_review_keeps_task_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_PENDING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+
+            self.assertEqual(queue.status, "RUNNING")
+            loaded = task_store.load()
+            self.assertEqual(loaded.tasks[0].status, TASK_RUNNING)
+            self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
+            self.assertEqual(fake.run_ids, [])
+
+    def test_new_run_waiting_plan_review_keeps_task_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("PLAN_REVIEW_REQUIRED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+
+            self.assertEqual(queue.status, "RUNNING")
+            loaded = task_store.load()
+            self.assertEqual(loaded.tasks[0].status, TASK_RUNNING)
+            self.assertEqual(loaded.tasks[0].reason, "plan_review_required")
+            self.assertEqual(loaded.tasks[0].active_run_id, fake.run_ids[0])
+            self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
+
     def test_runs_two_pending_tasks_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

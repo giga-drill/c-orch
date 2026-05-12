@@ -198,6 +198,38 @@ class PlanRecord:
 
 
 @dataclass
+class PlanRevisionRecord:
+    id: str
+    created_at: str
+    human_feedback: str
+    previous_plan: Dict[str, Any]
+    new_plan: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at,
+            "human_feedback": self.human_feedback,
+            "previous_plan": dict(self.previous_plan),
+            "new_plan": dict(self.new_plan),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlanRevisionRecord":
+        return cls(
+            id=str(data.get("id", "")),
+            created_at=str(data.get("created_at", "")),
+            human_feedback=str(data.get("human_feedback", "")),
+            previous_plan=dict(data.get("previous_plan", {}))
+            if isinstance(data.get("previous_plan"), dict)
+            else {},
+            new_plan=dict(data.get("new_plan", {}))
+            if isinstance(data.get("new_plan"), dict)
+            else {},
+        )
+
+
+@dataclass
 class RunManifest:
     run_id: str
     cwd: str
@@ -208,6 +240,7 @@ class RunManifest:
     acceptance_criteria: List[str]
     verification_commands: List[str]
     plan: Optional[PlanRecord]
+    plan_revisions: List[PlanRevisionRecord]
     review: Optional[ReviewRecord]
     review_attempts: List[ReviewAttemptRecord]
     created_at: str
@@ -228,6 +261,7 @@ class RunManifest:
             "acceptance_criteria": list(self.acceptance_criteria),
             "verification_commands": list(self.verification_commands),
             "plan": self.plan.to_dict() if self.plan is not None else None,
+            "plan_revisions": [revision.to_dict() for revision in self.plan_revisions],
             "review": self.review.to_dict() if self.review is not None else None,
             "review_attempts": [attempt.to_dict() for attempt in self.review_attempts],
             "created_at": self.created_at,
@@ -241,6 +275,7 @@ class RunManifest:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunManifest":
         review_data = data.get("review")
+        plan_revisions = data.get("plan_revisions")
         review_attempts = data.get("review_attempts")
         return cls(
             run_id=str(data.get("run_id", "")),
@@ -255,6 +290,11 @@ class RunManifest:
             acceptance_criteria=_list_of_strings(data.get("acceptance_criteria")),
             verification_commands=_list_of_strings(data.get("verification_commands")),
             plan=PlanRecord.from_dict(data["plan"]) if isinstance(data.get("plan"), dict) else None,
+            plan_revisions=[
+                PlanRevisionRecord.from_dict(revision)
+                for revision in plan_revisions
+                if isinstance(revision, dict)
+            ] if isinstance(plan_revisions, list) else [],
             review=ReviewRecord.from_dict(review_data) if review_data else None,
             review_attempts=[
                 ReviewAttemptRecord.from_dict(attempt)
@@ -324,6 +364,7 @@ class RunStore:
             acceptance_criteria=[],
             verification_commands=[],
             plan=None,
+            plan_revisions=[],
             review=None,
             review_attempts=[],
             created_at=now,

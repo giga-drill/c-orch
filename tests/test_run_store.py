@@ -6,7 +6,13 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.run_store import (
+    PlanRecord,
+    PlanRevisionRecord,
+    ReviewAttemptRecord,
+    ReviewRecord,
+    RunStore,
+)
 
 
 class RunStoreTests(unittest.TestCase):
@@ -96,6 +102,15 @@ class RunStoreTests(unittest.TestCase):
                     evidence_files=["runs/example/evidence/git-diff.patch"],
                 )
             )
+            manifest.plan_revisions.append(
+                PlanRevisionRecord(
+                    id="plan-revision-1",
+                    created_at="2026-05-12T09:00:30+08:00",
+                    human_feedback="Tighten scope",
+                    previous_plan={"summary": "old"},
+                    new_plan={"summary": "new"},
+                )
+            )
             manifest.workers[0].result = {"status": "work_done", "summary": "done"}
 
             store.save(manifest)
@@ -111,6 +126,9 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.plan.raw, {"status": "plan_ready"})
             self.assertEqual(loaded.plan.approval_status, "approved")
             self.assertEqual(loaded.plan.approved_by, "human")
+            self.assertEqual(len(loaded.plan_revisions), 1)
+            self.assertEqual(loaded.plan_revisions[0].human_feedback, "Tighten scope")
+            self.assertEqual(loaded.plan_revisions[0].new_plan["summary"], "new")
             self.assertIsNotNone(loaded.review)
             self.assertEqual(loaded.review.decision, "needs_changes")
             self.assertEqual(

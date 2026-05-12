@@ -92,3 +92,22 @@ If decision is "needs_changes", next_worker_prompt must be a concrete,
 self-contained instruction for the same Worker thread.
 """
 
+
+def planner_revision_prompt(*, human_feedback: str) -> str:
+    return f"""You are the Planner for c-orch.
+
+The human reviewer asked you to revise your previous plan.
+
+Human feedback:
+{human_feedback}
+
+Return exactly one complete JSON plan object with this shape:
+{{
+  "status": "plan_ready",
+  "summary": "Short plan summary",
+  "acceptance_criteria": ["Criterion 1"],
+  "worker_prompt": "Self-contained Worker instructions",
+  "verification_commands": ["command to run"],
+  "risk_notes": ["Risk note"]
+}}
+"""

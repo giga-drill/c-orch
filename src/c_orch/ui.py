@@ -89,7 +89,7 @@ def make_dashboard_handler(runs_dir: Path, queue_path: Optional[Path]) -> Type[B
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
                 return
             action = data.get("action")
-            result = _run_action(runs_dir, run_id, action)
+            result = _run_action(runs_dir, run_id, action, data.get("feedback"))
             if result is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
                 return
@@ -124,6 +124,7 @@ def _run_action(
     runs_dir: Path,
     run_id: str,
     action: Any,
+    feedback: Any = None,
 ) -> Optional[Tuple[HTTPStatus, Dict[str, Any]]]:
     if not _valid_run_id(run_id):
         return None
@@ -132,8 +133,11 @@ def _run_action(
         manifest = store.load(run_id)
     except OSError:
         return None
-    if action not in {"approve-plan", "retry-review"}:
+    if action not in {"approve-plan", "revise-plan", "retry-review"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+    if action == "revise-plan":
+        if not isinstance(feedback, str) or not feedback.strip():
+            return HTTPStatus.BAD_REQUEST, {"error": "feedback is required for revise-plan"}
 
     from .mcp_driver import McpCodexDriver
     from .orchestrator import OrchestratorConfig, RunOrchestrator
@@ -155,7 +159,9 @@ def _run_action(
                     approve_plan=action == "approve-plan",
                 ),
             )
-            if action == "retry-review":
+            if action == "revise-plan":
+                manifest = orchestrator.revise_plan(manifest, feedback.strip())
+            elif action == "retry-review":
                 manifest = orchestrator.retry_review(manifest)
             else:
                 manifest = orchestrator.run(manifest)
@@ -596,6 +602,7 @@ INDEX_HTML = """<!doctype html>
     .BLOCKED, .NEEDS_CHANGES, .REVIEW_RETRYABLE { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     .WORKING, .REVIEWING, .PLANNING, .WORK_DONE, .PLAN_READY, .PLAN_APPROVED { color: var(--blue); border-color: rgba(37,111,146,.3); background: rgba(37,111,146,.08); }
     .PLAN_REVIEW_REQUIRED { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
+    .PLAN_REVISING { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     main {
       padding: 22px;
       min-width: 0;
@@ -687,6 +694,16 @@ INDEX_HTML = """<!doctype html>
       font-size: 12px;
       line-height: 1.45;
     }
+    .planFeedback {
+      margin-top: 8px;
+      width: 100%;
+      min-height: 108px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      resize: vertical;
+    }
     ul {
       margin: 8px 0 0;
       padding-left: 18px;
@@ -767,6 +784,7 @@ INDEX_HTML = """<!doctype html>
       "PLANNING",
       "PLAN_READY",
       "PLAN_REVIEW_REQUIRED",
+      "PLAN_REVISING",
       "PLAN_APPROVED",
       "WORKING",
       "WORK_DONE",
@@ -782,6 +800,7 @@ INDEX_HTML = """<!doctype html>
       PLANNING: "规划中",
       PLAN_READY: "方案已生成",
       PLAN_REVIEW_REQUIRED: "等待人工审方案",
+      PLAN_REVISING: "Planner 修订方案中",
       PLAN_APPROVED: "方案已通过",
       WORKING: "Worker 执行中",
       WORK_DONE: "Worker 已完成",
@@ -885,20 +904,34 @@ INDEX_HTML = """<!doctype html>
     }
 
     async function runAction(runId, action) {
+      return runActionWithPayload(runId, action, {});
+    }
+
+    async function runActionWithPayload(runId, action, actionPayload) {
       const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/actions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify({ action })
+        body: JSON.stringify({ action, ...actionPayload })
       });
       if (!response.ok) {
         const text = await response.text();
         alert(text);
         return;
       }
-      const payload = await response.json();
-      renderDetail(payload);
+      const resultPayload = await response.json();
+      renderDetail(resultPayload);
       await loadRuns(false);
+    }
+
+    async function runRevisePlan(runId) {
+      const input = document.getElementById(`planFeedback-${runId}`);
+      const feedback = input && typeof input.value === "string" ? input.value.trim() : "";
+      if (!feedback) {
+        alert("请先填写修改意见。");
+        return;
+      }
+      await runActionWithPayload(runId, "revise-plan", { feedback });
     }
 
     function renderDetail(payload) {
@@ -931,9 +964,17 @@ INDEX_HTML = """<!doctype html>
       )).join("");
 
       const plan = manifest.plan || null;
+      const revisePanel = run.status === "PLAN_REVIEW_REQUIRED" && plan ? `
+        <div style="margin-top:10px">
+          <textarea class="planFeedback" id="planFeedback-${escapeHtml(run.run_id)}" placeholder="请输入修改意见，Planner 会在同一线程里重写完整方案 JSON"></textarea>
+          <div style="margin-top:8px">
+            <button type="button" onclick="runRevisePlan('${escapeJs(run.run_id)}')">让 Planner 重新生成计划</button>
+          </div>
+        </div>
+      ` : "";
       const actionButtons = [
         run.status === "PLAN_REVIEW_REQUIRED" && plan
-          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'approve-plan')">通过并启动 Worker</button>`
+          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'approve-plan')">通过并启动 Worker</button>${revisePanel}`
           : "",
         run.status === "REVIEW_RETRYABLE"
           ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'retry-review')">重新让 Planner 复核</button>`

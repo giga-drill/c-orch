@@ -3,10 +3,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
-from c_orch.ui import INDEX_HTML, build_queue_payload, build_run_payload, build_runs_payload
+from c_orch.ui import INDEX_HTML, _run_action, build_queue_payload, build_run_payload, build_runs_payload
 
 
 class UiTests(unittest.TestCase):
@@ -148,7 +149,42 @@ class UiTests(unittest.TestCase):
         self.assertIn("Worker 指令", INDEX_HTML)
         self.assertIn("Worker 活动", INDEX_HTML)
         self.assertIn("通过并启动 Worker", INDEX_HTML)
+        self.assertIn("让 Planner 重新生成计划", INDEX_HTML)
         self.assertIn("重新让 Planner 复核", INDEX_HTML)
+
+    def test_run_action_revise_plan_passes_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/bin/codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.planner.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan", worker_prompt="Prompt")
+            store.save(manifest)
+
+            with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls, mock.patch(
+                "c_orch.orchestrator.RunOrchestrator"
+            ) as orchestrator_cls:
+                driver = driver_cls.return_value.__enter__.return_value
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.revise_plan.return_value = manifest
+                status, _payload = _run_action(
+                    root / "runs",
+                    manifest.run_id,
+                    "revise-plan",
+                    "Please update the plan",
+                )
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(orchestrator.revise_plan.call_count, 1)
+            self.assertEqual(orchestrator.revise_plan.call_args.args[1], "Please update the plan")
+            driver_cls.assert_called_once()
 
 
 if __name__ == "__main__":
