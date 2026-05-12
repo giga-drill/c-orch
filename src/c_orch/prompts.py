@@ -16,6 +16,10 @@ Worker model: {worker_model}
 User task:
 {user_task}
 
+Use Simplified Chinese for all human-readable plan content, including summary,
+acceptance_criteria, worker_prompt, and risk_notes. Keep JSON keys, status
+values, file paths, and commands unchanged.
+
 Return exactly one JSON object with this shape:
 {{
   "status": "plan_ready",
@@ -100,6 +104,10 @@ The human reviewer asked you to revise your previous plan.
 
 Human feedback:
 {human_feedback}
+
+Use Simplified Chinese for all human-readable plan content, including summary,
+acceptance_criteria, worker_prompt, and risk_notes. Keep JSON keys, status
+values, file paths, and commands unchanged.
 
 Return exactly one complete JSON plan object with this shape:
 {{
