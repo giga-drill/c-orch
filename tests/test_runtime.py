@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import List
 from unittest import mock
 
+from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalStore
+from c_orch.run_store import PlanRecord
 from c_orch.runtime import COrchRuntime
 from c_orch.scheduler import SchedulerConfig
+from c_orch.states import RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
 from c_orch.task_store import TASK_WAITING, TaskStore
 
 
@@ -17,8 +20,12 @@ class _FakeOrchestrator:
         self.run_store = run_store
         self.status = status
         self.run_ids: List[str] = []
+        self.run_calls = 0
+        self.input_statuses: List[str] = []
 
     def run(self, manifest):  # type: ignore[no-untyped-def]
+        self.run_calls += 1
+        self.input_statuses.append(manifest.status)
         manifest.status = self.status
         self.run_store.save(manifest)
         self.run_ids.append(manifest.run_id)
@@ -103,6 +110,74 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
+
+    def test_proposal_approve_dispatches_existing_approved_run_to_worker(self) -> None:
+        from c_orch.run_store import RunStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            manifest.status = RUN_PLAN_REVIEW_REQUIRED
+            manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+            run_store.save(manifest)
+
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1")
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                run_id=manifest.run_id,
+                status=RUN_PLAN_REVIEW_REQUIRED,
+            )
+            proposal_store.save(pool)
+
+            fake = _FakeOrchestrator(run_store, "APPROVED")
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                scheduler_config=_scheduler_config(root),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            status, _payload = runtime.proposal_action(proposal.proposal_id, "approve-plan")
+
+            self.assertEqual(int(status), 200)
+            self.assertTrue(runtime.wait_for_dispatch(timeout=2))
+
+            loaded_manifest = run_store.load(manifest.run_id)
+            self.assertEqual(loaded_manifest.status, "APPROVED")
+            self.assertEqual(fake.input_statuses, [RUN_PLAN_APPROVED])
+            self.assertEqual(fake.run_calls, 1)
+            self.assertEqual(fake.run_ids, [manifest.run_id])
+
+            loaded_pool = proposal_store.load()
+            loaded_proposal = loaded_pool.proposals[0]
+            self.assertEqual(loaded_proposal.status, PROPOSAL_QUEUED)
+            self.assertEqual(loaded_proposal.task_id, proposal.proposal_id)
+
+            queue = TaskStore(root / "queue.json").load()
+            self.assertEqual(queue.status, "APPROVED")
+            self.assertEqual(len(queue.tasks), 1)
+            self.assertEqual(queue.tasks[0].task_id, proposal.proposal_id)
+            self.assertEqual(queue.tasks[0].status, "APPROVED")
+            self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
+            self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
+
+            manifests = list((root / "runs").glob("*/manifest.json"))
+            self.assertEqual(len(manifests), 1)
 
     def test_queue_action_requires_queue_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
