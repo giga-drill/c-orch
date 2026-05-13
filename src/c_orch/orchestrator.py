@@ -365,6 +365,7 @@ class RunOrchestrator:
         return manifest
 
     def _start_planner(self, manifest: RunManifest, worker: WorkerRecord) -> PlannerPlan:
+        worktree_path = _required_worktree_path(worker)
         manifest.status = RUN_PLANNING
         manifest.planner.status = WORKER_ACTIVE
         self._save(manifest)
@@ -377,10 +378,10 @@ class RunOrchestrator:
         result = self.driver.start_session(
             role="planner",
             model=manifest.planner.model,
-            cwd=manifest.cwd,
+            cwd=worktree_path,
             prompt=planner_initial_prompt(
                 user_task=manifest.user_task,
-                cwd=manifest.cwd,
+                cwd=worktree_path,
                 worker_model=worker.model,
             ),
             sandbox=self.config.sandbox,
@@ -533,7 +534,7 @@ class RunOrchestrator:
         worker: WorkerRecord,
         worktree_path: str,
     ) -> DiffEvidence:
-        evidence = self.evidence_collector(worktree_path, self._evidence_dir(manifest))
+        evidence = self.evidence_collector(worktree_path, self._attempt_evidence_dir(manifest, worker))
         worker.evidence_files = _append_unique(worker.evidence_files, evidence.evidence_files)
         self._save(manifest)
         self._record_event(
@@ -554,7 +555,7 @@ class RunOrchestrator:
         report = self.verification_runner(
             manifest.verification_commands,
             cwd=worktree_path,
-            evidence_dir=self._evidence_dir(manifest),
+            evidence_dir=self._attempt_evidence_dir(manifest, worker),
         )
         worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
         self._save(manifest)
@@ -584,11 +585,14 @@ class RunOrchestrator:
         manifest.planner.status = RUN_REVIEWING
         self._save(manifest)
         evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
+        workspace_path = _required_worktree_path(worker)
         attempt = ReviewAttemptRecord(
             id=f"review-{len(manifest.review_attempts) + 1}",
             worker_id=worker.id,
             status=REVIEW_ATTEMPT_ACTIVE,
             started_at=self.store.now_iso(),
+            worker_attempt=worker.attempt,
+            workspace_path=workspace_path,
             evidence_files=evidence_files,
         )
         manifest.review_attempts.append(attempt)
@@ -608,6 +612,7 @@ class RunOrchestrator:
                 worker_result=worker_result,
                 evidence=evidence,
                 verification=verification,
+                review_workspace=workspace_path,
             )
         except Exception as exc:
             attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
@@ -663,12 +668,14 @@ class RunOrchestrator:
         worker_result: WorkerResult,
         evidence: DiffEvidence,
         verification: VerificationReport,
+        review_workspace: str,
     ) -> ReviewDecision:
         if not manifest.planner.thread_id:
             raise OrchestratorError("cannot review without planner thread_id")
         primary_prompt = planner_review_prompt(
             original_plan_json=plan.raw,
             worker_result_json=worker_result.raw,
+            review_workspace=review_workspace,
             diff_summary=evidence.summary,
             diff_path=str(evidence.patch_path),
             test_summary=verification.summary,
@@ -694,12 +701,13 @@ class RunOrchestrator:
             fallback_result = self.driver.start_session(
                 role="planner",
                 model=manifest.planner.model,
-                cwd=manifest.cwd,
+                cwd=review_workspace,
                 prompt=planner_review_fallback_prompt(
                     user_task=manifest.user_task,
                     original_plan_json=plan.raw,
                     acceptance_criteria=plan.acceptance_criteria,
                     worker_result_json=worker_result.raw,
+                    review_workspace=review_workspace,
                     diff_summary=evidence.summary,
                     diff_path=str(evidence.patch_path),
                     test_summary=verification.summary,
@@ -838,6 +846,9 @@ class RunOrchestrator:
     def _evidence_dir(self, manifest: RunManifest) -> Path:
         return self.store.run_dir(manifest.run_id) / "evidence"
 
+    def _attempt_evidence_dir(self, manifest: RunManifest, worker: WorkerRecord) -> Path:
+        return self._evidence_dir(manifest) / f"attempt-{worker.attempt}"
+
     def _apply_reviewed_diff(
         self,
         *,
@@ -848,7 +859,7 @@ class RunOrchestrator:
         apply_report = self.diff_applier(
             evidence,
             manifest.cwd,
-            self._evidence_dir(manifest),
+            self._attempt_evidence_dir(manifest, worker),
         )
         worker.evidence_files = _append_unique(worker.evidence_files, apply_report.evidence_files)
         if manifest.review is not None:

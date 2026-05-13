@@ -2,13 +2,13 @@ from __future__ import annotations
 
 DEFAULT_PLANNER_MODELS = ("gpt-5.5", "gpt-5.4")
 DEFAULT_PLANNER_REASONING_EFFORT = "high"
-DEFAULT_WORKER_MODEL = "gpt-5.3-codex-spark"
+DEFAULT_WORKER_MODEL = "gpt-5.3-codex"
 
 INTERESTING_MODEL_SLUGS = frozenset(
     {
         *DEFAULT_PLANNER_MODELS,
         "gpt-5.4-mini",
-        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
         DEFAULT_WORKER_MODEL,
     }
 )

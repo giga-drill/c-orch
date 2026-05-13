@@ -26,7 +26,7 @@ class CliRunTests(unittest.TestCase):
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
                     usable=True,
                 ),
             )
@@ -65,7 +65,7 @@ class CliRunTests(unittest.TestCase):
             self.assertEqual(manifest.planner.model, "gpt-5.5")
             self.assertEqual(manifest.planner.reasoning_effort, "high")
             self.assertEqual(manifest.planner.service_tier, "fast")
-            self.assertEqual(manifest.workers[0].model, "gpt-5.3-codex-spark")
+            self.assertEqual(manifest.workers[0].model, "gpt-5.3-codex")
             self.assertEqual(manifest.workers[0].reasoning_effort, "medium")
             self.assertEqual(manifest.workers[0].service_tier, "flex")
             self.assertEqual(manifest.workers[0].worktree_path, str(worktree_path))
@@ -154,7 +154,7 @@ approval_policy = "on-request"
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
                     usable=True,
                 ),
             )
@@ -228,7 +228,7 @@ approval_policy = "on-request"
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
                     usable=True,
                 ),
             )
@@ -588,6 +588,7 @@ approval_policy = "on-request"
             serve_dashboard.assert_called_once_with(
                 runs_dir=cwd.resolve() / "runs",
                 queue_path=cwd.resolve() / ".c-orch" / "tasks" / "queue.json",
+                scheduler_config=None,
                 host="127.0.0.1",
                 port=9999,
             )

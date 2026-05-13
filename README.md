@@ -71,7 +71,7 @@ Common options:
 ```bash
 --codex-bin /Applications/Codex.app/Contents/Resources/codex
 --planner-model gpt-5.5
---worker-model gpt-5.3-codex-spark
+--worker-model gpt-5.3-codex
 --planner-reasoning-effort high
 --worker-reasoning-effort medium
 --planner-service-tier fast
@@ -94,7 +94,7 @@ reasoning_effort = "high"
 service_tier = "fast"
 
 [worker]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.3-codex"
 reasoning_effort = "medium"
 
 [run]
@@ -123,9 +123,15 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 ## Boundaries
 
 - The target repo must have a committed base ref before `c-orch run` can create
-  Worker git worktrees.
+  task git worktrees.
+- Each run gets one isolated task workspace. Planner and Worker sessions for
+  that run use the same workspace so review can inspect the same files the
+  Worker changed.
 - The current MVP supports one Worker thread with human plan approval before
   Worker start and retryable review attempts after Worker execution.
+- The current MVP does not support parallel runs that modify the same target
+  repo. Run such tasks serially; otherwise patch apply can conflict with commits
+  made while a Worker was running.
 - Planner review has only two business decisions: `accepted` and
   `revision_requested`. Failure recovery is handled by c-orch separately from
   the business state machine.
@@ -135,6 +141,15 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - The dashboard server keeps one `COrchRuntime` for its process lifetime. The
   runtime may reuse a live MCP driver for speed, but c-orch still treats MCP
   state as volatile and falls back to `codex exec resume` when needed.
+- Task status is user-level state. A task can own multiple run attempts via
+  `run_ids`; `active_run_id` points to the current attempt. The backend
+  reconciles task/queue status from the active run and exposes derived
+  `waiting_for` / `next_action` values such as `human_plan_review` and
+  `retry_task`.
+- Failed tasks can be requeued with `c-orch queue retry <task_id>` or from the
+  dashboard. This preserves prior `run_ids`; when the dashboard backend has
+  execution config, a requeued first task is auto-dispatched. `c-orch queue run`
+  is still available as the manual scheduler entrypoint.
 - Planner/Worker sessions are created through Codex MCP and written into Codex
   session logs with `source=mcp`.
 - Continuing a saved session first tries MCP `codex-reply`; if a fresh MCP

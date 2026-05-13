@@ -20,7 +20,7 @@ and a self-contained Worker prompt only.
 
 {PROJECT_CONTEXT_INSTRUCTIONS}
 
-Workspace: {cwd}
+Task workspace: {cwd}
 Worker model: {worker_model}
 
 User task:
@@ -74,6 +74,7 @@ def planner_review_prompt(
     *,
     original_plan_json: dict,
     worker_result_json: dict,
+    review_workspace: str,
     diff_summary: str,
     diff_path: str,
     test_summary: str,
@@ -90,6 +91,9 @@ Original plan JSON:
 Worker result JSON:
 {json.dumps(worker_result_json, ensure_ascii=False, indent=2)}
 
+Review target workspace:
+{review_workspace}
+
 Git diff summary:
 {diff_summary}
 
@@ -98,9 +102,11 @@ Full git diff file: {diff_path}
 Verification summary:
 {test_summary}{test_path_line}
 
-Decide whether the Worker satisfies the acceptance criteria. There are only two
-business outcomes: accept the work, or request a concrete Worker revision.
-Infrastructure errors are handled by c-orch, not by this JSON contract.
+Review the Worker result against the task workspace and the evidence above. Do
+not judge by reading another checkout of the same repository. Decide whether the
+Worker satisfies the acceptance criteria. There are only two business outcomes:
+accept the work, or request a concrete Worker revision. Infrastructure errors
+are handled by c-orch, not by this JSON contract.
 
 Return exactly one JSON object with this shape:
 {{
@@ -147,6 +153,7 @@ def planner_review_fallback_prompt(
     original_plan_json: dict,
     acceptance_criteria: Iterable[str],
     worker_result_json: dict,
+    review_workspace: str,
     diff_summary: str,
     diff_path: str,
     test_summary: str,
@@ -173,6 +180,9 @@ Acceptance criteria:
 Worker result JSON:
 {json.dumps(worker_result_json, ensure_ascii=False, indent=2)}
 
+Review target workspace:
+{review_workspace}
+
 Git diff summary:
 {diff_summary}
 
@@ -181,8 +191,10 @@ Full git diff file: {diff_path}
 Verification summary:
 {test_summary}{test_path_line}
 
-Decide whether the Worker satisfies the acceptance criteria. There are only two
-business outcomes: accept the work, or request a concrete Worker revision.
+Review the Worker result against the task workspace and the evidence above. Do
+not judge by reading another checkout of the same repository. Decide whether the
+Worker satisfies the acceptance criteria. There are only two business outcomes:
+accept the work, or request a concrete Worker revision.
 Infrastructure errors are handled by c-orch, not by this JSON contract.
 
 Return exactly one JSON object with this shape:

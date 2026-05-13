@@ -10,6 +10,7 @@ from unittest import mock
 
 from c_orch.cli import main
 from c_orch.codex_discovery import CodexCandidateReport, CodexEnvironmentReport
+from c_orch.run_store import RunStore
 from c_orch.task_store import TaskStore
 
 
@@ -77,7 +78,7 @@ class CliQueueTests(unittest.TestCase):
                     path="/Applications/Codex.app/Contents/Resources/codex",
                     source="macos_app",
                     version="codex-cli test",
-                    interesting_models=("gpt-5.5", "gpt-5.3-codex-spark"),
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
                     usable=True,
                 ),
             )
@@ -105,6 +106,46 @@ class CliQueueTests(unittest.TestCase):
             self.assertTrue(driver.exited)
             self.assertEqual(scheduler_cls.call_count, 1)
             self.assertIn("status: APPROVED", stdout.getvalue())
+
+    def test_queue_retry_requeues_failed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            queue_path = cwd / ".c-orch" / "tasks" / "queue.json"
+            task_store = TaskStore(queue_path)
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                ]
+            )
+            run_store = RunStore(cwd / "runs")
+            manifest = run_store.create_run(
+                cwd=cwd,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "FAILED"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["queue", "retry", "task-001", "--cwd", str(cwd)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("status: PENDING", stdout.getvalue())
+            loaded = task_store.load()
+            self.assertEqual(loaded.tasks[0].status, "PENDING")
+            self.assertIsNone(loaded.tasks[0].active_run_id)
+            self.assertEqual(loaded.tasks[0].run_ids, [manifest.run_id])
 
     def test_queue_status_missing_file_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

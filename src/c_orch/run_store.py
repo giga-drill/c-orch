@@ -134,6 +134,8 @@ class ReviewAttemptRecord:
     worker_id: str
     status: str
     started_at: str
+    worker_attempt: Optional[int] = None
+    workspace_path: Optional[str] = None
     completed_at: Optional[str] = None
     decision: Optional[str] = None
     reason: Optional[str] = None
@@ -147,6 +149,8 @@ class ReviewAttemptRecord:
             "worker_id": self.worker_id,
             "status": self.status,
             "started_at": self.started_at,
+            "worker_attempt": self.worker_attempt,
+            "workspace_path": self.workspace_path,
             "completed_at": self.completed_at,
             "decision": self.decision,
             "reason": self.reason,
@@ -162,6 +166,10 @@ class ReviewAttemptRecord:
             worker_id=str(data.get("worker_id", "")),
             status=str(data.get("status", "")),
             started_at=str(data.get("started_at", "")),
+            worker_attempt=int(data["worker_attempt"])
+            if data.get("worker_attempt") is not None
+            else None,
+            workspace_path=data.get("workspace_path"),
             completed_at=data.get("completed_at"),
             decision=data.get("decision"),
             reason=data.get("reason"),

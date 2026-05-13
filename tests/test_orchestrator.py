@@ -359,7 +359,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.workers[0].thread_id, "worker-thread")
             self.assertEqual(result.workers[0].status, "APPROVED")
             self.assertEqual(driver.start_calls[0]["role"], "planner")
-            self.assertEqual(driver.start_calls[0]["cwd"], manifest.cwd)
+            self.assertEqual(driver.start_calls[0]["cwd"], str(worktree))
             self.assertEqual(driver.start_calls[0]["reasoning_effort"], "high")
             self.assertEqual(driver.start_calls[0]["service_tier"], "fast")
             self.assertEqual(driver.start_calls[1]["role"], "worker")
@@ -375,13 +375,19 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(evidence.calls[0]["worktree_path"], worktree)
             self.assertEqual(
                 evidence.calls[0]["evidence_dir"],
-                store.run_dir(manifest.run_id) / "evidence",
+                store.run_dir(manifest.run_id) / "evidence" / "attempt-1",
             )
             self.assertEqual(verification.calls[0]["commands"], ["python -m unittest"])
             self.assertEqual(verification.calls[0]["cwd"], worktree)
+            self.assertEqual(
+                verification.calls[0]["evidence_dir"],
+                store.run_dir(manifest.run_id) / "evidence" / "attempt-1",
+            )
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "accepted")
             self.assertEqual(len(result.review.evidence_files), 4)
+            self.assertEqual(result.review_attempts[0].workspace_path, str(worktree))
+            self.assertEqual(result.review_attempts[0].worker_attempt, 1)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
             self.assertFalse(result.requires_restart)
             self.assertIsNone(result.restart_reason)
@@ -391,7 +397,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(applier.calls[0]["target_repo_path"], Path(manifest.cwd))
             self.assertEqual(
                 applier.calls[0]["evidence_dir"],
-                store.run_dir(manifest.run_id) / "evidence",
+                store.run_dir(manifest.run_id) / "evidence" / "attempt-1",
             )
 
             loaded = store.load(manifest.run_id)
@@ -618,12 +624,18 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(len(evidence.calls), 2)
             self.assertEqual(
                 evidence.calls[1]["evidence_dir"],
-                store.run_dir(manifest.run_id) / "evidence",
+                store.run_dir(manifest.run_id) / "evidence" / "attempt-2",
+            )
+            self.assertEqual(
+                [call["evidence_dir"].name for call in evidence.calls],
+                ["attempt-1", "attempt-2"],
             )
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "accepted")
+            self.assertIn("attempt-1", result.review_attempts[0].evidence_files[0])
+            self.assertIn("attempt-2", result.review_attempts[1].evidence_files[0])
             self.assertEqual(len(verification.calls), 2)
-            self.assertEqual(len(result.workers[0].evidence_files), 4)
+            self.assertEqual(len(result.workers[0].evidence_files), 7)
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
 
@@ -684,6 +696,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
             self.assertEqual(paused.plan.approval_status, "pending")
             self.assertEqual([call["role"] for call in driver.start_calls], ["planner"])
+            self.assertEqual(driver.start_calls[0]["cwd"], manifest.workers[0].worktree_path)
 
             result = RunOrchestrator(
                 store=store,

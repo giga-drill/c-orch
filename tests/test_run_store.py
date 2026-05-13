@@ -97,6 +97,8 @@ class RunStoreTests(unittest.TestCase):
                     worker_id="worker-1",
                     status="FAILED_RETRYABLE",
                     started_at="2026-05-12T09:01:00+08:00",
+                    worker_attempt=2,
+                    workspace_path="/tmp/workspace",
                     completed_at="2026-05-12T09:02:00+08:00",
                     error="Timed out",
                     evidence_files=["runs/example/evidence/git-diff.patch"],
@@ -136,6 +138,8 @@ class RunStoreTests(unittest.TestCase):
                 ["runs/example/evidence/git-diff.patch"],
             )
             self.assertEqual(loaded.review_attempts[0].status, "FAILED_RETRYABLE")
+            self.assertEqual(loaded.review_attempts[0].worker_attempt, 2)
+            self.assertEqual(loaded.review_attempts[0].workspace_path, "/tmp/workspace")
             self.assertEqual(loaded.review_attempts[0].error, "Timed out")
             self.assertEqual(loaded.workers[0].result["summary"], "done")
 

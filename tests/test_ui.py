@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action
+from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action, task_action
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
 from c_orch.ui import INDEX_HTML
@@ -124,15 +124,85 @@ class UiTests(unittest.TestCase):
                 status="APPROVED",
                 active_run_id="run-123",
                 run_ids=["run-123"],
+                reason="done",
+                error="old error",
             )
             queue_store.save(queue)
 
             payload = build_queue_payload(root / "queue.json")
 
             self.assertEqual(payload["queue"]["status"], "PENDING")
+            self.assertEqual(payload["summary"]["total_tasks"], 1)
+            self.assertEqual(payload["summary"]["approved_tasks"], 1)
+            self.assertEqual(payload["summary"]["current_waiting_point"], "done")
             self.assertEqual(payload["tasks"][0]["task_id"], "task-001")
             self.assertEqual(payload["tasks"][0]["active_run_id"], "run-123")
             self.assertEqual(payload["tasks"][0]["run_ids"], ["run-123"])
+            self.assertEqual(payload["tasks"][0]["reason"], "done")
+            self.assertEqual(payload["tasks"][0]["error"], "old error")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "done")
+
+    def test_build_queue_payload_reconciles_failed_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "FAILED"
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+            loaded = queue_store.load()
+
+            self.assertEqual(payload["queue"]["status"], "FAILED")
+            self.assertEqual(payload["tasks"][0]["status"], "FAILED")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_task")
+            self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
+            self.assertEqual(loaded.status, "FAILED")
+            self.assertEqual(loaded.tasks[0].status, "FAILED")
+
+    def test_task_action_retry_requeues_failed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="FAILED",
+                active_run_id="run-1",
+                run_ids=["run-1"],
+                reason="active_run_failed",
+            )
+            queue_store.save(queue)
+
+            status, payload = task_action(root / "queue.json", "task-001", "retry-task")
+            loaded = queue_store.load()
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["tasks"][0]["status"], "PENDING")
+            self.assertIsNone(payload["tasks"][0]["active_run_id"])
+            self.assertEqual(payload["tasks"][0]["run_ids"], ["run-1"])
+            self.assertEqual(loaded.tasks[0].status, "PENDING")
+            self.assertIsNone(loaded.tasks[0].active_run_id)
 
     def test_index_html_contains_dashboard_mount_points(self) -> None:
         self.assertIn('id="runList"', INDEX_HTML)
@@ -149,6 +219,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("影响路径", INDEX_HTML)
         self.assertIn("Worker 指令", INDEX_HTML)
         self.assertIn("Worker 活动", INDEX_HTML)
+        self.assertIn("worker_attempt", INDEX_HTML)
+        self.assertIn("workspace", INDEX_HTML)
         self.assertIn("通过并启动 Worker", INDEX_HTML)
         self.assertIn("让 Planner 重新生成计划", INDEX_HTML)
         self.assertIn("重新让 Planner 复核", INDEX_HTML)

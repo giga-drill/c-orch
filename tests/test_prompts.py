@@ -53,6 +53,7 @@ class PromptTests(unittest.TestCase):
         prompt = planner_review_prompt(
             original_plan_json={"summary": "plan"},
             worker_result_json={"summary": "done"},
+            review_workspace="/tmp/task-workspace",
             diff_summary="diff",
             diff_path="runs/r/evidence/git-diff.patch",
             test_summary="tests passed",
@@ -62,6 +63,7 @@ class PromptTests(unittest.TestCase):
             original_plan_json={"summary": "plan"},
             acceptance_criteria=["criterion"],
             worker_result_json={"summary": "done"},
+            review_workspace="/tmp/task-workspace",
             diff_summary="diff",
             diff_path="runs/r/evidence/git-diff.patch",
             test_summary="tests passed",
@@ -69,8 +71,10 @@ class PromptTests(unittest.TestCase):
 
         for value in (prompt, fallback):
             self.assertIn('"decision": "accepted|revision_requested"', value)
-            self.assertIn("Infrastructure errors are handled by c-orch", value)
+            self.assertIn("Infrastructure errors", value)
+            self.assertIn("handled by c-orch", value)
             self.assertIn("docs/architecture-principles.md", value)
+            self.assertIn("Review target workspace:", value)
 
 
 if __name__ == "__main__":

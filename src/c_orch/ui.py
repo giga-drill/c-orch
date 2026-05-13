@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Type, Union
 from urllib.parse import unquote
 
 from .runtime import COrchRuntime
+from .scheduler import SchedulerConfig
 from .settings import DEFAULT_UI_HOST, DEFAULT_UI_PORT
 
 
@@ -18,10 +19,17 @@ def serve_dashboard(
     *,
     runs_dir: Pathish,
     queue_path: Optional[Pathish] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
 ) -> None:
-    server = build_server(runs_dir=runs_dir, queue_path=queue_path, host=host, port=port)
+    server = build_server(
+        runs_dir=runs_dir,
+        queue_path=queue_path,
+        scheduler_config=scheduler_config,
+        host=host,
+        port=port,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -37,15 +45,21 @@ def build_server(
     *,
     runs_dir: Pathish,
     queue_path: Optional[Pathish] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
 ) -> ThreadingHTTPServer:
     runs_path = Path(runs_dir).expanduser().resolve()
     queue_file = Path(queue_path).expanduser().resolve() if queue_path is not None else None
-    runtime = COrchRuntime(runs_dir=runs_path, queue_path=queue_file)
+    runtime = COrchRuntime(
+        runs_dir=runs_path,
+        queue_path=queue_file,
+        scheduler_config=scheduler_config,
+    )
     handler = make_dashboard_handler(runtime)
     server = ThreadingHTTPServer((host, port), handler)
     setattr(server, "c_orch_runtime", runtime)
+    runtime.dispatch_queue_async()
     return server
 
 
@@ -74,12 +88,14 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
-            prefix = "/api/runs/"
+            run_prefix = "/api/runs/"
+            task_prefix = "/api/tasks/"
             suffix = "/actions"
-            if not path.startswith(prefix) or not path.endswith(suffix):
+            if not path.endswith(suffix) or not (
+                path.startswith(run_prefix) or path.startswith(task_prefix)
+            ):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
-            run_id = unquote(path[len(prefix):-len(suffix)])
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -91,9 +107,14 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
                 return
             action = data.get("action")
-            result = runtime.run_action(run_id, action, data.get("feedback"))
+            if path.startswith(run_prefix):
+                run_id = unquote(path[len(run_prefix):-len(suffix)])
+                result = runtime.run_action(run_id, action, data.get("feedback"))
+            else:
+                task_id = unquote(path[len(task_prefix):-len(suffix)])
+                result = runtime.task_action(task_id, action)
             if result is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             status, payload = result
             self._send_json(status, payload)
@@ -458,6 +479,7 @@ INDEX_HTML = """<!doctype html>
     const statusText = {
       PENDING: "待执行",
       RUNNING: "执行中",
+      WAITING: "等待中",
       NEW: "新建",
       PLANNING: "规划中",
       PLAN_READY: "方案已生成",
@@ -521,7 +543,9 @@ INDEX_HTML = """<!doctype html>
         els.queueList.innerHTML = `<div class="meta">暂无任务队列。</div>`;
         return;
       }
-      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${payload.queue_file || ""}`;
+      const summary = payload.summary || {};
+      const summaryText = `total ${summary.total_tasks ?? 0} · done ${summary.approved_tasks ?? 0} · pending ${summary.pending_tasks ?? 0} · failed ${summary.failed_tasks ?? 0} · waiting ${summary.current_waiting_point || "-"}`;
+      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${summaryText} · ${payload.queue_file || ""}`;
       const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
       els.queueList.innerHTML = tasks.map(task => `
         <article class="queueItem">
@@ -530,10 +554,32 @@ INDEX_HTML = """<!doctype html>
             <span class="badge ${escapeHtml(task.status || "")}">${escapeHtml(formatStatus(task.status || ""))}</span>
           </div>
           <div>${escapeHtml(task.title || "")}</div>
+          <div class="meta">waiting: ${escapeHtml(task.waiting_for || "-")}</div>
           <div class="meta">run: ${escapeHtml(task.active_run_id || "-")}</div>
           <div class="meta">runs: ${escapeHtml((task.run_ids || []).join(", "))}</div>
+          ${task.reason ? `<div class="meta">reason: ${escapeHtml(task.reason)}</div>` : ""}
+          ${task.error ? `<div class="meta">error: ${escapeHtml(task.error)}</div>` : ""}
+          ${task.status === "FAILED" ? `<button data-task-action="retry-task" data-task-id="${escapeHtml(task.task_id || "")}">重新排队</button>` : ""}
         </article>
       `).join("") || `<div class="meta">暂无任务。</div>`;
+      document.querySelectorAll("[data-task-action]").forEach(button => {
+        button.onclick = () => runTaskAction(button.dataset.taskId, button.dataset.taskAction);
+      });
+    }
+
+    async function runTaskAction(taskId, action) {
+      if (!taskId || !action) return;
+      const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action })
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        window.alert(payload.error || `任务操作失败: ${response.status}`);
+        return;
+      }
+      await loadQueue();
     }
 
     function renderList() {
@@ -659,6 +705,9 @@ INDEX_HTML = """<!doctype html>
             <span class="mono">${escapeHtml(attempt.id || "")}</span>
             <span class="meta">${escapeHtml(attempt.completed_at || attempt.started_at || "")}</span>
           </div>
+          <div class="meta">worker_attempt: ${escapeHtml(String(attempt.worker_attempt || "-"))}</div>
+          <div class="meta">workspace: ${escapeHtml(attempt.workspace_path || "-")}</div>
+          <div class="meta">evidence: ${escapeHtml(String((attempt.evidence_files || []).length))}</div>
           ${attempt.reason ? `<div>${escapeHtml(attempt.reason)}</div>` : ""}
           ${attempt.error ? `<div class="meta mono">${escapeHtml(attempt.error)}</div>` : ""}
         </li>

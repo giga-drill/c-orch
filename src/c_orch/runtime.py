@@ -12,10 +12,17 @@ from .codex_session_logs import CodexSessionLogStore
 from .drivers import CodexDriver
 from .failure_policy import has_retryable_review_failure, has_retryable_review_failure_dict
 from .run_store import RunManifest, RunStore
+from .scheduler import OrchestratorLike, SchedulerConfig, TaskScheduler
 from .states import (
     RUN_PLAN_REVIEW_REQUIRED,
     RUN_STATUS_ORDER,
     TERMINAL_RUN_STATUSES,
+)
+from .task_lifecycle import (
+    derive_run_waiting_for,
+    derive_task_progress,
+    mark_task_for_retry,
+    reconcile_queue,
 )
 from .task_store import TaskStore
 
@@ -37,20 +44,29 @@ class COrchRuntime:
         *,
         runs_dir: Pathish,
         queue_path: Optional[Pathish] = None,
+        scheduler_config: Optional[SchedulerConfig] = None,
         driver_factory: Optional[DriverFactory] = None,
+        worktree_factory: Optional[Callable[..., Path]] = None,
+        orchestrator_factory: Optional[Callable[[], OrchestratorLike]] = None,
     ) -> None:
         self.runs_dir = Path(runs_dir).expanduser().resolve()
         self.queue_path = Path(queue_path).expanduser().resolve() if queue_path is not None else None
+        self._scheduler_config = scheduler_config
         self._external_driver_factory = driver_factory
+        self._worktree_factory = worktree_factory
+        self._orchestrator_factory = orchestrator_factory
         self._action_lock = threading.RLock()
         self._driver_lock = threading.RLock()
+        self._dispatch_lock = threading.RLock()
         self._drivers: Dict[str, Any] = {}
+        self._dispatch_thread: Optional[threading.Thread] = None
+        self._last_dispatch_error: Optional[str] = None
 
     def build_runs_payload(self) -> Dict[str, Any]:
         return build_runs_payload(self.runs_dir)
 
     def build_queue_payload(self) -> Dict[str, Any]:
-        return build_queue_payload(self.queue_path)
+        return build_queue_payload(self.queue_path, runs_dir=self.runs_dir)
 
     def build_run_payload(self, run_id: str) -> Optional[Dict[str, Any]]:
         return build_run_payload(self.runs_dir, run_id)
@@ -62,13 +78,57 @@ class COrchRuntime:
         feedback: Any = None,
     ) -> RunActionResponse:
         with self._action_lock:
-            return run_action(
+            result = run_action(
                 self.runs_dir,
                 run_id,
                 action,
                 feedback,
                 driver_factory=self._driver_context,
             )
+            if self.queue_path is not None:
+                reconcile_queue_file(queue_path=self.queue_path, runs_dir=self.runs_dir)
+                self.dispatch_queue_async()
+            return result
+
+    def task_action(self, task_id: str, action: Any) -> RunActionResponse:
+        with self._action_lock:
+            if self.queue_path is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
+            result = task_action(
+                self.queue_path,
+                task_id,
+                action,
+                runs_dir=self.runs_dir,
+            )
+            if result is not None and int(result[0]) < 400:
+                self.dispatch_queue_async()
+            return result
+
+    def dispatch_queue_async(self) -> bool:
+        """Start one background queue scheduler pass when execution is configured."""
+        if self.queue_path is None or self._scheduler_config is None:
+            return False
+        with self._dispatch_lock:
+            if self._dispatch_thread is not None and self._dispatch_thread.is_alive():
+                return False
+            self._last_dispatch_error = None
+            thread = threading.Thread(
+                target=self._dispatch_queue_worker,
+                name="c-orch-queue-dispatch",
+                daemon=True,
+            )
+            self._dispatch_thread = thread
+            thread.start()
+            return True
+
+    def wait_for_dispatch(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the current background scheduler pass; mainly used by tests."""
+        with self._dispatch_lock:
+            thread = self._dispatch_thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def close(self) -> None:
         with self._driver_lock:
@@ -106,6 +166,36 @@ class COrchRuntime:
             driver = self._drivers.pop(codex_path, None)
         if driver is not None:
             driver.close()
+
+    def _dispatch_queue_worker(self) -> None:
+        try:
+            with self._action_lock:
+                self._run_queue_once()
+        except Exception as exc:
+            self._last_dispatch_error = str(exc)
+
+    def _run_queue_once(self) -> None:
+        if self.queue_path is None or self._scheduler_config is None:
+            return
+        task_store = TaskStore(self.queue_path)
+        run_store = RunStore(self.runs_dir)
+        with self._driver_context(self._scheduler_config.codex_binary_path) as driver:
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=driver,
+                config=self._scheduler_config,
+                **self._scheduler_overrides(),
+            )
+            scheduler.run()
+
+    def _scheduler_overrides(self) -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        if self._worktree_factory is not None:
+            overrides["worktree_factory"] = self._worktree_factory
+        if self._orchestrator_factory is not None:
+            overrides["orchestrator_factory"] = self._orchestrator_factory
+        return overrides
 
 
 def run_action(
@@ -172,6 +262,32 @@ def run_action(
     return HTTPStatus.OK, payload or {"ok": True}
 
 
+def task_action(
+    queue_path: Pathish,
+    task_id: str,
+    action: Any,
+    *,
+    runs_dir: Optional[Pathish] = None,
+) -> RunActionResponse:
+    if action != "retry-task":
+        return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+    queue_file = Path(queue_path).expanduser().resolve()
+    store = TaskStore(queue_file)
+    try:
+        queue = store.load()
+    except OSError:
+        return None
+    if runs_dir is not None:
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    try:
+        mark_task_for_retry(queue, task_id=task_id)
+    except ValueError as exc:
+        return HTTPStatus.CONFLICT, {"error": str(exc)}
+    store.save(queue)
+    return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_dir)
+
+
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     runs_path = Path(runs_dir).expanduser().resolve()
     store = RunStore(runs_path)
@@ -192,7 +308,11 @@ def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     }
 
 
-def build_queue_payload(queue_path: Optional[Pathish]) -> Dict[str, Any]:
+def build_queue_payload(
+    queue_path: Optional[Pathish],
+    *,
+    runs_dir: Optional[Pathish] = None,
+) -> Dict[str, Any]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     if queue_path is None:
         return {
@@ -212,6 +332,11 @@ def build_queue_payload(queue_path: Optional[Pathish]) -> Dict[str, Any]:
             "queue": None,
             "tasks": [],
         }
+    run_store = RunStore(Path(runs_dir).expanduser().resolve()) if runs_dir is not None else None
+    if run_store is not None:
+        if reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso):
+            store.save(queue)
+    tasks = [_summarize_task(task, run_store=run_store) for task in queue.tasks]
     return {
         "queue_file": str(queue_file),
         "generated_at": generated_at,
@@ -221,18 +346,8 @@ def build_queue_payload(queue_path: Optional[Pathish]) -> Dict[str, Any]:
             "created_at": queue.created_at,
             "updated_at": queue.updated_at,
         },
-        "tasks": [
-            {
-                "task_id": task.task_id,
-                "title": task.title,
-                "status": task.status,
-                "active_run_id": task.active_run_id,
-                "run_ids": list(task.run_ids),
-                "updated_at": task.updated_at,
-                "completed_at": task.completed_at,
-            }
-            for task in queue.tasks
-        ],
+        "summary": _queue_summary(tasks),
+        "tasks": tasks,
     }
 
 
@@ -311,11 +426,14 @@ def _summarize_manifest(
     )
     updated_at = str(manifest.get("updated_at", ""))
     created_at = str(manifest.get("created_at", ""))
+    waiting_for = _derive_manifest_waiting_for(manifest)
     return {
         "run_id": str(manifest.get("run_id", "")),
         "status": status,
         "status_index": RUN_STATUS_ORDER.get(status, 0),
         "terminal": status in TERMINAL_RUN_STATUSES,
+        "waiting_for": waiting_for,
+        "next_action": waiting_for,
         "requires_restart": bool(manifest.get("requires_restart", False)),
         "restart_reason": manifest.get("restart_reason"),
         "restart_paths": _list_value(manifest.get("restart_paths")),
@@ -351,10 +469,78 @@ def _summarize_manifest(
     }
 
 
+def reconcile_queue_file(*, queue_path: Pathish, runs_dir: Pathish) -> bool:
+    queue_file = Path(queue_path).expanduser().resolve()
+    runs_path = Path(runs_dir).expanduser().resolve()
+    store = TaskStore(queue_file)
+    queue = store.load()
+    run_store = RunStore(runs_path)
+    changed = reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    if changed:
+        store.save(queue)
+    return changed
+
+
+def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, Any]:
+    active_run = None
+    if run_store is not None and task.active_run_id:
+        try:
+            active_run = run_store.load(task.active_run_id)
+        except OSError:
+            active_run = None
+    progress = derive_task_progress(task, active_run=active_run)
+    return {
+        "task_id": task.task_id,
+        "title": task.title,
+        "status": task.status,
+        "active_run_id": task.active_run_id,
+        "run_ids": list(task.run_ids),
+        "updated_at": task.updated_at,
+        "completed_at": task.completed_at,
+        "reason": task.reason,
+        "error": task.error,
+        "waiting_for": progress.waiting_for,
+        "next_action": progress.waiting_for,
+    }
+
+
+def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(tasks)
+    approved = sum(1 for task in tasks if task.get("status") == "APPROVED")
+    pending = sum(1 for task in tasks if task.get("status") == "PENDING")
+    failed = sum(1 for task in tasks if task.get("status") == "FAILED")
+    running = sum(1 for task in tasks if task.get("status") in {"RUNNING", "WAITING"})
+    current = next((task for task in tasks if task.get("status") != "APPROVED"), None)
+    return {
+        "total_tasks": total,
+        "approved_tasks": approved,
+        "completed_tasks": approved,
+        "pending_tasks": pending,
+        "failed_tasks": failed,
+        "running_tasks": running,
+        "current_waiting_point": current.get("waiting_for") if current else "done",
+    }
+
+
+def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:
+    try:
+        return derive_run_waiting_for(RunManifest.from_dict(manifest))
+    except Exception:
+        status = str(manifest.get("status", ""))
+        if status == "APPROVED":
+            return "restart" if manifest.get("requires_restart") else "done"
+        if status == "FAILED":
+            return "failed"
+        return "planner"
+
+
 def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": attempt.get("id"),
         "status": attempt.get("status"),
+        "worker_attempt": attempt.get("worker_attempt"),
+        "workspace_path": attempt.get("workspace_path"),
+        "evidence_count": len(_list_value(attempt.get("evidence_files"))),
         "decision": attempt.get("decision"),
         "reason": attempt.get("reason"),
         "error": attempt.get("error"),

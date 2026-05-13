@@ -9,6 +9,7 @@ from .failure_policy import has_retryable_review_failure
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
 from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED
+from .task_lifecycle import reconcile_queue, reconcile_task_with_active_run
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -21,6 +22,7 @@ from .task_store import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
+    TASK_WAITING,
     TaskQueue,
     TaskStore,
 )
@@ -70,10 +72,19 @@ class TaskScheduler:
 
     def run(self) -> TaskQueue:
         queue = self.task_store.load()
+        if reconcile_queue(
+            queue,
+            run_loader=self.run_store.load,
+            now_iso=self.run_store.now_iso,
+        ):
+            self.task_store.save(queue)
         orchestrator = self._orchestrator_factory()
         processed = 0
 
         while True:
+            if queue.status in {QUEUE_FAILED, QUEUE_BLOCKED}:
+                self.task_store.save(queue)
+                return queue
             if self.config.max_tasks is not None and processed >= self.config.max_tasks:
                 if queue.status == QUEUE_RUNNING:
                     queue.status = QUEUE_PENDING
@@ -89,22 +100,10 @@ class TaskScheduler:
                 active = self._load_active_run(task.active_run_id)
                 if active is not None and active.status == RUN_PLAN_REVIEW_REQUIRED:
                     queue.status = QUEUE_RUNNING
-                    self.task_store.update_task(
-                        queue,
-                        task.task_id,
-                        status=TASK_RUNNING,
-                        reason="plan_review_required",
-                    )
                     self.task_store.save(queue)
                     return queue
                 if active is not None and has_retryable_review_failure(active):
                     queue.status = QUEUE_RUNNING
-                    self.task_store.update_task(
-                        queue,
-                        task.task_id,
-                        status=TASK_RUNNING,
-                        reason="review_retry_available",
-                    )
                     self.task_store.save(queue)
                     return queue
             if task.status == TASK_FAILED:
@@ -113,6 +112,10 @@ class TaskScheduler:
                 return queue
             if task.status == TASK_BLOCKED:
                 queue.status = QUEUE_BLOCKED
+                self.task_store.save(queue)
+                return queue
+            if task.status == TASK_WAITING:
+                queue.status = QUEUE_RUNNING
                 self.task_store.save(queue)
                 return queue
             if task.status == TASK_RUNNING:
@@ -198,13 +201,10 @@ class TaskScheduler:
                 raise
 
             if manifest.status == RUN_APPROVED:
-                self.task_store.update_task(
-                    queue,
-                    task.task_id,
-                    status=TASK_APPROVED,
+                reconcile_task_with_active_run(
+                    task,
+                    active_run=manifest,
                     completed_at=self.run_store.now_iso(),
-                    error=None,
-                    reason=None,
                 )
                 if manifest.requires_restart:
                     queue.status = QUEUE_RESTART_REQUIRED
@@ -217,22 +217,27 @@ class TaskScheduler:
 
             if manifest.status == RUN_PLAN_REVIEW_REQUIRED:
                 queue.status = QUEUE_RUNNING
-                self.task_store.update_task(
-                    queue,
-                    task.task_id,
-                    status=TASK_RUNNING,
-                    reason="plan_review_required",
+                reconcile_task_with_active_run(
+                    task,
+                    active_run=manifest,
+                    completed_at=self.run_store.now_iso(),
                 )
                 self.task_store.save(queue)
                 return queue
 
             queue.status = QUEUE_FAILED
-            self.task_store.update_task(
-                queue,
-                task.task_id,
-                status=TASK_FAILED,
-                reason=manifest.status or RUN_FAILED,
+            reconcile_task_with_active_run(
+                task,
+                active_run=manifest,
+                completed_at=self.run_store.now_iso(),
             )
+            if task.status != TASK_FAILED:
+                self.task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_FAILED,
+                    reason=manifest.status or RUN_FAILED,
+                )
             self.task_store.save(queue)
             return queue
 

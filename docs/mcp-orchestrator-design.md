@@ -11,7 +11,7 @@
 核心目标：
 
 - Planner 使用最强可用模型，负责方案、任务拆分、验收标准和 Worker 结果 review。
-- Worker 默认使用 `gpt-5.3-codex-spark`，负责执行 Planner 下发的具体任务。
+- Worker 默认使用 `gpt-5.3-codex`，负责执行 Planner 下发的具体任务。
 - Planner 和 Worker 都应作为 Codex session/thread 保留，便于在 Codex Session 列表中查看过程。
 - 总控负责状态机、thread 映射、重试、结果传递和本地 run manifest。
 - 第一版先用 MCP 快速闭环，后续可把底层 driver 换成 Codex App Server 以获得更细粒度控制。
@@ -81,6 +81,7 @@ User task
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
 - `COrchRuntime` 是 dashboard 后端控制面入口。前端/HTTP handler 只负责展示状态和转发用户意图，action 校验、Codex driver 创建、Orchestrator 调用和 manifest 更新都在 runtime 层完成。dashboard server 会在进程生命周期内保留同一个 runtime，并可复用长活 MCP driver；但 MCP 内存状态只作为 cache，可靠恢复仍以 manifest、event log、Codex thread id 和 `codex exec resume` 为准。
+- `task_lifecycle.py` 将 Task 作为用户级状态机、Run 作为一次执行 attempt。它负责从 `active_run_id` 收敛 task/queue 状态，并派生 `waiting_for` / `next_action`。例如 active run 进入 `FAILED` 后，task 会收敛为 `FAILED`，queue 为 `FAILED`，等待点为 `retry_task`，而不是继续卡在 `RUNNING`。`queue retry <task_id>` 和 dashboard 的“重新排队”会保留旧 `run_ids`、清空 `active_run_id`、把 task 设回 `PENDING`。当 dashboard backend 拥有执行配置时，队首 `PENDING` task 会自动触发 scheduler 创建新的 run attempt；`queue run` 仍是手动触发同一调度路径的 CLI 入口。
 - `failure_policy.py` 将可恢复异常从业务状态机中拆出。比如 Planner review 的 Codex session 丢失时，run 保持 `WORK_DONE`，review attempt 记录 `FAILED_RETRYABLE`，UI/CLI 再提供重试动作。
 - `McpCodexDriver.reply()` 已验证：fresh MCP server 对旧 session id 调 `codex-reply` 会返回 `Session not found`，但 `codex exec resume <session-id>` 可以恢复同一个磁盘 session。因此 reply 先走 MCP 快路径，遇到 session-not-found 时降级到 CLI resume；CLI resume 也失败后，才交给 failure policy / replacement agent 兜底。
 - `c-orch run --prepare-only` 只建 manifest/worktree，不调用 Codex。
@@ -140,7 +141,7 @@ Worker 也是 Codex thread。它的职责：
 
 模型选择：
 
-- 默认 `gpt-5.3-codex-spark`。
+- 默认 `gpt-5.3-codex`。
 - 返工超过阈值时，当前 MVP 进入 `FAILED`；升级模型或拆任务后续再作为明确功能设计。
 
 工作区隔离：
@@ -280,7 +281,7 @@ review attempt 表示可以重试复核。
     {
       "id": "worker-1",
       "thread_id": "019...",
-      "model": "gpt-5.3-codex-spark",
+      "model": "gpt-5.3-codex",
       "worktree_path": "/Users/mac/projs/.c-orch/worktrees/2026-05-11-001/worker-1",
       "status": "DONE",
       "attempt": 1
@@ -432,7 +433,7 @@ c-orch run --cwd /Users/mac/projs/example "Implement feature X"
 ```text
 --codex-bin /Applications/Codex.app/Contents/Resources/codex
 --planner-model gpt-5.4
---worker-model gpt-5.3-codex-spark
+--worker-model gpt-5.3-codex
 --max-rework 3
 --sandbox workspace-write
 --approval-policy never

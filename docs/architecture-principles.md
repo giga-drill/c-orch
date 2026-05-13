@@ -16,7 +16,7 @@ The deterministic c-orch controller owns orchestration mechanics:
 
 - run and task state
 - Codex thread ids
-- Worker worktrees
+- task workspaces
 - evidence collection
 - verification commands
 - apply behavior
@@ -36,7 +36,13 @@ Planner and Worker own semantic work:
 
 - Planner designs plans, acceptance criteria, Worker instructions, and review
   decisions.
-- Worker implements the approved plan inside its assigned worktree.
+- Planner and Worker for the same run use one isolated task workspace.
+- Worker implements the approved plan inside that task workspace.
+
+The task workspace is currently implemented as the single Worker's git
+worktree. Planner sessions must start in the same workspace before planning, and
+Planner review must judge that workspace plus the saved diff/test evidence, not
+another checkout of the same repo.
 
 ## State Model
 
@@ -83,6 +89,43 @@ the session through `codex exec resume <session-id>`. If that resume path also
 fails, c-orch may start a replacement Planner or Worker using saved manifest,
 evidence, and the same concrete prompt. The run state should not become a
 special exception state.
+
+Task state is the user-level lifecycle; run state is one execution attempt.
+One task can have multiple run attempts over time. `active_run_id` points to the
+current attempt and `run_ids` preserves prior attempts for audit.
+
+Task status should stay coarse:
+
+```text
+PENDING
+RUNNING
+WAITING
+APPROVED
+FAILED
+```
+
+`BLOCKED` is retained only for legacy or exceptional queue records. Detailed
+waiting points such as `human_plan_review`, `planner_review_retry`,
+`worker_rework`, and `retry_task` are derived values, not separate task
+statuses. `task_lifecycle.py` owns task/run reconciliation, so Scheduler,
+Runtime, CLI, and UI do not each invent their own task transition rules.
+
+When an active run reaches `FAILED`, the owning task must converge to `FAILED`
+with `waiting_for=retry_task`; retrying the task should create a new run
+attempt rather than mutating the old failed run. The first retry step is
+requeueing the failed task: preserve `run_ids`, clear `active_run_id`, and move
+the task back to `PENDING`. `PENDING` is an eligible scheduling state: if the
+dashboard backend has execution config and the task is the first incomplete
+task, the backend scheduler should automatically create the next run attempt.
+The CLI `queue run` command remains the explicit manual entrypoint for the same
+scheduler path.
+
+## Apply Boundary
+
+The current MVP assumes runs that modify the same target repository are
+serialized. It does not support parallel modification of one repo by multiple
+task workspaces. If the target repo changes while a Worker is running, c-orch
+may reject the reviewed patch during apply instead of rebasing or merging it.
 
 ## Agent Context Contract
 

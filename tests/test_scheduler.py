@@ -15,6 +15,7 @@ from c_orch.task_store import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
+    TASK_WAITING,
     TaskStore,
 )
 
@@ -73,7 +74,8 @@ class SchedulerTests(unittest.TestCase):
 
             self.assertEqual(queue.status, "RUNNING")
             loaded = task_store.load()
-            self.assertEqual(loaded.tasks[0].status, TASK_RUNNING)
+            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
+            self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
             self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(fake.run_ids, [])
 
@@ -99,8 +101,8 @@ class SchedulerTests(unittest.TestCase):
 
             self.assertEqual(queue.status, "RUNNING")
             loaded = task_store.load()
-            self.assertEqual(loaded.tasks[0].status, TASK_RUNNING)
-            self.assertEqual(loaded.tasks[0].reason, "plan_review_required")
+            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
+            self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
             self.assertEqual(loaded.tasks[0].active_run_id, fake.run_ids[0])
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
 

@@ -246,6 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue_status.add_argument("--queue-file", default=None, help="Queue JSON path.")
     queue_status.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
 
+    queue_retry = queue_subparsers.add_parser(
+        "retry",
+        help="Requeue a failed task so the next queue run creates a new run attempt.",
+    )
+    queue_retry.add_argument("task_id", help="Failed task ID to requeue.")
+    queue_retry.add_argument("--cwd", default=".", help="Target repository path.")
+    queue_retry.add_argument("--queue-file", default=None, help="Queue JSON path.")
+
     queue_run = queue_subparsers.add_parser(
         "run",
         help="Run queue tasks serially from the first PENDING task.",
@@ -390,7 +398,7 @@ def _resolve_execution_config(
     if not planner_model:
         raise ValueError(f"No planner model found in selected Codex binary: {report.selected.path}")
 
-    worker_model = args.worker_model or project_config.worker.model or DEFAULT_WORKER_MODEL
+    worker_model = getattr(args, "worker_model", None) or project_config.worker.model or DEFAULT_WORKER_MODEL
     if not report.selected.has_model(worker_model):
         raise ValueError(
             f"Worker model {worker_model!r} was not found in selected Codex binary: {report.selected.path}"
@@ -401,8 +409,14 @@ def _resolve_execution_config(
         "codex_path": report.selected.path,
         "planner_model": planner_model,
         "worker_model": worker_model,
-        "runs_dir": _resolve_under_cwd(cwd, args.runs_dir or project_config.run.runs_dir),
-        "worktrees_dir": _resolve_under_cwd(cwd, args.worktrees_dir or project_config.run.worktrees_dir),
+        "runs_dir": _resolve_under_cwd(
+            cwd,
+            getattr(args, "runs_dir", None) or project_config.run.runs_dir,
+        ),
+        "worktrees_dir": _resolve_under_cwd(
+            cwd,
+            getattr(args, "worktrees_dir", None) or project_config.run.worktrees_dir,
+        ),
         "planner_reasoning_effort": _first_value(
             getattr(args, "planner_reasoning_effort", None),
             project_config.planner.reasoning_effort,
@@ -420,9 +434,9 @@ def _resolve_execution_config(
             getattr(args, "worker_service_tier", None),
             project_config.worker.service_tier,
         ),
-        "max_attempts": args.max_attempts or project_config.run.max_attempts,
-        "sandbox": args.sandbox or project_config.run.sandbox,
-        "approval_policy": args.approval_policy or project_config.run.approval_policy,
+        "max_attempts": getattr(args, "max_attempts", None) or project_config.run.max_attempts,
+        "sandbox": getattr(args, "sandbox", None) or project_config.run.sandbox,
+        "approval_policy": getattr(args, "approval_policy", None) or project_config.run.approval_policy,
     }
 
 
@@ -674,6 +688,8 @@ def run_queue_import(args: argparse.Namespace) -> int:
 
 
 def run_queue_status(args: argparse.Namespace) -> int:
+    from .config import load_project_config
+    from .runtime import build_queue_payload
     from .task_store import TaskStore
 
     cwd = Path(args.cwd).expanduser().resolve()
@@ -687,10 +703,20 @@ def run_queue_status(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"queue load error: {exc}", file=sys.stderr)
         return 1
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=None)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, project_config.run.runs_dir)
+    dashboard_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
+    queue = store.load()
 
     payload = {
         "queue_file": str(queue_path),
         "queue": queue.to_dict(),
+        "summary": dashboard_payload.get("summary"),
+        "tasks": dashboard_payload.get("tasks", []),
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -702,8 +728,35 @@ def run_queue_status(args: argparse.Namespace) -> int:
     for task in queue.tasks:
         print(
             f"- {task.task_id} [{task.status}] run={task.active_run_id or '-'} "
-            f"title={task.title}"
+            f"reason={task.reason or '-'} title={task.title}"
         )
+    return 0
+
+
+def run_queue_retry(args: argparse.Namespace) -> int:
+    from .config import load_project_config
+    from .runtime import task_action
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=None)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, project_config.run.runs_dir)
+    result = task_action(queue_path, args.task_id, "retry-task", runs_dir=runs_dir)
+    if result is None:
+        print(f"queue file not found: {queue_path}", file=sys.stderr)
+        return 1
+    status, payload = result
+    if int(status) >= 400:
+        print(str(payload.get("error", "retry failed")), file=sys.stderr)
+        return 1
+    print(f"queue_file: {queue_path}")
+    print(f"task: {args.task_id}")
+    print("status: PENDING")
+    print("next: run `c-orch queue run` to create a new run attempt")
     return 0
 
 
@@ -770,6 +823,7 @@ def run_queue_run(args: argparse.Namespace) -> int:
 
 def run_ui(args: argparse.Namespace) -> int:
     from .config import load_project_config
+    from .scheduler import SchedulerConfig
     from .ui import serve_dashboard
 
     cwd = Path(args.cwd).expanduser().resolve()
@@ -782,11 +836,41 @@ def run_ui(args: argparse.Namespace) -> int:
     queue_path = _resolve_queue_path(cwd, args.queue_file)
     host = args.host or project_config.ui.host
     port = args.port or project_config.ui.port
+    scheduler_config = None
+    if queue_path.exists():
+        try:
+            execution_config = _resolve_execution_config(args, cwd=cwd)
+        except ValueError as exc:
+            print(f"queue auto-dispatch disabled: {exc}", file=sys.stderr, flush=True)
+        else:
+            scheduler_config = SchedulerConfig(
+                cwd=cwd,
+                runs_dir=runs_dir,
+                worktrees_dir=execution_config["worktrees_dir"],
+                planner_model=execution_config["planner_model"],
+                worker_model=execution_config["worker_model"],
+                codex_binary_path=execution_config["codex_path"],
+                planner_reasoning_effort=execution_config["planner_reasoning_effort"],
+                worker_reasoning_effort=execution_config["worker_reasoning_effort"],
+                planner_service_tier=execution_config["planner_service_tier"],
+                worker_service_tier=execution_config["worker_service_tier"],
+                max_attempts=execution_config["max_attempts"],
+                sandbox=execution_config["sandbox"],
+                approval_policy=execution_config["approval_policy"],
+            )
     print(f"c-orch UI: http://{host}:{port}", flush=True)
     print(f"runs_dir: {runs_dir}", flush=True)
     if args.queue_file is not None:
         print(f"queue_file: {queue_path}", flush=True)
-    serve_dashboard(runs_dir=runs_dir, queue_path=queue_path, host=host, port=port)
+    if scheduler_config is not None:
+        print("queue_auto_dispatch: enabled", flush=True)
+    serve_dashboard(
+        runs_dir=runs_dir,
+        queue_path=queue_path,
+        scheduler_config=scheduler_config,
+        host=host,
+        port=port,
+    )
     return 0
 
 
@@ -888,6 +972,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return run_queue_import(args)
         if args.queue_command == "status":
             return run_queue_status(args)
+        if args.queue_command == "retry":
+            return run_queue_retry(args)
         if args.queue_command in {"run", "resume"}:
             return run_queue_run(args)
         parser.error(f"unknown queue command: {args.queue_command}")
