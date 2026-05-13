@@ -22,6 +22,16 @@ The deterministic c-orch controller owns orchestration mechanics:
 - apply behavior
 - failure recovery policy
 
+The dashboard frontend is not part of the business state machine. It should
+render run/task state and send user intent to the backend. Backend runtime code
+owns action validation, Codex driver usage, Orchestrator calls, and manifest
+updates.
+
+The dashboard server keeps a process-lifetime runtime object. That runtime may
+reuse a live Codex MCP driver as a performance and continuity optimization, but
+MCP process memory is volatile cache only. Persisted run manifests, event logs,
+Codex thread ids, and Codex disk sessions remain the recovery source of truth.
+
 Planner and Worker own semantic work:
 
 - Planner designs plans, acceptance criteria, Worker instructions, and review

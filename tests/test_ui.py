@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
-from c_orch.ui import INDEX_HTML, _run_action, build_queue_payload, build_run_payload, build_runs_payload
+from c_orch.ui import INDEX_HTML
 
 
 class UiTests(unittest.TestCase):
@@ -179,7 +180,7 @@ class UiTests(unittest.TestCase):
                 driver = driver_cls.return_value.__enter__.return_value
                 orchestrator = orchestrator_cls.return_value
                 orchestrator.revise_plan.return_value = manifest
-                status, _payload = _run_action(
+                status, _payload = run_action(
                     root / "runs",
                     manifest.run_id,
                     "revise-plan",
@@ -207,7 +208,7 @@ class UiTests(unittest.TestCase):
             store.save(manifest)
 
             with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls:
-                status, payload = _run_action(root / "runs", manifest.run_id, "approve-plan")
+                status, payload = run_action(root / "runs", manifest.run_id, "approve-plan")
 
             self.assertEqual(int(status), 409)
             self.assertEqual(payload["status"], "WORKING")
@@ -230,7 +231,7 @@ class UiTests(unittest.TestCase):
             store.save(manifest)
 
             with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls:
-                status, payload = _run_action(root / "runs", manifest.run_id, "retry-review")
+                status, payload = run_action(root / "runs", manifest.run_id, "retry-review")
 
             self.assertEqual(int(status), 409)
             self.assertEqual(payload["status"], "PLAN_REVIEW_REQUIRED")

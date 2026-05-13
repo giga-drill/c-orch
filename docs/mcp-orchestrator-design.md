@@ -80,6 +80,7 @@ User task
 - `RunStore` 保存 `runs/<run_id>/manifest.json`。
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
+- `COrchRuntime` 是 dashboard 后端控制面入口。前端/HTTP handler 只负责展示状态和转发用户意图，action 校验、Codex driver 创建、Orchestrator 调用和 manifest 更新都在 runtime 层完成。dashboard server 会在进程生命周期内保留同一个 runtime，并可复用长活 MCP driver；但 MCP 内存状态只作为 cache，可靠恢复仍以 manifest、event log、Codex thread id 和 `codex exec resume` 为准。
 - `failure_policy.py` 将可恢复异常从业务状态机中拆出。比如 Planner review 的 Codex session 丢失时，run 保持 `WORK_DONE`，review attempt 记录 `FAILED_RETRYABLE`，UI/CLI 再提供重试动作。
 - `McpCodexDriver.reply()` 已验证：fresh MCP server 对旧 session id 调 `codex-reply` 会返回 `Session not found`，但 `codex exec resume <session-id>` 可以恢复同一个磁盘 session。因此 reply 先走 MCP 快路径，遇到 session-not-found 时降级到 CLI resume；CLI resume 也失败后，才交给 failure policy / replacement agent 兜底。
 - `c-orch run --prepare-only` 只建 manifest/worktree，不调用 Codex。
