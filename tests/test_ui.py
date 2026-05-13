@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from urllib.request import urlopen
 from unittest import mock
 
 from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action, task_action
 from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
-from c_orch.ui import INDEX_HTML
+from c_orch.ui import FALLBACK_INDEX_HTML, build_server
 
 
 class UiTests(unittest.TestCase):
@@ -107,6 +109,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["run"]["evidence_count"], 1)
             self.assertEqual(payload["run"]["waiting_for"], "restart")
             self.assertEqual(payload["run"]["next_action"], "restart")
+            self.assertEqual(payload["run"]["allowed_actions"], [])
             self.assertEqual(payload["run"]["plan_revision_count"], 1)
             self.assertEqual(payload["run"]["latest_plan_revision_id"], "plan-revision-1")
             self.assertEqual(payload["run"]["latest_plan_revision_created_at"], "2026-05-11T12:00:00+00:00")
@@ -162,6 +165,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["error"], "old error")
             self.assertEqual(payload["tasks"][0]["waiting_for"], "done")
             self.assertEqual(payload["tasks"][0]["next_action"], "done")
+            self.assertEqual(payload["tasks"][0]["allowed_actions"], [])
 
     def test_build_queue_payload_reconciles_failed_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,6 +199,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["status"], "FAILED")
             self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_task")
             self.assertEqual(payload["tasks"][0]["next_action"], "retry_task")
+            self.assertEqual(payload["tasks"][0]["allowed_actions"], ["retry-task"])
             self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
             self.assertEqual(payload["summary"]["completed_tasks"], 0)
             self.assertEqual(payload["summary"]["running_tasks"], 0)
@@ -228,61 +233,70 @@ class UiTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].status, "PENDING")
             self.assertIsNone(loaded.tasks[0].active_run_id)
 
-    def test_index_html_contains_dashboard_mount_points(self) -> None:
-        self.assertIn('id="runList"', INDEX_HTML)
-        self.assertIn("/api/runs", INDEX_HTML)
-        self.assertIn("/api/queue", INDEX_HTML)
-        self.assertIn('id="queueList"', INDEX_HTML)
-        self.assertIn('id="queueSummary"', INDEX_HTML)
-        self.assertIn("Task Queue", INDEX_HTML)
-        self.assertIn("total_tasks", INDEX_HTML)
-        self.assertIn("approved_tasks", INDEX_HTML)
-        self.assertIn("completed_tasks", INDEX_HTML)
-        self.assertIn("pending_tasks", INDEX_HTML)
-        self.assertIn("failed_tasks", INDEX_HTML)
-        self.assertIn("running_tasks", INDEX_HTML)
-        self.assertIn("current_waiting_point", INDEX_HTML)
-        self.assertIn("waiting_for", INDEX_HTML)
-        self.assertIn("next_action", INDEX_HTML)
-        self.assertIn('id="detail"', INDEX_HTML)
-        self.assertIn("运行时间线", INDEX_HTML)
-        self.assertIn("payload.events", INDEX_HTML)
-        self.assertIn("Planner Agent", INDEX_HTML)
-        self.assertIn("Worker Agent", INDEX_HTML)
-        self.assertIn("plan_revision_count", INDEX_HTML)
-        self.assertIn("latest_plan_revision_feedback", INDEX_HTML)
-        self.assertIn("reasoning_effort", INDEX_HTML)
-        self.assertIn("需要重启", INDEX_HTML)
-        self.assertIn("重启原因", INDEX_HTML)
-        self.assertIn("影响路径", INDEX_HTML)
-        self.assertIn("Worker 指令", INDEX_HTML)
-        self.assertIn("Worker 活动", INDEX_HTML)
-        self.assertIn("worker_attempt", INDEX_HTML)
-        self.assertIn("workspace", INDEX_HTML)
-        self.assertIn("通过并启动 Worker", INDEX_HTML)
-        self.assertIn("让 Planner 重新生成计划", INDEX_HTML)
-        self.assertIn("重新让 Planner 复核", INDEX_HTML)
-        self.assertIn("pendingActions", INDEX_HTML)
-        self.assertIn("setActionButtonsDisabled", INDEX_HTML)
-        self.assertIn("data-run-action=\"approve-plan\"", INDEX_HTML)
-        self.assertIn("data-run-action=\"revise-plan\"", INDEX_HTML)
-        self.assertIn("data-run-action=\"retry-review\"", INDEX_HTML)
+    def test_plan_review_run_exposes_allowed_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan", worker_prompt="Prompt")
+            store.save(manifest)
 
-    def test_index_html_contains_timeline_collapse_and_refresh_contracts(self) -> None:
-        self.assertIn("newestFirst(events)", INDEX_HTML)
-        self.assertIn("items.slice().reverse()", INDEX_HTML)
-        self.assertIn("<details><summary>Worker 指令</summary>", INDEX_HTML)
-        self.assertIn("<details><summary>验收标准</summary>", INDEX_HTML)
-        self.assertIn("<details><summary>验证命令</summary>", INDEX_HTML)
-        self.assertIn("<details><summary>风险说明</summary>", INDEX_HTML)
-        self.assertIn("<details><summary>证据文件 (", INDEX_HTML)
-        self.assertIn("async function refreshAll(options)", INDEX_HTML)
-        self.assertIn("await refreshAll({ preferredRunId: runId, forceFirst: false });", INDEX_HTML)
-        self.assertIn("const taskSnapshot = findTask(payload, taskId);", INDEX_HTML)
-        self.assertIn("let preferredRunId = pickTaskTargetRun(taskSnapshot);", INDEX_HTML)
-        self.assertIn("payload.generated_at", INDEX_HTML)
-        self.assertIn("queueUpdatedAt", INDEX_HTML)
-        self.assertIn("cache: \"no-store\"", INDEX_HTML)
+            payload = build_run_payload(root / "runs", manifest.run_id)
+
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["run"]["allowed_actions"], ["approve-plan", "revise-plan"])
+
+    def test_react_frontend_sources_contain_dashboard_contracts(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_source = (root / "web" / "src" / "components" / "App.tsx").read_text(encoding="utf-8")
+        client_source = (root / "web" / "src" / "api" / "client.ts").read_text(encoding="utf-8")
+        query_source = (root / "web" / "src" / "queries.ts").read_text(encoding="utf-8")
+
+        self.assertIn("/api/runs", client_source)
+        self.assertIn("/api/queue", client_source)
+        self.assertIn("/actions", client_source)
+        self.assertIn("allowed_actions", app_source)
+        self.assertIn("通过并启动 Worker", app_source)
+        self.assertIn("让 Planner 重新生成计划", app_source)
+        self.assertIn("重新让 Planner 复核", app_source)
+        self.assertIn("运行时间线", app_source)
+        self.assertIn("Worker 指令", app_source)
+        self.assertIn("验收标准", app_source)
+        self.assertIn("验证命令", app_source)
+        self.assertIn("newestFirst", app_source)
+        self.assertIn("useMutation", query_source)
+        self.assertIn("invalidateQueries", query_source)
+
+    def test_fallback_html_explains_missing_frontend_build(self) -> None:
+        self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)
+        self.assertIn("npm --prefix web run build", FALLBACK_INDEX_HTML)
+
+    def test_dashboard_server_serves_root_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = build_server(runs_dir=root / "runs", host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=2) as response:
+                    body = response.read().decode("utf-8")
+                    content_type = response.headers["Content-Type"]
+            finally:
+                runtime = getattr(server, "c_orch_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertIn("c-orch", body)
+            self.assertIn("text/html", content_type)
 
     def test_run_action_revise_plan_passes_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

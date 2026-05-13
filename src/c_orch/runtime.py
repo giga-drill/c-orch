@@ -416,6 +416,7 @@ def _summarize_manifest(
     plan_revisions = [_dict_value(revision) for revision in _list_value(manifest.get("plan_revisions"))]
     latest_plan_revision = plan_revisions[-1] if plan_revisions else {}
     status = str(manifest.get("status", "UNKNOWN"))
+    allowed_actions = _allowed_run_actions(manifest)
     evidence_files = _unique_strings(
         _flatten(
             [
@@ -436,6 +437,7 @@ def _summarize_manifest(
         "terminal": status in TERMINAL_RUN_STATUSES,
         "waiting_for": waiting_for,
         "next_action": waiting_for,
+        "allowed_actions": allowed_actions,
         "requires_restart": bool(manifest.get("requires_restart", False)),
         "restart_reason": manifest.get("restart_reason"),
         "restart_paths": _list_value(manifest.get("restart_paths")),
@@ -507,6 +509,7 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "error": task.error,
         "waiting_for": progress.waiting_for,
         "next_action": progress.waiting_for,
+        "allowed_actions": _allowed_task_actions(task),
     }
 
 
@@ -526,6 +529,26 @@ def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "running_tasks": running,
         "current_waiting_point": current.get("waiting_for") if current else "done",
     }
+
+
+def _allowed_run_actions(manifest: Dict[str, Any]) -> List[str]:
+    actions: List[str] = []
+    plan = _dict_value(manifest.get("plan"))
+    if (
+        str(manifest.get("status", "")) == RUN_PLAN_REVIEW_REQUIRED
+        and plan
+        and plan.get("approval_status") != "approved"
+    ):
+        actions.extend(["approve-plan", "revise-plan"])
+    if has_retryable_review_failure_dict(manifest):
+        actions.append("retry-review")
+    return actions
+
+
+def _allowed_task_actions(task: Any) -> List[str]:
+    if getattr(task, "status", None) == "FAILED":
+        return ["retry-task"]
+    return []
 
 
 def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:

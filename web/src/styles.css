@@ -1,0 +1,415 @@
+:root {
+  color-scheme: light;
+  --bg: #f5f6f1;
+  --ink: #17211d;
+  --muted: #667067;
+  --line: #d8ddd2;
+  --panel: #ffffff;
+  --panel-soft: #eef3ea;
+  --green: #117a55;
+  --amber: #a86200;
+  --red: #b93636;
+  --blue: #256f92;
+  --violet: #6c5a9c;
+  --shadow: 0 14px 32px rgba(25, 36, 30, .08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #aab5a6;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .04);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: .58;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  font-weight: 760;
+}
+
+h2 {
+  font-size: 14px;
+  font-weight: 760;
+}
+
+code,
+pre,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  white-space: pre-wrap;
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+}
+
+.sidebar {
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  background: #fbfcf8;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.content {
+  min-width: 0;
+  padding: 22px;
+  overflow: auto;
+}
+
+.appHeader,
+.sectionTitle,
+.detailHeader,
+.itemTop,
+.timelineTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.meta,
+.label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.label {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.panel,
+.section,
+.agentCard,
+.systemStatus,
+.stateStrip,
+.actionBar,
+.empty,
+.error {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.panel,
+.section,
+.agentCard,
+.systemStatus,
+.stateStrip,
+.actionBar {
+  padding: 12px;
+}
+
+.systemStatus {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.systemStatus.restart {
+  border-color: #ecc782;
+  background: #fff9ec;
+}
+
+.systemStatus p {
+  grid-column: 1 / -1;
+  color: var(--amber);
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metrics.compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.metric {
+  min-width: 0;
+  border: 1px solid #e7ece3;
+  border-radius: 8px;
+  background: #fafcf8;
+  padding: 9px;
+}
+
+.metric strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.taskList,
+.runList,
+.detail,
+.planPanel {
+  display: grid;
+  gap: 10px;
+}
+
+.runsPanel {
+  min-height: 0;
+}
+
+.runList {
+  max-height: 34vh;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.taskItem {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.taskItem.selected,
+.runItem.selected {
+  border-color: var(--green);
+  box-shadow: inset 3px 0 0 var(--green);
+}
+
+.taskButton,
+.runItem {
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+}
+
+.taskButton:hover:not(:disabled),
+.runItem:hover:not(:disabled) {
+  box-shadow: none;
+}
+
+.runItem {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 10px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 24px;
+  border-radius: 999px;
+  border: 1px solid #d9e0d4;
+  background: #f4f7f1;
+  color: #344036;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: normal;
+}
+
+.badge.APPROVED,
+.badge.DONE,
+.badge.accepted {
+  border-color: #a9d7c4;
+  background: #e8f6ef;
+  color: var(--green);
+}
+
+.badge.FAILED,
+.badge.BLOCKED {
+  border-color: #f0b3b3;
+  background: #fff1f1;
+  color: var(--red);
+}
+
+.badge.RUNNING,
+.badge.WORKING,
+.badge.REVIEWING {
+  border-color: #afd8e8;
+  background: #eef8fc;
+  color: var(--blue);
+}
+
+.badge.WAITING,
+.badge.PLAN_REVIEW_REQUIRED,
+.badge.RESTART_REQUIRED {
+  border-color: #ecc782;
+  background: #fff8e8;
+  color: var(--amber);
+}
+
+.detailHeader {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.stateStrip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  background: #f8fbf5;
+}
+
+.actionBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.revisionBox {
+  flex: 1 1 420px;
+  display: grid;
+  gap: 8px;
+}
+
+textarea {
+  min-height: 82px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.agentGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid #edf1e9;
+}
+
+details {
+  border: 1px solid #e3e9dd;
+  border-radius: 8px;
+  background: #fbfdf9;
+}
+
+summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  font-weight: 700;
+}
+
+details > div {
+  padding: 0 10px 10px;
+}
+
+.plainList,
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.plainList li,
+.timelineItem {
+  border: 1px solid #e4eae0;
+  border-radius: 8px;
+  padding: 9px;
+  background: #fcfdfa;
+}
+
+.plainList li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.empty,
+.error {
+  padding: 14px;
+}
+
+.error {
+  border-color: #efb5b5;
+  background: #fff4f4;
+  color: var(--red);
+}
+
+@media (max-width: 920px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .content {
+    padding: 16px;
+  }
+
+  .detailGrid,
+  .metrics,
+  .stateStrip,
+  .systemStatus {
+    grid-template-columns: 1fr;
+  }
+}
