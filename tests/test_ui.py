@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action, task_action
-from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
+from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
 from c_orch.ui import INDEX_HTML
 
@@ -65,6 +65,15 @@ class UiTests(unittest.TestCase):
                 risk_notes=["Risk note"],
                 approval_status="approved",
             )
+            manifest.plan_revisions.append(
+                PlanRevisionRecord(
+                    id="plan-revision-1",
+                    created_at="2026-05-11T12:00:00+00:00",
+                    human_feedback="Please narrow the scope.",
+                    previous_plan={"summary": "old"},
+                    new_plan={"summary": "new"},
+                )
+            )
             manifest.workers[0].evidence_files = [str(evidence_path)]
             manifest.workers[0].reasoning_effort = "medium"
             manifest.workers[0].service_tier = "flex"
@@ -96,6 +105,15 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
             self.assertEqual(payload["run"]["review_attempt_count"], 0)
             self.assertEqual(payload["run"]["evidence_count"], 1)
+            self.assertEqual(payload["run"]["waiting_for"], "restart")
+            self.assertEqual(payload["run"]["next_action"], "restart")
+            self.assertEqual(payload["run"]["plan_revision_count"], 1)
+            self.assertEqual(payload["run"]["latest_plan_revision_id"], "plan-revision-1")
+            self.assertEqual(payload["run"]["latest_plan_revision_created_at"], "2026-05-11T12:00:00+00:00")
+            self.assertEqual(
+                payload["run"]["latest_plan_revision_feedback"],
+                "Please narrow the scope.",
+            )
             self.assertTrue(payload["run"]["requires_restart"])
             self.assertEqual(payload["run"]["restart_reason"], "Touched runtime code")
             self.assertEqual(payload["run"]["restart_paths"], ["src/c_orch/orchestrator.py"])
@@ -134,6 +152,8 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["queue"]["status"], "PENDING")
             self.assertEqual(payload["summary"]["total_tasks"], 1)
             self.assertEqual(payload["summary"]["approved_tasks"], 1)
+            self.assertEqual(payload["summary"]["completed_tasks"], 1)
+            self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(payload["summary"]["current_waiting_point"], "done")
             self.assertEqual(payload["tasks"][0]["task_id"], "task-001")
             self.assertEqual(payload["tasks"][0]["active_run_id"], "run-123")
@@ -141,6 +161,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["reason"], "done")
             self.assertEqual(payload["tasks"][0]["error"], "old error")
             self.assertEqual(payload["tasks"][0]["waiting_for"], "done")
+            self.assertEqual(payload["tasks"][0]["next_action"], "done")
 
     def test_build_queue_payload_reconciles_failed_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,7 +194,10 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["queue"]["status"], "FAILED")
             self.assertEqual(payload["tasks"][0]["status"], "FAILED")
             self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_task")
+            self.assertEqual(payload["tasks"][0]["next_action"], "retry_task")
             self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
+            self.assertEqual(payload["summary"]["completed_tasks"], 0)
+            self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(loaded.status, "FAILED")
             self.assertEqual(loaded.tasks[0].status, "FAILED")
 
@@ -209,11 +233,25 @@ class UiTests(unittest.TestCase):
         self.assertIn("/api/runs", INDEX_HTML)
         self.assertIn("/api/queue", INDEX_HTML)
         self.assertIn('id="queueList"', INDEX_HTML)
+        self.assertIn('id="queueSummary"', INDEX_HTML)
         self.assertIn("Task Queue", INDEX_HTML)
+        self.assertIn("total_tasks", INDEX_HTML)
+        self.assertIn("approved_tasks", INDEX_HTML)
+        self.assertIn("completed_tasks", INDEX_HTML)
+        self.assertIn("pending_tasks", INDEX_HTML)
+        self.assertIn("failed_tasks", INDEX_HTML)
+        self.assertIn("running_tasks", INDEX_HTML)
+        self.assertIn("current_waiting_point", INDEX_HTML)
+        self.assertIn("waiting_for", INDEX_HTML)
+        self.assertIn("next_action", INDEX_HTML)
         self.assertIn('id="detail"', INDEX_HTML)
         self.assertIn("运行时间线", INDEX_HTML)
         self.assertIn("payload.events", INDEX_HTML)
-        self.assertIn("Planner 推理强度", INDEX_HTML)
+        self.assertIn("Planner Agent", INDEX_HTML)
+        self.assertIn("Worker Agent", INDEX_HTML)
+        self.assertIn("plan_revision_count", INDEX_HTML)
+        self.assertIn("latest_plan_revision_feedback", INDEX_HTML)
+        self.assertIn("reasoning_effort", INDEX_HTML)
         self.assertIn("需要重启", INDEX_HTML)
         self.assertIn("重启原因", INDEX_HTML)
         self.assertIn("影响路径", INDEX_HTML)

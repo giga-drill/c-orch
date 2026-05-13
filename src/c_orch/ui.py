@@ -240,6 +240,23 @@ INDEX_HTML = """<!doctype html>
       gap: 8px;
       align-items: center;
     }
+    .queueSummary {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .queueMetric {
+      border: 1px solid #e7ece3;
+      border-radius: 8px;
+      background: #fafcf8;
+      padding: 6px 8px;
+      min-width: 0;
+    }
+    .queueMetric .value {
+      font-size: 13px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
     .runItem {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -324,6 +341,26 @@ INDEX_HTML = """<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .agentCards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      min-width: 0;
+    }
+    .agentCard {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fafcf8;
+      min-width: 0;
+    }
+    .agentCardTitle {
+      font-size: 12px;
+      font-weight: 760;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 6px;
     }
     .steps {
       display: grid;
@@ -428,7 +465,7 @@ INDEX_HTML = """<!doctype html>
       .shell { grid-template-columns: 1fr; }
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
       main { padding: 14px; }
-      .grid, .twoCol { grid-template-columns: 1fr; }
+      .grid, .twoCol, .agentCards { grid-template-columns: 1fr; }
       .steps { grid-template-columns: repeat(5, 1fr); }
     }
   </style>
@@ -447,6 +484,7 @@ INDEX_HTML = """<!doctype html>
       <section class="queueBlock">
         <h3>Task Queue</h3>
         <p class="meta" id="queueMeta"></p>
+        <div class="queueSummary" id="queueSummary"></div>
         <div class="queueList" id="queueList"></div>
       </section>
     </aside>
@@ -502,6 +540,7 @@ INDEX_HTML = """<!doctype html>
     const els = {
       runList: document.getElementById("runList"),
       queueMeta: document.getElementById("queueMeta"),
+      queueSummary: document.getElementById("queueSummary"),
       queueList: document.getElementById("queueList"),
       runsDir: document.getElementById("runsDir"),
       refreshBtn: document.getElementById("refreshBtn"),
@@ -540,12 +579,26 @@ INDEX_HTML = """<!doctype html>
       const queue = payload.queue;
       if (!queue) {
         els.queueMeta.textContent = payload.queue_file ? `未加载: ${payload.queue_file}` : "未配置 queue file";
+        els.queueSummary.innerHTML = "";
         els.queueList.innerHTML = `<div class="meta">暂无任务队列。</div>`;
         return;
       }
       const summary = payload.summary || {};
-      const summaryText = `total ${summary.total_tasks ?? 0} · done ${summary.approved_tasks ?? 0} · pending ${summary.pending_tasks ?? 0} · failed ${summary.failed_tasks ?? 0} · waiting ${summary.current_waiting_point || "-"}`;
-      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${summaryText} · ${payload.queue_file || ""}`;
+      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${payload.queue_file || ""}`;
+      els.queueSummary.innerHTML = [
+        ["total_tasks", summary.total_tasks],
+        ["approved_tasks", summary.approved_tasks],
+        ["completed_tasks", summary.completed_tasks],
+        ["pending_tasks", summary.pending_tasks],
+        ["failed_tasks", summary.failed_tasks],
+        ["running_tasks", summary.running_tasks],
+        ["current_waiting_point", summary.current_waiting_point]
+      ].map(([key, value]) => `
+        <div class="queueMetric">
+          <div class="meta">${escapeHtml(key)}</div>
+          <div class="value mono">${escapeHtml(displayValue(value))}</div>
+        </div>
+      `).join("");
       const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
       els.queueList.innerHTML = tasks.map(task => `
         <article class="queueItem">
@@ -554,11 +607,13 @@ INDEX_HTML = """<!doctype html>
             <span class="badge ${escapeHtml(task.status || "")}">${escapeHtml(formatStatus(task.status || ""))}</span>
           </div>
           <div>${escapeHtml(task.title || "")}</div>
-          <div class="meta">waiting: ${escapeHtml(task.waiting_for || "-")}</div>
-          <div class="meta">run: ${escapeHtml(task.active_run_id || "-")}</div>
-          <div class="meta">runs: ${escapeHtml((task.run_ids || []).join(", "))}</div>
-          ${task.reason ? `<div class="meta">reason: ${escapeHtml(task.reason)}</div>` : ""}
-          ${task.error ? `<div class="meta">error: ${escapeHtml(task.error)}</div>` : ""}
+          <div class="meta">status: ${escapeHtml(displayValue(task.status))}</div>
+          <div class="meta">active_run_id: ${escapeHtml(displayValue(task.active_run_id))}</div>
+          <div class="meta">run_ids: ${escapeHtml(displayValue(task.run_ids && task.run_ids.join(", ")))}</div>
+          <div class="meta">waiting_for: ${escapeHtml(displayValue(task.waiting_for))}</div>
+          <div class="meta">next_action: ${escapeHtml(displayValue(task.next_action))}</div>
+          <div class="meta">reason: ${escapeHtml(displayValue(task.reason))}</div>
+          <div class="meta">error: ${escapeHtml(displayValue(task.error))}</div>
           ${task.status === "FAILED" ? `<button data-task-action="retry-task" data-task-id="${escapeHtml(task.task_id || "")}">重新排队</button>` : ""}
         </article>
       `).join("") || `<div class="meta">暂无任务。</div>`;
@@ -664,16 +719,29 @@ INDEX_HTML = """<!doctype html>
       els.updatedAt.textContent = `更新于 ${run.updated_at || ""}`;
       renderSteps(run);
 
-      const workerRows = (manifest.workers || []).map(worker => `
-        <div class="section">
-          <h3>${escapeHtml(worker.id || "worker")}</h3>
-          ${kv("状态", formatStatus(worker.status))}
-          ${kv("模型", worker.model)}
-          ${optionalKv("推理强度", worker.reasoning_effort)}
-          ${optionalKv("响应速度", worker.service_tier)}
-          ${kv("线程", worker.thread_id || "")}
-          ${kv("尝试次数", String(worker.attempt || ""))}
-          ${kv("工作区", worker.worktree_path || "")}
+      const planner = run.planner || {};
+      const workers = Array.isArray(run.workers) ? run.workers : [];
+      const plannerAgentCard = `
+        <div class="agentCard">
+          <div class="agentCardTitle">Planner Agent</div>
+          ${kv("status", planner.status)}
+          ${kv("model", planner.model)}
+          ${kv("thread_id", planner.thread_id)}
+          ${kv("reasoning_effort", planner.reasoning_effort)}
+          ${kv("service_tier", planner.service_tier)}
+        </div>
+      `;
+      const workerAgentCards = workers.map(worker => `
+        <div class="agentCard">
+          <div class="agentCardTitle">Worker Agent · ${escapeHtml(displayValue(worker.id))}</div>
+          ${kv("status", worker.status)}
+          ${kv("model", worker.model)}
+          ${kv("thread_id", worker.thread_id)}
+          ${kv("attempt", worker.attempt)}
+          ${kv("worktree_path", worker.worktree_path)}
+          ${kv("reasoning_effort", worker.reasoning_effort)}
+          ${kv("service_tier", worker.service_tier)}
+          ${kv("evidence_count", worker.evidence_count)}
         </div>
       `).join("");
 
@@ -767,17 +835,23 @@ INDEX_HTML = """<!doctype html>
             ${kv("CWD", manifest.cwd)}
             ${kv("创建时间", manifest.created_at)}
             ${kv("更新时间", manifest.updated_at)}
-            ${kv("Planner 线程", (manifest.planner || {}).thread_id || "")}
-            ${optionalKv("Planner 推理强度", (manifest.planner || {}).reasoning_effort)}
-            ${optionalKv("Planner 响应速度", (manifest.planner || {}).service_tier)}
+            ${kv("waiting_for", run.waiting_for)}
+            ${kv("next_action", run.next_action)}
+            ${kv("plan_revision_count", run.plan_revision_count ?? 0)}
+            ${kv("latest_plan_revision_feedback", run.latest_plan_revision_feedback)}
+            ${kv("latest_plan_revision_id", run.latest_plan_revision_id)}
+            ${kv("latest_plan_revision_created_at", run.latest_plan_revision_created_at)}
             ${kv("需要重启", restartRequired ? "是" : "否")}
             ${restartRequired && manifest.restart_reason ? kv("重启原因", manifest.restart_reason) : ""}
             ${restartRequired && restartPaths.length ? kv("影响路径", restartPaths.join(", ")) : ""}
             ${kv("Codex", manifest.codex_binary_path || "")}
           </div>
         </div>
+        <div class="agentCards">
+          ${plannerAgentCard}
+          ${workerAgentCards || `<div class="agentCard"><div class="agentCardTitle">Worker Agent</div>${kv("status", "-")}${kv("model", "-")}${kv("thread_id", "-")}${kv("attempt", "-")}${kv("worktree_path", "-")}${kv("reasoning_effort", "-")}${kv("service_tier", "-")}${kv("evidence_count", "-")}</div>`}
+        </div>
         <div class="twoCol">
-          <div>${workerRows}</div>
           <div class="stack">
             <div class="section">
               <h3>证据文件</h3>
@@ -787,6 +861,8 @@ INDEX_HTML = """<!doctype html>
               <h3>Worker 活动</h3>
               ${activity ? `<ul class="timeline">${activity}</ul>` : `<p class="meta">暂无 Worker 活动。</p>`}
             </div>
+          </div>
+          <div class="stack">
             <div class="section">
               <h3>复核记录</h3>
               ${reviewAttempts ? `<ul class="timeline">${reviewAttempts}</ul>` : `<p class="meta">暂无复核记录。</p>`}
@@ -821,11 +897,24 @@ INDEX_HTML = """<!doctype html>
     }
 
     function kv(key, value) {
-      return `<div class="kv"><span class="meta">${escapeHtml(key)}</span><span class="mono">${escapeHtml(value || "")}</span></div>`;
+      return `<div class="kv"><span class="meta">${escapeHtml(key)}</span><span class="mono">${escapeHtml(displayValue(value))}</span></div>`;
     }
 
     function optionalKv(key, value) {
       return value ? kv(key, value) : "";
+    }
+
+    function displayValue(value) {
+      if (value === null || value === undefined) {
+        return "-";
+      }
+      if (typeof value === "string") {
+        return value.trim() ? value : "-";
+      }
+      if (Array.isArray(value)) {
+        return value.length ? value.join(", ") : "-";
+      }
+      return String(value);
     }
 
     function setActionButtonsDisabled(disabled) {

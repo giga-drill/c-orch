@@ -413,6 +413,8 @@ def _summarize_manifest(
     review = _dict_value(manifest.get("review"))
     review_attempts = [_dict_value(attempt) for attempt in _list_value(manifest.get("review_attempts"))]
     plan = _dict_value(manifest.get("plan"))
+    plan_revisions = [_dict_value(revision) for revision in _list_value(manifest.get("plan_revisions"))]
+    latest_plan_revision = plan_revisions[-1] if plan_revisions else {}
     status = str(manifest.get("status", "UNKNOWN"))
     evidence_files = _unique_strings(
         _flatten(
@@ -463,6 +465,10 @@ def _summarize_manifest(
             "approval_status": plan.get("approval_status"),
             "summary": plan.get("summary"),
         } if plan else None,
+        "plan_revision_count": len(plan_revisions),
+        "latest_plan_revision_id": latest_plan_revision.get("id"),
+        "latest_plan_revision_created_at": latest_plan_revision.get("created_at"),
+        "latest_plan_revision_feedback": latest_plan_revision.get("human_feedback"),
         "acceptance_count": len(_list_value(manifest.get("acceptance_criteria"))),
         "verification_count": len(_list_value(manifest.get("verification_commands"))),
         "evidence_count": len(evidence_files),
