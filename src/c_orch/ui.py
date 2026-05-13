@@ -240,6 +240,10 @@ INDEX_HTML = """<!doctype html>
       gap: 8px;
       align-items: center;
     }
+    .queueFocus {
+      border-left: 3px solid #d9e6dd;
+      padding-left: 8px;
+    }
     .queueSummary {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -355,6 +359,19 @@ INDEX_HTML = """<!doctype html>
       background: #fafcf8;
       min-width: 0;
     }
+    .stateStrip {
+      border: 1px solid #e2e8df;
+      border-radius: 8px;
+      background: #f7fbf6;
+      padding: 8px 10px;
+      display: grid;
+      gap: 6px;
+    }
+    .stateRow {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
     .agentCardTitle {
       font-size: 12px;
       font-weight: 760;
@@ -414,6 +431,19 @@ INDEX_HTML = """<!doctype html>
       font-family: "SFMono-Regular", Consolas, monospace;
       font-size: 12px;
       line-height: 1.45;
+    }
+    details {
+      margin-top: 10px;
+      border: 1px solid #edf0ea;
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fafcf8;
+    }
+    details summary {
+      cursor: pointer;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 700;
     }
     .planFeedback {
       margin-top: 8px;
@@ -535,6 +565,7 @@ INDEX_HTML = """<!doctype html>
     let runs = [];
     let queueData = null;
     let selected = null;
+    let runsGeneratedAt = "";
     const pendingActions = new Set();
 
     const els = {
@@ -551,17 +582,29 @@ INDEX_HTML = """<!doctype html>
       steps: document.getElementById("steps")
     };
 
-    els.refreshBtn.addEventListener("click", () => loadRuns(true));
-    setInterval(() => loadRuns(false), 2500);
-    loadRuns(false);
+    els.refreshBtn.addEventListener("click", () => refreshAll({ forceFirst: false }));
+    setInterval(() => refreshAll({ forceFirst: false }), 2500);
+    refreshAll({ forceFirst: false });
 
-    async function loadRuns(forceFirst) {
+    async function refreshAll(options) {
+      const config = options || {};
+      const forceFirst = Boolean(config.forceFirst);
+      const preferredRunId = config.preferredRunId || null;
       const response = await fetch("/api/runs", { cache: "no-store" });
       const payload = await response.json();
       runs = payload.runs || [];
+      runsGeneratedAt = payload.generated_at || "";
       els.runsDir.textContent = payload.runs_dir || "";
-      if (!selected || forceFirst || !runs.find(run => run.run_id === selected)) {
+      if (preferredRunId && runs.find(run => run.run_id === preferredRunId)) {
+        selected = preferredRunId;
+      } else if (!selected || forceFirst || !runs.find(run => run.run_id === selected)) {
         selected = runs[0] ? runs[0].run_id : null;
+      }
+      const runsTime = runsGeneratedAt ? ` · 更新 ${runsGeneratedAt}` : "";
+      if (payload.runs_dir) {
+        els.runsDir.textContent = `${payload.runs_dir}${runsTime}`;
+      } else {
+        els.runsDir.textContent = runsGeneratedAt ? `更新 ${runsGeneratedAt}` : "";
       }
       renderList();
       await loadQueue();
@@ -577,14 +620,17 @@ INDEX_HTML = """<!doctype html>
       const payload = await response.json();
       queueData = payload;
       const queue = payload.queue;
+      const queueUpdatedAt = payload.generated_at ? ` · 更新 ${payload.generated_at}` : "";
       if (!queue) {
-        els.queueMeta.textContent = payload.queue_file ? `未加载: ${payload.queue_file}` : "未配置 queue file";
+        els.queueMeta.textContent = payload.queue_file
+          ? `未加载: ${payload.queue_file}${queueUpdatedAt}`
+          : `未配置 queue file${queueUpdatedAt}`;
         els.queueSummary.innerHTML = "";
         els.queueList.innerHTML = `<div class="meta">暂无任务队列。</div>`;
         return;
       }
       const summary = payload.summary || {};
-      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${payload.queue_file || ""}`;
+      els.queueMeta.textContent = `${queue.queue_id} · ${formatStatus(queue.status)} · ${payload.queue_file || ""}${queueUpdatedAt}`;
       els.queueSummary.innerHTML = [
         ["total_tasks", summary.total_tasks],
         ["approved_tasks", summary.approved_tasks],
@@ -606,12 +652,11 @@ INDEX_HTML = """<!doctype html>
             <span class="runId">${escapeHtml(task.task_id || "")}</span>
             <span class="badge ${escapeHtml(task.status || "")}">${escapeHtml(formatStatus(task.status || ""))}</span>
           </div>
+          <div class="meta queueFocus">waiting_for: ${escapeHtml(displayValue(task.waiting_for))} · next_action: ${escapeHtml(displayValue(task.next_action))}</div>
           <div>${escapeHtml(task.title || "")}</div>
           <div class="meta">status: ${escapeHtml(displayValue(task.status))}</div>
           <div class="meta">active_run_id: ${escapeHtml(displayValue(task.active_run_id))}</div>
           <div class="meta">run_ids: ${escapeHtml(displayValue(task.run_ids && task.run_ids.join(", ")))}</div>
-          <div class="meta">waiting_for: ${escapeHtml(displayValue(task.waiting_for))}</div>
-          <div class="meta">next_action: ${escapeHtml(displayValue(task.next_action))}</div>
           <div class="meta">reason: ${escapeHtml(displayValue(task.reason))}</div>
           <div class="meta">error: ${escapeHtml(displayValue(task.error))}</div>
           ${task.status === "FAILED" ? `<button data-task-action="retry-task" data-task-id="${escapeHtml(task.task_id || "")}">重新排队</button>` : ""}
@@ -627,6 +672,7 @@ INDEX_HTML = """<!doctype html>
       const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ action })
       });
       if (!response.ok) {
@@ -634,7 +680,26 @@ INDEX_HTML = """<!doctype html>
         window.alert(payload.error || `任务操作失败: ${response.status}`);
         return;
       }
-      await loadQueue();
+      const payload = await response.json().catch(() => ({}));
+      const taskSnapshot = findTask(payload, taskId);
+      let preferredRunId = pickTaskTargetRun(taskSnapshot);
+      await refreshAll({ preferredRunId, forceFirst: false });
+      const waitingStatus = taskSnapshot && taskSnapshot.status;
+      if (!taskSnapshot || !taskSnapshot.active_run_id) {
+        if (waitingStatus === "PENDING" || waitingStatus === "RUNNING" || waitingStatus === "WAITING") {
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            await sleep(300);
+            await refreshAll({ preferredRunId, forceFirst: false });
+            const latest = queueData ? findTask(queueData, taskId) : null;
+            const latestRunId = pickTaskTargetRun(latest);
+            if (latestRunId) {
+              preferredRunId = latestRunId;
+              await refreshAll({ preferredRunId, forceFirst: false });
+              break;
+            }
+          }
+        }
+      }
     }
 
     function renderList() {
@@ -690,7 +755,7 @@ INDEX_HTML = """<!doctype html>
         }
         const resultPayload = await response.json();
         renderDetail(resultPayload);
-        await loadRuns(false);
+        await refreshAll({ preferredRunId: runId, forceFirst: false });
       } finally {
         pendingActions.delete(key);
         setActionButtonsDisabled(false);
@@ -716,7 +781,8 @@ INDEX_HTML = """<!doctype html>
       els.detailTitle.textContent = run.run_id;
       els.detailBadge.className = `badge ${run.status}`;
       els.detailBadge.textContent = formatStatus(run.status);
-      els.updatedAt.textContent = `更新于 ${run.updated_at || ""}`;
+      const detailUpdatedAt = payload.generated_at || run.updated_at || manifest.updated_at || "";
+      els.updatedAt.textContent = detailUpdatedAt ? `更新于 ${detailUpdatedAt}` : "";
       renderSteps(run);
 
       const planner = run.planner || {};
@@ -729,6 +795,8 @@ INDEX_HTML = """<!doctype html>
           ${kv("thread_id", planner.thread_id)}
           ${kv("reasoning_effort", planner.reasoning_effort)}
           ${kv("service_tier", planner.service_tier)}
+          ${kv("waiting_for", run.waiting_for)}
+          ${kv("next_action", run.next_action)}
         </div>
       `;
       const workerAgentCards = workers.map(worker => `
@@ -742,6 +810,8 @@ INDEX_HTML = """<!doctype html>
           ${kv("reasoning_effort", worker.reasoning_effort)}
           ${kv("service_tier", worker.service_tier)}
           ${kv("evidence_count", worker.evidence_count)}
+          ${kv("waiting_for", run.waiting_for)}
+          ${kv("next_action", run.next_action)}
         </div>
       `).join("");
 
@@ -766,7 +836,7 @@ INDEX_HTML = """<!doctype html>
           ? `<button type="button" data-run-action="retry-review" onclick="runAction('${escapeJs(run.run_id)}', 'retry-review')">重新让 Planner 复核</button>`
           : ""
       ].filter(Boolean).join(" ");
-      const reviewAttempts = (manifest.review_attempts || []).map(attempt => `
+      const reviewAttempts = newestFirst(manifest.review_attempts || []).map(attempt => `
         <li class="timelineItem">
           <div class="timelineTop">
             <span class="badge">${escapeHtml(attempt.status || "")}</span>
@@ -780,7 +850,7 @@ INDEX_HTML = """<!doctype html>
           ${attempt.error ? `<div class="meta mono">${escapeHtml(attempt.error)}</div>` : ""}
         </li>
       `).join("");
-      const activity = (payload.worker_activity || []).map(item => `
+      const activity = newestFirst(payload.worker_activity || []).map(item => `
         <li class="timelineItem">
           <div class="timelineTop">
             <span class="mono">${escapeHtml(item.timestamp || "")}</span>
@@ -793,7 +863,7 @@ INDEX_HTML = """<!doctype html>
       const riskNotes = plan ? (plan.risk_notes || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") : "";
       const criteria = (manifest.acceptance_criteria || []).map(item => `<li>${escapeHtml(item)}</li>`).join("");
       const commands = (manifest.verification_commands || []).map(item => `<li><code>${escapeHtml(item)}</code></li>`).join("");
-      const timeline = events.map(event => {
+      const timeline = newestFirst(events).map(event => {
         const details = eventDetails(event);
         return `
           <li class="timelineItem">
@@ -809,6 +879,13 @@ INDEX_HTML = """<!doctype html>
 
       els.detail.innerHTML = `
         ${actionButtons ? `<div class="section">${actionButtons}</div>` : ""}
+        <div class="stateStrip">
+          <div class="meta">当前等待点与下一动作</div>
+          <div class="stateRow">
+            <div class="mono">waiting_for: ${escapeHtml(displayValue(run.waiting_for))}</div>
+            <div class="mono">next_action: ${escapeHtml(displayValue(run.next_action))}</div>
+          </div>
+        </div>
         <div class="grid">
           <div class="metric"><div class="meta">Planner</div><div class="value">${escapeHtml(formatStatus(run.planner.status || ""))}</div></div>
           <div class="metric"><div class="meta">Worker</div><div class="value">${escapeHtml(formatStatus((run.workers[0] || {}).status || ""))}</div></div>
@@ -824,11 +901,11 @@ INDEX_HTML = """<!doctype html>
               ${kv("审批", plan.approval_status || "")}
               ${plan.approved_at ? kv("通过时间", plan.approved_at) : ""}
               ${plan.summary ? `<p>${escapeHtml(plan.summary)}</p>` : ""}
-              ${riskNotes ? `<h3 style="margin-top:14px">风险</h3><ul>${riskNotes}</ul>` : ""}
-              ${plan.worker_prompt ? `<h3 style="margin-top:14px">Worker 指令</h3><div class="planPrompt">${escapeHtml(plan.worker_prompt)}</div>` : ""}
+              ${plan.worker_prompt ? `<details><summary>Worker 指令</summary><div class="planPrompt">${escapeHtml(plan.worker_prompt)}</div></details>` : ""}
+              ${riskNotes ? `<details><summary>风险说明</summary><ul>${riskNotes}</ul></details>` : ""}
             ` : ""}
-            ${criteria ? `<h3 style="margin-top:14px">验收标准</h3><ul>${criteria}</ul>` : ""}
-            ${commands ? `<h3 style="margin-top:14px">验证命令</h3><ul>${commands}</ul>` : ""}
+            ${criteria ? `<details><summary>验收标准</summary><ul>${criteria}</ul></details>` : ""}
+            ${commands ? `<details><summary>验证命令</summary><ul>${commands}</ul></details>` : ""}
           </div>
           <div class="section">
             <h3>运行信息</h3>
@@ -855,7 +932,7 @@ INDEX_HTML = """<!doctype html>
           <div class="stack">
             <div class="section">
               <h3>证据文件</h3>
-              ${evidence ? `<ul>${evidence}</ul>` : `<p class="meta">暂无证据。</p>`}
+              ${evidence ? `<details><summary>证据文件 (${escapeHtml(String((payload.evidence_files || []).length))})</summary><ul>${evidence}</ul></details>` : `<p class="meta">暂无证据。</p>`}
             </div>
             <div class="section">
               <h3>Worker 活动</h3>
@@ -915,6 +992,33 @@ INDEX_HTML = """<!doctype html>
         return value.length ? value.join(", ") : "-";
       }
       return String(value);
+    }
+
+    function newestFirst(items) {
+      return Array.isArray(items) ? items.slice().reverse() : [];
+    }
+
+    function findTask(payload, taskId) {
+      if (!payload || !taskId) {
+        return null;
+      }
+      const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+      return tasks.find(item => item && item.task_id === taskId) || null;
+    }
+
+    function pickTaskTargetRun(task) {
+      if (!task) {
+        return null;
+      }
+      if (task.active_run_id) {
+        return task.active_run_id;
+      }
+      const runIds = Array.isArray(task.run_ids) ? task.run_ids : [];
+      return runIds.length ? runIds[runIds.length - 1] : null;
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => window.setTimeout(resolve, ms));
     }
 
     function setActionButtonsDisabled(disabled) {

@@ -268,6 +268,22 @@ class UiTests(unittest.TestCase):
         self.assertIn("data-run-action=\"revise-plan\"", INDEX_HTML)
         self.assertIn("data-run-action=\"retry-review\"", INDEX_HTML)
 
+    def test_index_html_contains_timeline_collapse_and_refresh_contracts(self) -> None:
+        self.assertIn("newestFirst(events)", INDEX_HTML)
+        self.assertIn("items.slice().reverse()", INDEX_HTML)
+        self.assertIn("<details><summary>Worker 指令</summary>", INDEX_HTML)
+        self.assertIn("<details><summary>验收标准</summary>", INDEX_HTML)
+        self.assertIn("<details><summary>验证命令</summary>", INDEX_HTML)
+        self.assertIn("<details><summary>风险说明</summary>", INDEX_HTML)
+        self.assertIn("<details><summary>证据文件 (", INDEX_HTML)
+        self.assertIn("async function refreshAll(options)", INDEX_HTML)
+        self.assertIn("await refreshAll({ preferredRunId: runId, forceFirst: false });", INDEX_HTML)
+        self.assertIn("const taskSnapshot = findTask(payload, taskId);", INDEX_HTML)
+        self.assertIn("let preferredRunId = pickTaskTargetRun(taskSnapshot);", INDEX_HTML)
+        self.assertIn("payload.generated_at", INDEX_HTML)
+        self.assertIn("queueUpdatedAt", INDEX_HTML)
+        self.assertIn("cache: \"no-store\"", INDEX_HTML)
+
     def test_run_action_revise_plan_passes_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
