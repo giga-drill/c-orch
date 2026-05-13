@@ -9,7 +9,11 @@ from .failure_policy import has_retryable_review_failure
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
 from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
-from .task_lifecycle import reconcile_queue, reconcile_task_with_active_run
+from .task_lifecycle import (
+    REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
+    reconcile_queue,
+    reconcile_task_with_active_run,
+)
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -103,10 +107,6 @@ class TaskScheduler:
                 return queue
             if task.active_run_id:
                 active = self._load_active_run(task.active_run_id)
-                if active is not None and active.status == RUN_PLAN_REVIEW_REQUIRED:
-                    queue.status = QUEUE_RUNNING
-                    self.task_store.save(queue)
-                    return queue
                 if active is not None and active.status == RUN_PLAN_APPROVED:
                     self.task_store.update_task(
                         queue,
@@ -277,7 +277,7 @@ class TaskScheduler:
                 approval_policy=self.config.approval_policy,
                 max_attempts=self.config.max_attempts,
                 require_plan_approval=True,
-                approve_plan=False,
+                approve_plan=True,
             ),
         )
 
@@ -309,8 +309,18 @@ class TaskScheduler:
             self.task_store.save(queue)
             return True
 
-        if manifest.status == RUN_PLAN_REVIEW_REQUIRED or has_retryable_review_failure(manifest):
+        if has_retryable_review_failure(manifest):
             queue.status = QUEUE_RUNNING
+            self.task_store.save(queue)
+            return False
+        if manifest.status == RUN_PLAN_REVIEW_REQUIRED:
+            queue.status = QUEUE_FAILED
+            self.task_store.update_task(
+                queue,
+                task.task_id,
+                status=TASK_FAILED,
+                reason=REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
+            )
             self.task_store.save(queue)
             return False
 

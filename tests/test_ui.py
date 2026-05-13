@@ -555,7 +555,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(body["queue"]["status"], "APPROVED")
             self.assertFalse(run_store.load(manifest.run_id).requires_restart)
 
-    def test_plan_review_run_exposes_allowed_actions(self) -> None:
+    def test_plan_review_run_does_not_expose_dashboard_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = RunStore(root / "runs")
@@ -573,7 +573,7 @@ class UiTests(unittest.TestCase):
 
             self.assertIsNotNone(payload)
             assert payload is not None
-            self.assertEqual(payload["run"]["allowed_actions"], ["approve-plan", "revise-plan"])
+            self.assertEqual(payload["run"]["allowed_actions"], [])
 
     def test_react_frontend_sources_contain_dashboard_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -595,8 +595,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("确认已重启并继续", app_source)
         self.assertIn("确认中...", app_source)
         self.assertIn("queueActionError", app_source)
-        self.assertIn("通过并启动 Worker", app_source)
-        self.assertIn("让 Planner 重新生成计划", app_source)
+        self.assertNotIn("通过并启动 Worker", app_source)
+        self.assertNotIn("让 Planner 重新生成计划", app_source)
         self.assertIn("重新让 Planner 复核", app_source)
         self.assertIn("运行时间线", app_source)
         self.assertIn("Worker 指令", app_source)

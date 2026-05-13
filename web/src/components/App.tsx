@@ -460,7 +460,6 @@ function RunDetail({
   onSelectRun: (runId: string) => void;
 }) {
   const actionMutation = useRunActionMutation();
-  const [feedback, setFeedback] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
 
   if (isLoading) {
@@ -477,7 +476,6 @@ function RunDetail({
     setActionError(null);
     try {
       await actionMutation.mutateAsync({ runId: run.run_id, action, payload: extra });
-      if (action === "revise-plan") setFeedback("");
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     }
@@ -511,8 +509,6 @@ function RunDetail({
       <ActionBar
         actions={run.allowed_actions}
         isPending={actionMutation.isPending}
-        feedback={feedback}
-        onFeedbackChange={setFeedback}
         onAction={runAction}
       />
       {actionError ? <div className="error">{actionError}</div> : null}
@@ -588,44 +584,19 @@ function RunDetail({
 function ActionBar({
   actions,
   isPending,
-  feedback,
-  onFeedbackChange,
   onAction,
 }: {
   actions: AllowedRunAction[];
   isPending: boolean;
-  feedback: string;
-  onFeedbackChange: (value: string) => void;
   onAction: (action: AllowedRunAction, extra?: Record<string, unknown>) => void;
 }) {
   if (!actions.length) return null;
   return (
     <section className="actionBar">
-      {actions.includes("approve-plan") ? (
-        <button type="button" onClick={() => onAction("approve-plan")} disabled={isPending}>
-          {isPending ? "处理中..." : "通过并启动 Worker"}
-        </button>
-      ) : null}
       {actions.includes("retry-review") ? (
         <button type="button" onClick={() => onAction("retry-review")} disabled={isPending}>
           {isPending ? "处理中..." : "重新让 Planner 复核"}
         </button>
-      ) : null}
-      {actions.includes("revise-plan") ? (
-        <div className="revisionBox">
-          <textarea
-            value={feedback}
-            onChange={(event) => onFeedbackChange(event.target.value)}
-            placeholder="请输入修改意见，Planner 会在同一线程里重写完整方案。"
-          />
-          <button
-            type="button"
-            onClick={() => onAction("revise-plan", { feedback })}
-            disabled={isPending || !feedback.trim()}
-          >
-            {isPending ? "提交中..." : "让 Planner 重新生成计划"}
-          </button>
-        </div>
       ) : null}
     </section>
   );

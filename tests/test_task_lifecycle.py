@@ -6,7 +6,7 @@ from pathlib import Path
 
 from c_orch.run_store import RunStore
 from c_orch.task_lifecycle import (
-    WAITING_HUMAN_PLAN_REVIEW,
+    REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
     WAITING_RESTART,
     WAITING_RETRY_TASK,
     derive_run_waiting_for,
@@ -16,10 +16,8 @@ from c_orch.task_lifecycle import (
 from c_orch.task_store import (
     QUEUE_FAILED,
     QUEUE_RESTART_REQUIRED,
-    QUEUE_RUNNING,
     TASK_FAILED,
     TASK_PENDING,
-    TASK_WAITING,
     TaskStore,
 )
 
@@ -56,7 +54,7 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertEqual(queue.tasks[0].status, TASK_FAILED)
             self.assertEqual(queue.tasks[0].reason, "active_run_failed")
 
-    def test_active_plan_review_run_marks_task_waiting(self) -> None:
+    def test_active_plan_review_run_marks_queue_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task_store = TaskStore(root / "queue.json")
@@ -83,9 +81,9 @@ class TaskLifecycleTests(unittest.TestCase):
             changed = reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
 
             self.assertTrue(changed)
-            self.assertEqual(queue.status, QUEUE_RUNNING)
-            self.assertEqual(queue.tasks[0].status, TASK_WAITING)
-            self.assertEqual(queue.tasks[0].reason, WAITING_HUMAN_PLAN_REVIEW)
+            self.assertEqual(queue.status, QUEUE_FAILED)
+            self.assertEqual(queue.tasks[0].status, TASK_FAILED)
+            self.assertEqual(queue.tasks[0].reason, REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL)
 
     def test_approved_run_requiring_restart_marks_queue_restart_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

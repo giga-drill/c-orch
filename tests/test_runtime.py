@@ -12,7 +12,7 @@ from c_orch.run_store import PlanRecord
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
 from c_orch.states import RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
-from c_orch.task_store import TASK_WAITING, TaskStore
+from c_orch.task_store import TaskStore
 
 
 class _FakeOrchestrator:
@@ -90,7 +90,7 @@ class RuntimeTests(unittest.TestCase):
             task_store.update_task(queue, "task-001", status="FAILED", reason="active_run_failed")
             task_store.save(queue)
             run_store = RunStore(root / "runs")
-            fake = _FakeOrchestrator(run_store, "PLAN_REVIEW_REQUIRED")
+            fake = _FakeOrchestrator(run_store, "APPROVED")
             runtime = COrchRuntime(
                 runs_dir=root / "runs",
                 queue_path=root / "queue.json",
@@ -105,9 +105,9 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(int(status), 200)
             self.assertTrue(runtime.wait_for_dispatch(timeout=2))
             loaded = task_store.load()
-            self.assertEqual(loaded.status, "RUNNING")
-            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
-            self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
+            self.assertEqual(loaded.status, "APPROVED")
+            self.assertEqual(loaded.tasks[0].status, "APPROVED")
+            self.assertIsNone(loaded.tasks[0].reason)
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
 

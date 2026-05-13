@@ -132,9 +132,11 @@ FAILED
 ```
 
 `BLOCKED` is retained only for legacy or exceptional queue records. Detailed
-waiting points such as `human_plan_review`, `planner_review_retry`,
-`worker_rework`, and `retry_task` are derived values, not separate task
-statuses. `task_lifecycle.py` owns task/run reconciliation, so Scheduler,
+waiting points such as `planner_review_retry`, `worker_rework`, and
+`retry_task` are derived values, not separate task statuses.
+`human_plan_review` belongs to the proposal pool; if an execution-queue task
+reaches it, c-orch treats that as a flow-boundary violation rather than normal
+queue progress. `task_lifecycle.py` owns task/run reconciliation, so Scheduler,
 Runtime, CLI, and UI do not each invent their own task transition rules.
 
 When an active run reaches `FAILED`, the owning task must converge to `FAILED`

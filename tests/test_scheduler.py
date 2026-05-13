@@ -56,7 +56,7 @@ class _FakeOrchestrator:
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_active_run_waiting_plan_review_keeps_task_running(self) -> None:
+    def test_active_run_waiting_plan_review_fails_queue_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task_store = TaskStore(root / "queue.json")
@@ -92,16 +92,16 @@ class SchedulerTests(unittest.TestCase):
             )
             queue = scheduler.run()
 
-            self.assertEqual(queue.status, "RUNNING")
+            self.assertEqual(queue.status, QUEUE_FAILED)
             loaded = task_store.load()
-            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
-            self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
+            self.assertEqual(loaded.tasks[0].status, TASK_FAILED)
+            self.assertEqual(loaded.tasks[0].reason, "plan_review_outside_proposal_pool")
             self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(fake.run_ids, [])
             self.assertEqual(fake.run_calls, 0)
             self.assertEqual(fake.retry_review_calls, 0)
 
-    def test_new_run_waiting_plan_review_keeps_task_running(self) -> None:
+    def test_new_run_waiting_plan_review_fails_queue_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task_store = TaskStore(root / "queue.json")
@@ -121,10 +121,10 @@ class SchedulerTests(unittest.TestCase):
             )
             queue = scheduler.run()
 
-            self.assertEqual(queue.status, "RUNNING")
+            self.assertEqual(queue.status, QUEUE_FAILED)
             loaded = task_store.load()
-            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
-            self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
+            self.assertEqual(loaded.tasks[0].status, TASK_FAILED)
+            self.assertEqual(loaded.tasks[0].reason, "plan_review_outside_proposal_pool")
             self.assertEqual(loaded.tasks[0].active_run_id, fake.run_ids[0])
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(fake.retry_review_calls, 0)

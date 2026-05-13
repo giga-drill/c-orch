@@ -48,6 +48,7 @@ WAITING_RETRY_TASK = "retry_task"
 WAITING_RESTART = "restart"
 WAITING_DONE = "done"
 WAITING_FAILED = "failed"
+REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL = "plan_review_outside_proposal_pool"
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,13 @@ def derive_task_progress(
                 waiting_for=WAITING_RETRY_TASK,
                 reason="active_run_failed",
             )
-        if waiting_for in {WAITING_HUMAN_PLAN_REVIEW, WAITING_PLANNER_REVIEW_RETRY}:
+        if waiting_for == WAITING_HUMAN_PLAN_REVIEW:
+            return TaskProgress(
+                status=TASK_FAILED,
+                waiting_for=WAITING_FAILED,
+                reason=REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
+            )
+        if waiting_for == WAITING_PLANNER_REVIEW_RETRY:
             return TaskProgress(status=TASK_WAITING, waiting_for=waiting_for, reason=waiting_for)
         return TaskProgress(status=TASK_RUNNING, waiting_for=waiting_for, reason=waiting_for)
 

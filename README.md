@@ -170,8 +170,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - Task status is user-level state. A task can own multiple run attempts via
   `run_ids`; `active_run_id` points to the current attempt. The backend
   reconciles task/queue status from the active run and exposes derived
-  `waiting_for` / `next_action` values such as `human_plan_review`,
-  `planner_review_retry`, `restart`, and `retry_task`.
+  `waiting_for` / `next_action` values such as `planner_review_retry`,
+  `restart`, and `retry_task`. `human_plan_review` belongs to the proposal
+  pool and is treated as an invalid execution-queue waiting point.
 - Failed tasks can be requeued with `c-orch queue retry <task_id>` or from the
   dashboard. This preserves prior `run_ids`; when the dashboard backend has
   execution config, a requeued first task is auto-dispatched. `c-orch queue run`

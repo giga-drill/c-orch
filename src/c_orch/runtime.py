@@ -1038,13 +1038,6 @@ def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _allowed_run_actions(manifest: Dict[str, Any]) -> List[str]:
     actions: List[str] = []
-    plan = _dict_value(manifest.get("plan"))
-    if (
-        str(manifest.get("status", "")) == RUN_PLAN_REVIEW_REQUIRED
-        and plan
-        and plan.get("approval_status") != "approved"
-    ):
-        actions.extend(["approve-plan", "revise-plan"])
     if has_retryable_review_failure_dict(manifest):
         actions.append("retry-review")
     return actions
