@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 from typing import List, Tuple
 
-from c_orch.run_store import RunStore
+from c_orch.run_store import ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.scheduler import SchedulerConfig, TaskScheduler
+from c_orch.states import REVIEW_ATTEMPT_FAILED_RETRYABLE, RUN_WORK_DONE
 from c_orch.task_store import (
     QUEUE_APPROVED,
     QUEUE_FAILED,
@@ -21,17 +22,36 @@ from c_orch.task_store import (
 
 
 class _FakeOrchestrator:
-    def __init__(self, run_store: RunStore, outcomes: List[Tuple[str, bool]]) -> None:
+    def __init__(
+        self,
+        run_store: RunStore,
+        outcomes: List[Tuple[str, bool]],
+        retry_outcomes: List[Tuple[str, bool]] | None = None,
+    ) -> None:
         self.run_store = run_store
         self.outcomes = list(outcomes)
+        self.retry_outcomes = list(retry_outcomes or [])
         self.run_ids: List[str] = []
+        self.retry_run_ids: List[str] = []
+        self.run_calls = 0
+        self.retry_review_calls = 0
 
     def run(self, manifest):  # type: ignore[no-untyped-def]
+        self.run_calls += 1
         status, requires_restart = self.outcomes.pop(0)
         manifest.status = status
         manifest.requires_restart = requires_restart
         self.run_store.save(manifest)
         self.run_ids.append(manifest.run_id)
+        return manifest
+
+    def retry_review(self, manifest):  # type: ignore[no-untyped-def]
+        self.retry_review_calls += 1
+        status, requires_restart = self.retry_outcomes.pop(0)
+        manifest.status = status
+        manifest.requires_restart = requires_restart
+        self.run_store.save(manifest)
+        self.retry_run_ids.append(manifest.run_id)
         return manifest
 
 
@@ -78,6 +98,8 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
             self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(fake.run_ids, [])
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 0)
 
     def test_new_run_waiting_plan_review_keeps_task_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,6 +127,100 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].reason, "human_plan_review")
             self.assertEqual(loaded.tasks[0].active_run_id, fake.run_ids[0])
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
+            self.assertEqual(fake.retry_review_calls, 0)
+
+    def test_active_retryable_review_failure_auto_retries_and_approves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            _mark_retryable_review_failure(manifest)
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_WAITING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[], retry_outcomes=[("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded_manifest = run_store.load(manifest.run_id)
+            loaded_queue = task_store.load()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(loaded_queue.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 1)
+            self.assertEqual(fake.retry_run_ids, [manifest.run_id])
+            self.assertEqual(loaded_manifest.review.evidence_files, ["evidence/review.patch"])  # type: ignore[union-attr]
+
+    def test_active_retryable_review_failure_auto_retries_and_sets_restart_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            _mark_retryable_review_failure(manifest)
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_WAITING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[], retry_outcomes=[("APPROVED", True)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, QUEUE_RESTART_REQUIRED)
+            self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(loaded.tasks[1].status, TASK_PENDING)
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 1)
 
     def test_runs_two_pending_tasks_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +282,100 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
             self.assertEqual(loaded.tasks[1].status, TASK_PENDING)
             self.assertEqual(len(fake.run_ids), 1)
+
+    def test_restart_required_resume_hard_stops_before_next_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "APPROVED"
+            manifest.requires_restart = True
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_RUNNING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, QUEUE_RESTART_REQUIRED)
+            self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(loaded.tasks[1].status, TASK_PENDING)
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 0)
+
+    def test_retry_review_failure_keeps_evidence_and_waiting_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            _mark_retryable_review_failure(manifest)
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_WAITING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[], retry_outcomes=[(RUN_WORK_DONE, False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+            loaded_manifest = run_store.load(manifest.run_id)
+
+            self.assertEqual(queue.status, "RUNNING")
+            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
+            self.assertEqual(loaded.tasks[0].reason, "planner_review_retry")
+            self.assertEqual(fake.retry_review_calls, 1)
+            self.assertEqual(loaded_manifest.status, RUN_WORK_DONE)
+            self.assertEqual(loaded_manifest.review.evidence_files, ["evidence/review.patch"])  # type: ignore[union-attr]
+            self.assertEqual(loaded_manifest.review_attempts[-1].status, REVIEW_ATTEMPT_FAILED_RETRYABLE)
 
     def test_resume_skips_approved_and_runs_next_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +524,22 @@ def _fake_worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str,
     worktree = worktrees_dir / run_id / worker_id
     worktree.mkdir(parents=True, exist_ok=True)
     return worktree
+
+
+def _mark_retryable_review_failure(manifest) -> None:  # type: ignore[no-untyped-def]
+    manifest.status = RUN_WORK_DONE
+    manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+    manifest.review_attempts = [
+        ReviewAttemptRecord(
+            id="review-1",
+            worker_id="worker-1",
+            status=REVIEW_ATTEMPT_FAILED_RETRYABLE,
+            started_at="2026-05-13T00:00:00+00:00",
+            completed_at="2026-05-13T00:01:00+00:00",
+            evidence_files=["evidence/review.patch"],
+            error="Timed out waiting for MCP server output",
+        )
+    ]
 
 
 if __name__ == "__main__":

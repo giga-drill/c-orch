@@ -16,7 +16,7 @@ from c_orch.runtime import (
     run_action,
     task_action,
 )
-from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewRecord, RunStore
+from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
 from c_orch.ui import FALLBACK_INDEX_HTML, build_server
 
@@ -213,6 +213,55 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(loaded.status, "FAILED")
             self.assertEqual(loaded.tasks[0].status, "FAILED")
+
+    def test_build_queue_payload_reconciles_planner_review_retry_waiting_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-13T00:00:00+00:00",
+                    completed_at="2026-05-13T00:01:00+00:00",
+                    evidence_files=["evidence/review.patch"],
+                    error="Timed out waiting for MCP server output",
+                )
+            ]
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+            loaded = queue_store.load()
+
+            self.assertEqual(payload["queue"]["status"], "RUNNING")
+            self.assertEqual(payload["tasks"][0]["status"], "WAITING")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "planner_review_retry")
+            self.assertEqual(payload["tasks"][0]["next_action"], "planner_review_retry")
+            self.assertEqual(payload["tasks"][0]["allowed_actions"], [])
+            self.assertEqual(payload["summary"]["current_waiting_point"], "planner_review_retry")
+            self.assertEqual(loaded.tasks[0].status, "WAITING")
+            self.assertEqual(loaded.tasks[0].reason, "planner_review_retry")
 
     def test_task_action_retry_requeues_failed_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

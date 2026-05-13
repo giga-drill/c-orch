@@ -23,6 +23,7 @@ from .task_store import (
     TASK_PENDING,
     TASK_RUNNING,
     TASK_WAITING,
+    TaskRecord,
     TaskQueue,
     TaskStore,
 )
@@ -31,6 +32,9 @@ from .worktrees import create_worker_worktree
 
 class OrchestratorLike(Protocol):
     def run(self, manifest: RunManifest) -> RunManifest:
+        ...
+
+    def retry_review(self, manifest: RunManifest) -> RunManifest:
         ...
 
 
@@ -80,9 +84,10 @@ class TaskScheduler:
             self.task_store.save(queue)
         orchestrator = self._orchestrator_factory()
         processed = 0
+        attempted_retry_review_run_ids: set[str] = set()
 
         while True:
-            if queue.status in {QUEUE_FAILED, QUEUE_BLOCKED}:
+            if queue.status in {QUEUE_FAILED, QUEUE_BLOCKED, QUEUE_RESTART_REQUIRED}:
                 self.task_store.save(queue)
                 return queue
             if self.config.max_tasks is not None and processed >= self.config.max_tasks:
@@ -103,8 +108,34 @@ class TaskScheduler:
                     self.task_store.save(queue)
                     return queue
                 if active is not None and has_retryable_review_failure(active):
-                    queue.status = QUEUE_RUNNING
-                    self.task_store.save(queue)
+                    if active.run_id in attempted_retry_review_run_ids:
+                        queue.status = QUEUE_RUNNING
+                        self.task_store.save(queue)
+                        return queue
+                    attempted_retry_review_run_ids.add(active.run_id)
+                    self.run_store.append_event(
+                        active.run_id,
+                        "queue_auto_retry_review_started",
+                        "Queue scheduler started automatic planner review retry",
+                        source="queue_scheduler",
+                        action="retry-review",
+                    )
+                    try:
+                        active = orchestrator.retry_review(active)
+                    except Exception as exc:
+                        queue.status = QUEUE_FAILED
+                        self.task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_FAILED,
+                            error=str(exc),
+                            reason="orchestrator_exception",
+                        )
+                        self.task_store.save(queue)
+                        raise
+                    if self._handle_manifest_result(queue=queue, task=task, manifest=active):
+                        processed += 1
+                        continue
                     return queue
             if task.status == TASK_FAILED:
                 queue.status = QUEUE_FAILED
@@ -200,45 +231,9 @@ class TaskScheduler:
                 self.task_store.save(queue)
                 raise
 
-            if manifest.status == RUN_APPROVED:
-                reconcile_task_with_active_run(
-                    task,
-                    active_run=manifest,
-                    completed_at=self.run_store.now_iso(),
-                )
-                if manifest.requires_restart:
-                    queue.status = QUEUE_RESTART_REQUIRED
-                    self.task_store.save(queue)
-                    return queue
-                queue.status = QUEUE_PENDING
-                self.task_store.save(queue)
+            if self._handle_manifest_result(queue=queue, task=task, manifest=manifest):
                 processed += 1
                 continue
-
-            if manifest.status == RUN_PLAN_REVIEW_REQUIRED:
-                queue.status = QUEUE_RUNNING
-                reconcile_task_with_active_run(
-                    task,
-                    active_run=manifest,
-                    completed_at=self.run_store.now_iso(),
-                )
-                self.task_store.save(queue)
-                return queue
-
-            queue.status = QUEUE_FAILED
-            reconcile_task_with_active_run(
-                task,
-                active_run=manifest,
-                completed_at=self.run_store.now_iso(),
-            )
-            if task.status != TASK_FAILED:
-                self.task_store.update_task(
-                    queue,
-                    task.task_id,
-                    status=TASK_FAILED,
-                    reason=manifest.status or RUN_FAILED,
-                )
-            self.task_store.save(queue)
             return queue
 
     def _first_incomplete_task(self, queue: TaskQueue):
@@ -265,3 +260,41 @@ class TaskScheduler:
             return self.run_store.load(run_id)
         except OSError:
             return None
+
+    def _handle_manifest_result(
+        self,
+        *,
+        queue: TaskQueue,
+        task: TaskRecord,
+        manifest: RunManifest,
+    ) -> bool:
+        reconcile_task_with_active_run(
+            task,
+            active_run=manifest,
+            completed_at=self.run_store.now_iso(),
+        )
+
+        if manifest.status == RUN_APPROVED:
+            if manifest.requires_restart:
+                queue.status = QUEUE_RESTART_REQUIRED
+                self.task_store.save(queue)
+                return False
+            queue.status = QUEUE_PENDING
+            self.task_store.save(queue)
+            return True
+
+        if manifest.status == RUN_PLAN_REVIEW_REQUIRED or has_retryable_review_failure(manifest):
+            queue.status = QUEUE_RUNNING
+            self.task_store.save(queue)
+            return False
+
+        queue.status = QUEUE_FAILED
+        if task.status != TASK_FAILED:
+            self.task_store.update_task(
+                queue,
+                task.task_id,
+                status=TASK_FAILED,
+                reason=manifest.status or RUN_FAILED,
+            )
+        self.task_store.save(queue)
+        return False

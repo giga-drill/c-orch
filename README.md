@@ -128,7 +128,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   that run use the same workspace so review can inspect the same files the
   Worker changed.
 - The current MVP supports one Worker thread with human plan approval before
-  Worker start and retryable review attempts after Worker execution.
+  Worker start and retryable review attempts after Worker execution. Queue
+  scheduling can auto-trigger `retry_review` from saved evidence, but
+  `human_plan_review` and `restart` remain explicit human gates.
 - The current MVP does not support parallel runs that modify the same target
   repo. Run such tasks serially; otherwise patch apply can conflict with commits
   made while a Worker was running.
@@ -147,8 +149,8 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - Task status is user-level state. A task can own multiple run attempts via
   `run_ids`; `active_run_id` points to the current attempt. The backend
   reconciles task/queue status from the active run and exposes derived
-  `waiting_for` / `next_action` values such as `human_plan_review` and
-  `retry_task`.
+  `waiting_for` / `next_action` values such as `human_plan_review`,
+  `planner_review_retry`, `restart`, and `retry_task`.
 - Failed tasks can be requeued with `c-orch queue retry <task_id>` or from the
   dashboard. This preserves prior `run_ids`; when the dashboard backend has
   execution config, a requeued first task is auto-dispatched. `c-orch queue run`
