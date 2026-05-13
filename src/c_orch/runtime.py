@@ -104,6 +104,20 @@ class COrchRuntime:
                 self.dispatch_queue_async()
             return result
 
+    def queue_action(self, action: Any, *, confirmed_by: str = "dashboard") -> RunActionResponse:
+        with self._action_lock:
+            if self.queue_path is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
+            result = queue_action(
+                self.queue_path,
+                action,
+                runs_dir=self.runs_dir,
+                confirmed_by=confirmed_by,
+            )
+            if result is not None and int(result[0]) < 400:
+                self.dispatch_queue_async()
+            return result
+
     def dispatch_queue_async(self) -> bool:
         """Start one background queue scheduler pass when execution is configured."""
         if self.queue_path is None or self._scheduler_config is None:
@@ -286,6 +300,56 @@ def task_action(
         return HTTPStatus.CONFLICT, {"error": str(exc)}
     store.save(queue)
     return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_dir)
+
+
+def queue_action(
+    queue_path: Pathish,
+    action: Any,
+    *,
+    runs_dir: Pathish,
+    confirmed_by: str = "dashboard",
+) -> RunActionResponse:
+    if action != "confirm-runtime-restarted":
+        return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+    queue_file = Path(queue_path).expanduser().resolve()
+    queue_store = TaskStore(queue_file)
+    try:
+        queue = queue_store.load()
+    except OSError:
+        return None
+
+    runs_path = Path(runs_dir).expanduser().resolve()
+    run_store = RunStore(runs_path)
+    seen_run_ids = set()
+    for task in queue.tasks:
+        run_id = task.active_run_id
+        if not run_id or run_id in seen_run_ids:
+            continue
+        seen_run_ids.add(run_id)
+        try:
+            manifest = run_store.load(run_id)
+        except OSError:
+            continue
+        if manifest.status != "APPROVED" or not manifest.requires_restart:
+            continue
+        previous_restart_reason = manifest.restart_reason
+        previous_restart_paths = list(manifest.restart_paths)
+        manifest.requires_restart = False
+        run_store.save(manifest)
+        run_store.append_event(
+            run_id,
+            "runtime_restart_confirmed",
+            "Runtime restart confirmed; restart gate cleared.",
+            action="confirm-runtime-restarted",
+            confirmed_by=confirmed_by,
+            source=confirmed_by,
+            previous_restart_reason=previous_restart_reason,
+            previous_restart_paths=previous_restart_paths,
+        )
+
+    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    queue_store.save(queue)
+    return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_path)
 
 
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:

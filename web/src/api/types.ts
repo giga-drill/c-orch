@@ -1,5 +1,6 @@
 export type AllowedRunAction = "approve-plan" | "revise-plan" | "retry-review";
 export type AllowedTaskAction = "retry-task";
+export type AllowedQueueAction = "confirm-runtime-restarted";
 
 export interface QueueSummary {
   total_tasks: number;

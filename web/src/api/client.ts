@@ -1,4 +1,5 @@
 import type {
+  AllowedQueueAction,
   AllowedRunAction,
   AllowedTaskAction,
   QueuePayload,
@@ -49,6 +50,13 @@ export function postRunAction(
 
 export function postTaskAction(taskId: string, action: AllowedTaskAction): Promise<QueuePayload> {
   return requestJson<QueuePayload>(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
+    method: "POST",
+    body: JSON.stringify({ action }),
+  });
+}
+
+export function postQueueAction(action: AllowedQueueAction): Promise<QueuePayload> {
+  return requestJson<QueuePayload>("/api/queue/actions", {
     method: "POST",
     body: JSON.stringify({ action }),
   });

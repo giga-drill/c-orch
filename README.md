@@ -138,6 +138,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - The dashboard UI renders state and sends user intent only. Dashboard actions
   are handled by the backend `COrchRuntime`, which owns action validation,
   Codex driver usage, and Orchestrator state transitions.
+- Restart-gate acknowledgment must go through backend queue action
+  `POST /api/queue/actions` with `action=confirm-runtime-restarted`; the UI does
+  not directly edit run manifests or queue files.
 - The dashboard server keeps one `COrchRuntime` for its process lifetime. The
   runtime may reuse a live MCP driver for speed, but c-orch still treats MCP
   state as volatile and falls back to `codex exec resume` when needed.

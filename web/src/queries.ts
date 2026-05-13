@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchQueue, fetchRun, fetchRuns, postRunAction, postTaskAction } from "./api/client";
-import type { AllowedRunAction, AllowedTaskAction } from "./api/types";
+import { fetchQueue, fetchRun, fetchRuns, postQueueAction, postRunAction, postTaskAction } from "./api/client";
+import type { AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
 
 export const queryKeys = {
   queue: ["queue"] as const,
@@ -55,6 +55,20 @@ export function useTaskActionMutation() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
         queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
+      ]);
+    },
+  });
+}
+
+export function useQueueActionMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ action }: { action: AllowedQueueAction }) => postQueueAction(action),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
+        queryClient.invalidateQueries({ queryKey: ["run"] }),
       ]);
     },
   });

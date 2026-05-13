@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from unittest import mock
 
-from c_orch.runtime import build_queue_payload, build_run_payload, build_runs_payload, run_action, task_action
+from c_orch.runtime import (
+    build_queue_payload,
+    build_run_payload,
+    build_runs_payload,
+    queue_action,
+    run_action,
+    task_action,
+)
 from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
 from c_orch.ui import FALLBACK_INDEX_HTML, build_server
@@ -233,6 +241,201 @@ class UiTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].status, "PENDING")
             self.assertIsNone(loaded.tasks[0].active_run_id)
 
+    def test_queue_action_confirm_runtime_restarted_clears_restart_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "APPROVED"
+            manifest.requires_restart = True
+            manifest.restart_reason = "Runtime files changed"
+            manifest.restart_paths = ["src/c_orch/runtime.py", "src/c_orch/ui.py"]
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="APPROVED",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue.status = "RESTART_REQUIRED"
+            queue_store.save(queue)
+
+            status, payload = queue_action(
+                root / "queue.json",
+                "confirm-runtime-restarted",
+                runs_dir=root / "runs",
+                confirmed_by="dashboard",
+            )
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["queue"]["status"], "APPROVED")
+            loaded_manifest = run_store.load(manifest.run_id)
+            self.assertFalse(loaded_manifest.requires_restart)
+            self.assertEqual(loaded_manifest.restart_reason, "Runtime files changed")
+            self.assertEqual(
+                loaded_manifest.restart_paths,
+                ["src/c_orch/runtime.py", "src/c_orch/ui.py"],
+            )
+            events = run_store.load_events(manifest.run_id)
+            self.assertTrue(events)
+            event = events[-1]
+            self.assertEqual(event["type"], "runtime_restart_confirmed")
+            self.assertEqual(event["action"], "confirm-runtime-restarted")
+            self.assertEqual(event["confirmed_by"], "dashboard")
+            self.assertEqual(event["source"], "dashboard")
+            self.assertEqual(event["previous_restart_reason"], "Runtime files changed")
+            self.assertEqual(
+                event["previous_restart_paths"],
+                ["src/c_orch/runtime.py", "src/c_orch/ui.py"],
+            )
+
+    def test_queue_action_rejects_unknown_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            status, payload = queue_action(
+                root / "queue.json",
+                "unknown-action",
+                runs_dir=root / "runs",
+            )
+            self.assertEqual(int(status), 400)
+            self.assertEqual(payload["error"], "unsupported action")
+
+    def test_queue_action_returns_none_when_queue_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = queue_action(
+                root / "missing-queue.json",
+                "confirm-runtime-restarted",
+                runs_dir=root / "runs",
+            )
+            self.assertIsNone(result)
+
+    def test_queue_action_does_not_clear_non_approved_restart_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                    {"task_id": "task-003", "title": "Task 3", "prompt": "Do task 3"},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            status_by_task = {
+                "task-001": "FAILED",
+                "task-002": "RUNNING",
+                "task-003": "PLAN_REVIEW_REQUIRED",
+            }
+            run_ids = {}
+            for task_id, run_status in status_by_task.items():
+                manifest = run_store.create_run(
+                    cwd=root,
+                    user_task=task_id,
+                    planner_model="gpt-5.5",
+                    worker_model="gpt-5.3-codex",
+                )
+                manifest.status = run_status
+                manifest.requires_restart = True
+                manifest.restart_reason = f"{task_id} reason"
+                manifest.restart_paths = [f"{task_id}.txt"]
+                run_store.save(manifest)
+                run_ids[task_id] = manifest.run_id
+                queue_store.update_task(
+                    queue,
+                    task_id,
+                    status="RUNNING",
+                    active_run_id=manifest.run_id,
+                    run_ids=[manifest.run_id],
+                )
+            queue.status = "RESTART_REQUIRED"
+            queue_store.save(queue)
+
+            status, _payload = queue_action(
+                root / "queue.json",
+                "confirm-runtime-restarted",
+                runs_dir=root / "runs",
+                confirmed_by="dashboard",
+            )
+
+            self.assertEqual(int(status), 200)
+            for task_id in status_by_task:
+                loaded_manifest = run_store.load(run_ids[task_id])
+                self.assertTrue(loaded_manifest.requires_restart)
+                self.assertEqual(loaded_manifest.restart_reason, f"{task_id} reason")
+                self.assertEqual(loaded_manifest.restart_paths, [f"{task_id}.txt"])
+                self.assertEqual(run_store.load_events(run_ids[task_id]), [])
+
+    def test_dashboard_queue_actions_route_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "APPROVED"
+            manifest.requires_restart = True
+            manifest.restart_reason = "Restart before continue"
+            manifest.restart_paths = ["src/c_orch/runtime.py"]
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="APPROVED",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue.status = "RESTART_REQUIRED"
+            queue_store.save(queue)
+
+            server = build_server(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                host="127.0.0.1",
+                port=0,
+            )
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/queue/actions",
+                    data=json.dumps({"action": "confirm-runtime-restarted"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                runtime = getattr(server, "c_orch_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(body["queue"]["status"], "APPROVED")
+            self.assertFalse(run_store.load(manifest.run_id).requires_restart)
+
     def test_plan_review_run_exposes_allowed_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -261,8 +464,13 @@ class UiTests(unittest.TestCase):
 
         self.assertIn("/api/runs", client_source)
         self.assertIn("/api/queue", client_source)
+        self.assertIn("/api/queue/actions", client_source)
         self.assertIn("/actions", client_source)
         self.assertIn("allowed_actions", app_source)
+        self.assertIn("confirm-runtime-restarted", app_source)
+        self.assertIn("确认已重启并继续", app_source)
+        self.assertIn("确认中...", app_source)
+        self.assertIn("queueActionError", app_source)
         self.assertIn("通过并启动 Worker", app_source)
         self.assertIn("让 Planner 重新生成计划", app_source)
         self.assertIn("重新让 Planner 复核", app_source)
@@ -273,6 +481,7 @@ class UiTests(unittest.TestCase):
         self.assertIn("newestFirst", app_source)
         self.assertIn("useMutation", query_source)
         self.assertIn("invalidateQueries", query_source)
+        self.assertIn("queryKey: [\"run\"]", query_source)
 
     def test_fallback_html_explains_missing_frontend_build(self) -> None:
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)

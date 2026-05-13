@@ -104,6 +104,13 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
 
+    def test_queue_action_requires_queue_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = COrchRuntime(runs_dir=Path(tmp) / "runs")
+            status, payload = runtime.queue_action("confirm-runtime-restarted")
+            self.assertEqual(int(status), 400)
+            self.assertEqual(payload["error"], "missing queue file")
+
 
 def _scheduler_config(root: Path) -> SchedulerConfig:
     return SchedulerConfig(

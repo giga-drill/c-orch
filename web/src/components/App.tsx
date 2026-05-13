@@ -14,6 +14,7 @@ import type {
   WorkerActivity,
 } from "../api/types";
 import {
+  useQueueActionMutation,
   useQueueQuery,
   useRunActionMutation,
   useRunQuery,
@@ -122,8 +123,20 @@ function SystemStatus({
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
 }) {
+  const queueActionMutation = useQueueActionMutation();
+  const [queueActionError, setQueueActionError] = useState<string | null>(null);
   const queue = queuePayload?.queue;
   const restartRequired = queue?.status === "RESTART_REQUIRED";
+
+  async function confirmRuntimeRestarted() {
+    setQueueActionError(null);
+    try {
+      await queueActionMutation.mutateAsync({ action: "confirm-runtime-restarted" });
+    } catch (error) {
+      setQueueActionError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   return (
     <section className={restartRequired ? "systemStatus restart" : "systemStatus"}>
       <div>
@@ -138,7 +151,19 @@ function SystemStatus({
         <span className="label">updated</span>
         <strong>{displayValue(queuePayload?.generated_at ?? runsGeneratedAt)}</strong>
       </div>
-      {restartRequired ? <p>当前队列被 restart gate 暂停。本轮前端重构只展示这个状态，暂不解除它。</p> : null}
+      {restartRequired ? (
+        <>
+          <p>当前队列被 restart gate 暂停。请在 runtime 完成重启后确认继续。</p>
+          <button
+            type="button"
+            onClick={confirmRuntimeRestarted}
+            disabled={queueActionMutation.isPending}
+          >
+            {queueActionMutation.isPending ? "确认中..." : "确认已重启并继续"}
+          </button>
+          {queueActionError ? <div className="error">{queueActionError}</div> : null}
+        </>
+      ) : null}
     </section>
   );
 }

@@ -106,9 +106,11 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             path = self.path.split("?", 1)[0]
             run_prefix = "/api/runs/"
             task_prefix = "/api/tasks/"
+            queue_actions_path = "/api/queue/actions"
             suffix = "/actions"
-            if not path.endswith(suffix) or not (
-                path.startswith(run_prefix) or path.startswith(task_prefix)
+            if path != queue_actions_path and (
+                not path.endswith(suffix)
+                or not (path.startswith(run_prefix) or path.startswith(task_prefix))
             ):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -123,7 +125,12 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
                 return
             action = data.get("action")
-            if path.startswith(run_prefix):
+            if path == queue_actions_path:
+                confirmed_by = data.get("confirmed_by")
+                if not isinstance(confirmed_by, str) or not confirmed_by.strip():
+                    confirmed_by = "dashboard"
+                result = runtime.queue_action(action, confirmed_by=confirmed_by)
+            elif path.startswith(run_prefix):
                 run_id = unquote(path[len(run_prefix):-len(suffix)])
                 result = runtime.run_action(run_id, action, data.get("feedback"))
             else:
