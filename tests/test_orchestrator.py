@@ -1017,6 +1017,54 @@ class OrchestratorTests(unittest.TestCase):
                 ["FAILED_RETRYABLE", "ACCEPTED"],
             )
 
+    def test_retry_review_records_recovery_after_mcp_timeout_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            first_driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=first_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+            self.assertEqual(paused.status, "WORK_DONE")
+
+            retry_driver = FakeDriver(
+                start_results=[],
+                reply_results=[
+                    SessionResult(
+                        thread_id="planner-thread",
+                        content=_review("accepted"),
+                        raw={"resumedAfterMcpTimeout": True},
+                    )
+                ],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=retry_driver,
+                diff_applier=FakeDiffApplier(),
+            ).retry_review(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            events = store.load_events(manifest.run_id)
+            recovery_events = [
+                event for event in events if event["type"] == "planner_review_recovered"
+            ]
+            self.assertEqual(len(recovery_events), 1)
+            self.assertEqual(
+                recovery_events[0]["method"],
+                "codex_exec_resume_after_mcp_timeout",
+            )
+            self.assertEqual(recovery_events[0]["old_thread_id"], "planner-thread")
+
     def test_review_reply_success_does_not_start_fallback_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -103,6 +103,10 @@ class McpCodexDriver:
                 cwd=None,
                 started_at=started_at,
             )
+        except McpTimeoutError:
+            result = self._exec_resume_runner(self.codex_bin, thread_id, prompt)
+            result.raw.setdefault("resumedAfterMcpTimeout", True)
+            return result
         except Exception as exc:
             if not _is_session_not_found_error(exc):
                 raise

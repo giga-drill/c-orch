@@ -687,6 +687,7 @@ class RunOrchestrator:
                 thread_id=previous_thread_id,
                 prompt=primary_prompt,
             )
+            self._record_review_recovery_event(manifest, result, old_thread_id=previous_thread_id)
             return ReviewDecision.parse(result.content)
         except Exception as exc:
             if not should_start_replacement_agent(exc):
@@ -728,6 +729,32 @@ class RunOrchestrator:
                 new_thread_id=fallback_result.thread_id,
             )
             return ReviewDecision.parse(fallback_result.content)
+
+    def _record_review_recovery_event(
+        self,
+        manifest: RunManifest,
+        result: SessionResult,
+        *,
+        old_thread_id: str,
+    ) -> None:
+        raw = result.raw
+        if raw.get("resumedAfterMcpTimeout") is True:
+            method = "codex_exec_resume_after_mcp_timeout"
+        elif raw.get("resumedWithCodexExec") is True:
+            method = "codex_exec_resume"
+        elif raw.get("recoveredFromSessionLog"):
+            method = "session_log"
+        else:
+            return
+        self._record_event(
+            manifest,
+            "planner_review_recovered",
+            "Planner review recovered from transport uncertainty",
+            method=method,
+            old_thread_id=old_thread_id,
+            thread_id=result.thread_id,
+            recovered_from_session_log=raw.get("recoveredFromSessionLog"),
+        )
 
     def _continue_after_revision_requested(
         self,

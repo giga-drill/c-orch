@@ -216,6 +216,28 @@ class McpCodexDriverTests(unittest.TestCase):
         self.assertEqual(session_logs.calls[0]["thread_id"], "thr_planner")
         self.assertIsNone(session_logs.calls[0]["cwd"])
 
+    def test_reply_uses_codex_exec_resume_after_mcp_timeout_without_final_log(self) -> None:
+        client = FakeMcpClient([])
+        client.timeout_on_call = True
+        runner = FakeExecResumeRunner(
+            SessionResult(thread_id="thr_planner", content='{"decision":"accepted"}', raw={})
+        )
+        driver = McpCodexDriver(
+            codex_bin="/bin/codex",
+            client=client,
+            session_log_store=FakeSessionLogStore(None),
+            exec_resume_runner=runner,
+            session_start_grace_seconds=0,
+            session_recovery_poll_seconds=0,
+        )
+
+        result = driver.reply(thread_id="thr_planner", prompt="Review")
+
+        self.assertEqual(result.thread_id, "thr_planner")
+        self.assertEqual(result.content, '{"decision":"accepted"}')
+        self.assertEqual(result.raw["resumedAfterMcpTimeout"], True)
+        self.assertEqual(runner.calls, [("/bin/codex", "thr_planner", "Review")])
+
     def test_start_session_recovery_preserves_client_for_planner_reply(self) -> None:
         client = FakeMcpClient(
             [
