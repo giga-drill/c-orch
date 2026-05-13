@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type {
   AllowedRunAction,
@@ -73,6 +73,7 @@ export function App() {
   const proposalsQuery = useProposalsQuery();
   const runsQuery = useRunsQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const detailRef = useRef<HTMLElement | null>(null);
   const activeRunId = useMemo(() => {
     const task = queueQuery.data?.tasks.find((item) => item.active_run_id);
     return task?.active_run_id ?? null;
@@ -86,6 +87,13 @@ export function App() {
   }, [activeRunId, firstRunId, selectedRunId]);
 
   const runQuery = useRunQuery(selectedRunId);
+
+  function selectRun(runId: string) {
+    setSelectedRunId(runId);
+    window.setTimeout(() => {
+      detailRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }, 0);
+  }
 
   async function refreshAll() {
     await Promise.all([
@@ -120,17 +128,22 @@ export function App() {
         <SystemStatus queuePayload={queueQuery.data} runsGeneratedAt={runsQuery.data?.generated_at} />
         <ProposalPanel
           payload={proposalsQuery.data}
-          onSelectRun={setSelectedRunId}
+          onSelectRun={selectRun}
         />
         <QueuePanel
           payload={queueQuery.data}
           selectedRunId={selectedRunId}
-          onSelectRun={setSelectedRunId}
+          onSelectRun={selectRun}
         />
-        <RunList runs={runsQuery.data?.runs ?? []} selectedRunId={selectedRunId} onSelectRun={setSelectedRunId} />
+        <RunList runs={runsQuery.data?.runs ?? []} selectedRunId={selectedRunId} onSelectRun={selectRun} />
       </aside>
-      <section className="content">
-        <RunDetail payload={runQuery.data} isLoading={runQuery.isLoading} onSelectRun={setSelectedRunId} />
+      <section className="content" ref={detailRef}>
+        <RunDetail
+          payload={runQuery.data}
+          isLoading={runQuery.isLoading}
+          selectedRunId={selectedRunId}
+          onSelectRun={selectRun}
+        />
       </section>
     </main>
   );
@@ -243,7 +256,6 @@ function ProposalPanel({
         <div className="queueStats" aria-label="计划池统计">
           <span>总数 {summary.total_proposals}</span>
           <span>待审 {summary.review_required}</span>
-          <span>已入队 {summary.queued}</span>
           <span>失败 {summary.failed}</span>
         </div>
       ) : null}
@@ -440,17 +452,24 @@ function RunList({
 function RunDetail({
   payload,
   isLoading,
+  selectedRunId,
 }: {
   payload?: RunPayload;
   isLoading: boolean;
+  selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
 }) {
   const actionMutation = useRunActionMutation();
   const [feedback, setFeedback] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
 
-  if (isLoading) return <div className="empty">正在加载 run 详情...</div>;
+  if (isLoading) {
+    return <div className="empty">正在加载 run 详情: {displayValue(selectedRunId)}</div>;
+  }
   if (!payload) return <div className="empty">没有选中的 run。</div>;
+  if (selectedRunId && payload.run.run_id !== selectedRunId) {
+    return <div className="empty">正在切换 run 详情: {selectedRunId}</div>;
+  }
 
   const { run, manifest } = payload;
 

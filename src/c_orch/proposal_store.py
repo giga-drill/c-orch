@@ -181,6 +181,14 @@ class ProposalStore:
         pool.updated_at = proposal.updated_at
         return proposal
 
+    def remove_proposal(self, pool: ProposalPool, proposal_id: str) -> ProposalRecord:
+        for index, proposal in enumerate(pool.proposals):
+            if proposal.proposal_id == proposal_id:
+                removed = pool.proposals.pop(index)
+                pool.updated_at = _now_iso()
+                return removed
+        raise ValueError(f"proposal not found: {proposal_id}")
+
     def find(self, pool: ProposalPool, proposal_id: str) -> ProposalRecord:
         for proposal in pool.proposals:
             if proposal.proposal_id == proposal_id:

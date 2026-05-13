@@ -326,7 +326,8 @@ class UiTests(unittest.TestCase):
             loaded_manifest = run_store.load(manifest.run_id)
 
             self.assertEqual(int(status), 200)
-            self.assertEqual(payload["proposals"][0]["status"], "QUEUED")
+            self.assertEqual(payload["summary"]["total_proposals"], 0)
+            self.assertEqual(payload["proposals"], [])
             self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
             self.assertEqual(loaded_manifest.status, "PLAN_APPROVED")
@@ -602,6 +603,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("验收标准", app_source)
         self.assertIn("验证命令", app_source)
         self.assertIn("newestFirst", app_source)
+        self.assertIn("scrollIntoView", app_source)
+        self.assertIn("正在切换 run 详情", app_source)
         self.assertIn("useMutation", query_source)
         self.assertIn("invalidateQueries", query_source)
         self.assertIn("refreshDashboardQueries", query_source)

@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import List
 from unittest import mock
 
-from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalStore
+from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalPool, ProposalRecord, ProposalStore
 from c_orch.run_store import PlanRecord
-from c_orch.runtime import COrchRuntime
+from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
 from c_orch.states import RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
 from c_orch.task_store import TASK_WAITING, TaskStore
@@ -164,9 +164,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(fake.run_ids, [manifest.run_id])
 
             loaded_pool = proposal_store.load()
-            loaded_proposal = loaded_pool.proposals[0]
-            self.assertEqual(loaded_proposal.status, PROPOSAL_QUEUED)
-            self.assertEqual(loaded_proposal.task_id, proposal.proposal_id)
+            self.assertEqual(loaded_pool.proposals, [])
 
             queue = TaskStore(root / "queue.json").load()
             self.assertEqual(queue.status, "APPROVED")
@@ -178,6 +176,35 @@ class RuntimeTests(unittest.TestCase):
 
             manifests = list((root / "runs").glob("*/manifest.json"))
             self.assertEqual(len(manifests), 1)
+
+    def test_prune_queued_proposals_removes_legacy_plan_pool_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            proposal_store.save(
+                ProposalPool(
+                    proposals=[
+                        ProposalRecord(
+                            proposal_id="queued",
+                            title="Queued",
+                            prompt="Already queued",
+                            status=PROPOSAL_QUEUED,
+                        ),
+                        ProposalRecord(
+                            proposal_id="review",
+                            title="Review",
+                            prompt="Needs review",
+                            status=RUN_PLAN_REVIEW_REQUIRED,
+                        ),
+                    ],
+                )
+            )
+
+            removed = prune_queued_proposals(root / "proposals.json")
+
+            self.assertEqual(removed, 1)
+            loaded = proposal_store.load()
+            self.assertEqual([proposal.proposal_id for proposal in loaded.proposals], ["review"])
 
     def test_queue_action_requires_queue_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

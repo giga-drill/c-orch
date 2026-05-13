@@ -79,6 +79,8 @@ class COrchRuntime:
         self._drivers: Dict[str, Any] = {}
         self._dispatch_thread: Optional[threading.Thread] = None
         self._last_dispatch_error: Optional[str] = None
+        if self.proposals_path is not None:
+            prune_queued_proposals(self.proposals_path)
 
     def build_runs_payload(self) -> Dict[str, Any]:
         return build_runs_payload(self.runs_dir)
@@ -556,14 +558,7 @@ def proposal_action(
         proposal=proposal,
         run_id=manifest.run_id,
     )
-    proposal_store.update_proposal(
-        pool,
-        proposal.proposal_id,
-        status=PROPOSAL_QUEUED,
-        task_id=task_id,
-        error=None,
-        reason="queued_for_execution",
-    )
+    proposal_store.remove_proposal(pool, proposal.proposal_id)
     proposal_store.save(pool)
     run_store.append_event(
         manifest.run_id,
@@ -574,6 +569,21 @@ def proposal_action(
         source="dashboard",
     )
     return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+
+
+def prune_queued_proposals(proposals_path: Pathish) -> int:
+    proposals_file = Path(proposals_path).expanduser().resolve()
+    store = ProposalStore(proposals_file)
+    try:
+        pool = store.load()
+    except OSError:
+        return 0
+    kept = [proposal for proposal in pool.proposals if proposal.status != PROPOSAL_QUEUED]
+    removed = len(pool.proposals) - len(kept)
+    if removed:
+        pool.proposals = kept
+        store.save(pool)
+    return removed
 
 
 def build_proposals_payload(
