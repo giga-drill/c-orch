@@ -168,11 +168,6 @@ pre {
   gap: 10px;
 }
 
-.metrics.compact {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-top: 10px;
-}
-
 .metric {
   min-width: 0;
   border: 1px solid #e7ece3;
@@ -184,6 +179,23 @@ pre {
 .metric strong {
   display: block;
   overflow-wrap: anywhere;
+}
+
+.queueStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queueStats span {
+  min-height: 22px;
+  border: 1px solid #e7ece3;
+  border-radius: 999px;
+  background: #fafcf8;
+  padding: 2px 8px;
 }
 
 .taskList,

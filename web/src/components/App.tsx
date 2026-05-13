@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import type {
   AllowedRunAction,
   AllowedTaskAction,
@@ -180,6 +181,7 @@ function QueuePanel({
   const taskMutation = useTaskActionMutation();
   const [taskError, setTaskError] = useState<string | null>(null);
   const summary = payload?.summary;
+  const tasksNewestFirst = newestFirst(payload?.tasks ?? []);
 
   async function runTaskAction(task: TaskSummary, action: AllowedTaskAction) {
     setTaskError(null);
@@ -200,16 +202,16 @@ function QueuePanel({
         <span className="meta">{displayValue(payload?.queue_file)}</span>
       </div>
       {summary ? (
-        <div className="metrics compact">
-          <Metric label="总数" value={summary.total_tasks} />
-          <Metric label="完成" value={summary.completed_tasks} />
-          <Metric label="待执行" value={summary.pending_tasks} />
-          <Metric label="失败" value={summary.failed_tasks} />
+        <div className="queueStats" aria-label="任务队列统计">
+          <span>总数 {summary.total_tasks}</span>
+          <span>完成 {summary.completed_tasks}</span>
+          <span>待执行 {summary.pending_tasks}</span>
+          <span>失败 {summary.failed_tasks}</span>
         </div>
       ) : null}
       {taskError ? <div className="error">{taskError}</div> : null}
       <div className="taskList">
-        {(payload?.tasks ?? []).map((task) => {
+        {tasksNewestFirst.map((task) => {
           const taskRunId = pickTaskRun(task);
           const selected = Boolean(taskRunId && taskRunId === selectedRunId);
           return (
@@ -316,7 +318,6 @@ function RunDetail({
         <div>
           <p className="meta">Run</p>
           <h1>{run.run_id}</h1>
-          <p>{run.user_task}</p>
         </div>
         <StatusBadge status={run.status} />
       </header>
@@ -354,8 +355,11 @@ function RunDetail({
 
       <div className="detailGrid">
         <section className="section">
-          <h2>任务与方案</h2>
+          <h2>任务</h2>
           <p>{manifest.user_task}</p>
+        </section>
+        <section className="section">
+          <h2>方案</h2>
           <PlanPanel manifest={manifest} />
         </section>
         <section className="section">
@@ -605,7 +609,7 @@ function StatusBadge({ status }: { status?: string | null }) {
   return <span className={`badge ${status ?? ""}`}>{formatStatus(status)}</span>;
 }
 
-function Collapsible({ title, children }: { title: string; children: React.ReactNode }) {
+function Collapsible({ title, children }: { title: string; children: ReactNode }) {
   return (
     <details>
       <summary>{title}</summary>
