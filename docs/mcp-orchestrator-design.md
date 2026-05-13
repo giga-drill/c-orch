@@ -60,10 +60,12 @@
 
 ```text
 User task
+  -> c-orch stores a proposal in the plan proposal pool
   -> c-orch creates Planner Codex thread through codex()
   -> Planner returns plan, acceptance criteria, worker prompt
-  -> c-orch records the plan and waits for human approval
-  -> Human reviews and approves the plan
+  -> c-orch records the plan and waits for human approval outside the execution queue
+  -> Human approves the plan
+  -> c-orch enqueues an execution task that points at the approved run
   -> c-orch creates Worker Codex thread through codex()
   -> Worker implements and returns result evidence
   -> c-orch sends Worker result to Planner through codex-reply()
@@ -78,6 +80,7 @@ User task
 - `c-orch doctor` 能探测 Codex.app 内置 CLI 和 PATH 里的裸 Codex CLI，并优先选择 Codex.app 内置 CLI。
 - `McpCodexDriver` 使用 stdlib newline-delimited JSON-RPC 直接调用 `codex mcp-server`，支持 `tools/list`、`codex` 和 `codex-reply`。
 - `RunStore` 保存 `runs/<run_id>/manifest.json`。
+- `ProposalStore` 保存 `.c-orch/tasks/proposals.json`，用于 dashboard 新任务的方案池。方案池负责 Planner 生成方案和人工 approve/revise；执行队列只接收已经 approve 的 plan。
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
 - `COrchRuntime` 是 dashboard 后端控制面入口。前端/HTTP handler 只负责展示状态和转发用户意图，action 校验、Codex driver 创建、Orchestrator 调用和 manifest 更新都在 runtime 层完成。dashboard server 会在进程生命周期内保留同一个 runtime，并可复用长活 MCP driver；但 MCP 内存状态只作为 cache，可靠恢复仍以 manifest、event log、Codex thread id 和 `codex exec resume` 为准。
@@ -88,6 +91,7 @@ User task
 - `c-orch run` 默认会通过 MCP 创建 Planner Codex session，把方案写入 manifest，然后暂停在 `PLAN_REVIEW_REQUIRED`。
 - `c-orch resume --approve-plan <run_id>` 会标记人类已通过 Planner 方案，然后创建 Worker Codex session。
 - `c-orch run --auto-approve-plan` 可跳过人类方案审批点，直接延续旧的一次性执行流程。
+- Dashboard 新任务默认走 proposal pool：Planner 方案被人工通过后，runtime 会把同一个 run 标记为 `PLAN_APPROVED`，再创建 execution queue task。scheduler 看到这个 task 已绑定 approved run 时，会继续该 run，而不是重建 Planner run。
 
 ## 组件
 

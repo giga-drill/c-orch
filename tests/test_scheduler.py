@@ -254,6 +254,49 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[1].active_run_id, loaded.tasks[1].run_ids[-1])
             self.assertEqual(len(fake.run_ids), 2)
 
+    def test_pending_task_with_approved_plan_run_continues_existing_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "PLAN_APPROVED"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_PENDING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
+            self.assertEqual(loaded.tasks[0].run_ids, [manifest.run_id])
+            self.assertEqual(fake.run_ids, [manifest.run_id])
+
     def test_restart_required_stops_after_current_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

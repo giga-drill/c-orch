@@ -1,6 +1,7 @@
 export type AllowedRunAction = "approve-plan" | "revise-plan" | "retry-review";
 export type AllowedTaskAction = "retry-task";
 export type AllowedQueueAction = "confirm-runtime-restarted";
+export type AllowedProposalAction = "approve-plan" | "revise-plan";
 
 export interface QueueSummary {
   total_tasks: number;
@@ -40,6 +41,44 @@ export interface QueuePayload {
   queue: QueueRecord | null;
   summary?: QueueSummary;
   tasks: TaskSummary[];
+}
+
+export interface ProposalSummary {
+  total_proposals: number;
+  review_required: number;
+  queued: number;
+  failed: number;
+  active: number;
+}
+
+export interface ProposalPoolRecord {
+  pool_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProposalRecord {
+  proposal_id: string;
+  title: string;
+  prompt: string;
+  status: string;
+  run_id: string | null;
+  task_id: string | null;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+  reason: string | null;
+  waiting_for: string;
+  allowed_actions: AllowedProposalAction[];
+  run: RunListItem | null;
+}
+
+export interface ProposalsPayload {
+  proposals_file: string | null;
+  generated_at: string;
+  pool: ProposalPoolRecord | null;
+  summary?: ProposalSummary;
+  proposals: ProposalRecord[];
 }
 
 export interface AgentSummary {

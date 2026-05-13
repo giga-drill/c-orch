@@ -6,6 +6,8 @@ import type {
   AgentSummary,
   EvidenceFile,
   ManifestRecord,
+  ProposalRecord,
+  ProposalsPayload,
   QueuePayload,
   ReviewAttempt,
   RunEvent,
@@ -15,6 +17,9 @@ import type {
   WorkerActivity,
 } from "../api/types";
 import {
+  useCreateProposalMutation,
+  useProposalActionMutation,
+  useProposalsQuery,
   useQueueActionMutation,
   useQueueQuery,
   useRunActionMutation,
@@ -65,6 +70,7 @@ function pickTaskRun(task: TaskSummary): string | null {
 
 export function App() {
   const queueQuery = useQueueQuery();
+  const proposalsQuery = useProposalsQuery();
   const runsQuery = useRunsQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const activeRunId = useMemo(() => {
@@ -82,11 +88,16 @@ export function App() {
   const runQuery = useRunQuery(selectedRunId);
 
   async function refreshAll() {
-    await Promise.all([queueQuery.refetch(), runsQuery.refetch(), runQuery.refetch()]);
+    await Promise.all([
+      proposalsQuery.refetch(),
+      queueQuery.refetch(),
+      runsQuery.refetch(),
+      runQuery.refetch(),
+    ]);
   }
 
-  const isLoading = queueQuery.isLoading || runsQuery.isLoading;
-  const error = queueQuery.error ?? runsQuery.error ?? runQuery.error;
+  const isLoading = queueQuery.isLoading || proposalsQuery.isLoading || runsQuery.isLoading;
+  const error = proposalsQuery.error ?? queueQuery.error ?? runsQuery.error ?? runQuery.error;
 
   return (
     <main className="shell">
@@ -96,13 +107,21 @@ export function App() {
             <h1>c-orch</h1>
             <p className="meta">Planner / Worker 运行控制台</p>
           </div>
-          <button type="button" onClick={refreshAll} disabled={queueQuery.isFetching || runsQuery.isFetching}>
+          <button
+            type="button"
+            onClick={refreshAll}
+            disabled={proposalsQuery.isFetching || queueQuery.isFetching || runsQuery.isFetching}
+          >
             刷新
           </button>
         </header>
         {error ? <div className="error">{error.message}</div> : null}
         {isLoading ? <div className="empty">正在加载运行状态...</div> : null}
         <SystemStatus queuePayload={queueQuery.data} runsGeneratedAt={runsQuery.data?.generated_at} />
+        <ProposalPanel
+          payload={proposalsQuery.data}
+          onSelectRun={setSelectedRunId}
+        />
         <QueuePanel
           payload={queueQuery.data}
           selectedRunId={selectedRunId}
@@ -165,6 +184,139 @@ function SystemStatus({
           {queueActionError ? <div className="error">{queueActionError}</div> : null}
         </>
       ) : null}
+    </section>
+  );
+}
+
+function ProposalPanel({
+  payload,
+  onSelectRun,
+}: {
+  payload?: ProposalsPayload;
+  onSelectRun: (runId: string) => void;
+}) {
+  const createMutation = useCreateProposalMutation();
+  const actionMutation = useProposalActionMutation();
+  const [title, setTitle] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [feedbackById, setFeedbackById] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const proposalsNewestFirst = newestFirst(payload?.proposals ?? []);
+  const summary = payload?.summary;
+
+  async function createProposal() {
+    setError(null);
+    try {
+      await createMutation.mutateAsync({ title: title.trim(), prompt: prompt.trim() });
+      setTitle("");
+      setPrompt("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  async function proposalAction(proposal: ProposalRecord, action: "approve-plan" | "revise-plan") {
+    setError(null);
+    const feedback = feedbackById[proposal.proposal_id] ?? "";
+    try {
+      await actionMutation.mutateAsync({
+        proposalId: proposal.proposal_id,
+        action,
+        payload: action === "revise-plan" ? { feedback } : {},
+      });
+      if (action === "revise-plan") {
+        setFeedbackById((current) => ({ ...current, [proposal.proposal_id]: "" }));
+      }
+      if (proposal.run_id) onSelectRun(proposal.run_id);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  return (
+    <section className="panel">
+      <div className="sectionTitle">
+        <h2>待审核计划</h2>
+        <span className="meta">{displayValue(payload?.proposals_file)}</span>
+      </div>
+      {summary ? (
+        <div className="queueStats" aria-label="计划池统计">
+          <span>总数 {summary.total_proposals}</span>
+          <span>待审 {summary.review_required}</span>
+          <span>已入队 {summary.queued}</span>
+          <span>失败 {summary.failed}</span>
+        </div>
+      ) : null}
+      <div className="proposalForm">
+        <input
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          placeholder="任务标题"
+        />
+        <textarea
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          placeholder="任务说明。Planner 会先生成方案，等待你审核后才进入执行队列。"
+        />
+        <button
+          type="button"
+          onClick={createProposal}
+          disabled={createMutation.isPending || !title.trim() || !prompt.trim()}
+        >
+          {createMutation.isPending ? "生成计划中..." : "生成 Planner 方案"}
+        </button>
+      </div>
+      {error ? <div className="error">{error}</div> : null}
+      <div className="taskList">
+        {proposalsNewestFirst.map((proposal) => (
+          <article key={proposal.proposal_id} className="taskItem">
+            <button
+              type="button"
+              className="taskButton"
+              onClick={() => proposal.run_id && onSelectRun(proposal.run_id)}
+              disabled={!proposal.run_id}
+            >
+              <span className="itemTop">
+                <span className="mono">{proposal.proposal_id}</span>
+                <StatusBadge status={proposal.status} />
+              </span>
+              <span>{proposal.title}</span>
+              <span className="meta">waiting_for: {displayValue(proposal.waiting_for)}</span>
+              <span className="meta">run_id: {displayValue(proposal.run_id)}</span>
+            </button>
+            {proposal.run?.plan?.summary ? <p>{proposal.run.plan.summary}</p> : null}
+            {proposal.allowed_actions.includes("approve-plan") ? (
+              <div className="proposalActions">
+                <button
+                  type="button"
+                  onClick={() => proposalAction(proposal, "approve-plan")}
+                  disabled={actionMutation.isPending}
+                >
+                  {actionMutation.isPending ? "处理中..." : "通过并加入执行队列"}
+                </button>
+                <textarea
+                  value={feedbackById[proposal.proposal_id] ?? ""}
+                  onChange={(event) =>
+                    setFeedbackById((current) => ({
+                      ...current,
+                      [proposal.proposal_id]: event.target.value,
+                    }))
+                  }
+                  placeholder="修改意见"
+                />
+                <button
+                  type="button"
+                  onClick={() => proposalAction(proposal, "revise-plan")}
+                  disabled={actionMutation.isPending || !(feedbackById[proposal.proposal_id] ?? "").trim()}
+                >
+                  让 Planner 修改方案
+                </button>
+              </div>
+            ) : null}
+          </article>
+        ))}
+        {payload && payload.proposals.length === 0 ? <div className="empty">暂无待审核计划。</div> : null}
+      </div>
     </section>
   );
 }

@@ -1,7 +1,9 @@
 import type {
   AllowedQueueAction,
+  AllowedProposalAction,
   AllowedRunAction,
   AllowedTaskAction,
+  ProposalsPayload,
   QueuePayload,
   RunPayload,
   RunsPayload,
@@ -27,6 +29,10 @@ async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
 
 export function fetchQueue(): Promise<QueuePayload> {
   return requestJson<QueuePayload>("/api/queue");
+}
+
+export function fetchProposals(): Promise<ProposalsPayload> {
+  return requestJson<ProposalsPayload>("/api/proposals");
 }
 
 export function fetchRuns(): Promise<RunsPayload> {
@@ -59,5 +65,23 @@ export function postQueueAction(action: AllowedQueueAction): Promise<QueuePayloa
   return requestJson<QueuePayload>("/api/queue/actions", {
     method: "POST",
     body: JSON.stringify({ action }),
+  });
+}
+
+export function postProposal(title: string, prompt: string): Promise<ProposalsPayload> {
+  return requestJson<ProposalsPayload>("/api/proposals", {
+    method: "POST",
+    body: JSON.stringify({ title, prompt }),
+  });
+}
+
+export function postProposalAction(
+  proposalId: string,
+  action: AllowedProposalAction,
+  payload: Record<string, unknown> = {},
+): Promise<ProposalsPayload> {
+  return requestJson<ProposalsPayload>(`/api/proposals/${encodeURIComponent(proposalId)}/actions`, {
+    method: "POST",
+    body: JSON.stringify({ action, ...payload }),
   });
 }

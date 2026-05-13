@@ -10,7 +10,7 @@ from urllib.parse import unquote
 
 from .runtime import COrchRuntime
 from .scheduler import SchedulerConfig
-from .settings import DEFAULT_UI_HOST, DEFAULT_UI_PORT
+from .settings import DEFAULT_PROPOSALS_FILE, DEFAULT_UI_HOST, DEFAULT_UI_PORT
 
 
 Pathish = Union[str, Path]
@@ -36,6 +36,7 @@ def serve_dashboard(
     *,
     runs_dir: Pathish,
     queue_path: Optional[Pathish] = None,
+    proposals_path: Optional[Pathish] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
@@ -43,6 +44,7 @@ def serve_dashboard(
     server = build_server(
         runs_dir=runs_dir,
         queue_path=queue_path,
+        proposals_path=proposals_path,
         scheduler_config=scheduler_config,
         host=host,
         port=port,
@@ -62,15 +64,22 @@ def build_server(
     *,
     runs_dir: Pathish,
     queue_path: Optional[Pathish] = None,
+    proposals_path: Optional[Pathish] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
 ) -> ThreadingHTTPServer:
     runs_path = Path(runs_dir).expanduser().resolve()
     queue_file = Path(queue_path).expanduser().resolve() if queue_path is not None else None
+    proposals_file = (
+        Path(proposals_path).expanduser().resolve()
+        if proposals_path is not None
+        else _default_proposals_path(queue_file)
+    )
     runtime = COrchRuntime(
         runs_dir=runs_path,
         queue_path=queue_file,
+        proposals_path=proposals_file,
         scheduler_config=scheduler_config,
     )
     handler = make_dashboard_handler(runtime)
@@ -90,6 +99,9 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             if path == "/api/queue":
                 self._send_json(HTTPStatus.OK, runtime.build_queue_payload())
                 return
+            if path == "/api/proposals":
+                self._send_json(HTTPStatus.OK, runtime.build_proposals_payload())
+                return
             if path.startswith("/api/runs/"):
                 run_id = unquote(path[len("/api/runs/"):])
                 payload = runtime.build_run_payload(run_id)
@@ -106,11 +118,16 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             path = self.path.split("?", 1)[0]
             run_prefix = "/api/runs/"
             task_prefix = "/api/tasks/"
+            proposal_prefix = "/api/proposals/"
             queue_actions_path = "/api/queue/actions"
             suffix = "/actions"
-            if path != queue_actions_path and (
+            if path != "/api/proposals" and path != queue_actions_path and (
                 not path.endswith(suffix)
-                or not (path.startswith(run_prefix) or path.startswith(task_prefix))
+                or not (
+                    path.startswith(run_prefix)
+                    or path.startswith(task_prefix)
+                    or path.startswith(proposal_prefix)
+                )
             ):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -125,7 +142,9 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid json"})
                 return
             action = data.get("action")
-            if path == queue_actions_path:
+            if path == "/api/proposals":
+                result = runtime.create_proposal(data.get("title"), data.get("prompt"))
+            elif path == queue_actions_path:
                 confirmed_by = data.get("confirmed_by")
                 if not isinstance(confirmed_by, str) or not confirmed_by.strip():
                     confirmed_by = "dashboard"
@@ -133,6 +152,9 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             elif path.startswith(run_prefix):
                 run_id = unquote(path[len(run_prefix):-len(suffix)])
                 result = runtime.run_action(run_id, action, data.get("feedback"))
+            elif path.startswith(proposal_prefix):
+                proposal_id = unquote(path[len(proposal_prefix):-len(suffix)])
+                result = runtime.proposal_action(proposal_id, action, data.get("feedback"))
             else:
                 task_id = unquote(path[len(task_prefix):-len(suffix)])
                 result = runtime.task_action(task_id, action)
@@ -193,3 +215,9 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             self.wfile.write(body)
 
     return DashboardHandler
+
+
+def _default_proposals_path(queue_file: Optional[Path]) -> Optional[Path]:
+    if queue_file is None:
+        return None
+    return queue_file.parent / Path(DEFAULT_PROPOSALS_FILE).name

@@ -8,7 +8,7 @@ from .drivers import CodexDriver
 from .failure_policy import has_retryable_review_failure
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
-from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED
+from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
 from .task_lifecycle import reconcile_queue, reconcile_task_with_active_run
 from .task_store import (
     QUEUE_APPROVED,
@@ -106,6 +106,32 @@ class TaskScheduler:
                 if active is not None and active.status == RUN_PLAN_REVIEW_REQUIRED:
                     queue.status = QUEUE_RUNNING
                     self.task_store.save(queue)
+                    return queue
+                if active is not None and active.status == RUN_PLAN_APPROVED:
+                    self.task_store.update_task(
+                        queue,
+                        task.task_id,
+                        status=TASK_RUNNING,
+                        error=None,
+                        reason="worker",
+                    )
+                    self.task_store.save(queue)
+                    try:
+                        active = orchestrator.run(active)
+                    except Exception as exc:
+                        queue.status = QUEUE_FAILED
+                        self.task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_FAILED,
+                            error=str(exc),
+                            reason="orchestrator_exception",
+                        )
+                        self.task_store.save(queue)
+                        raise
+                    if self._handle_manifest_result(queue=queue, task=task, manifest=active):
+                        processed += 1
+                        continue
                     return queue
                 if active is not None and has_retryable_review_failure(active):
                     if active.run_id in attempted_retry_review_run_ids:

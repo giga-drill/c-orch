@@ -24,5 +24,6 @@ APPROVAL_POLICY_CHOICES = ("untrusted", "on-failure", "on-request", "never")
 
 DEFAULT_RUNS_DIR = "runs"
 DEFAULT_WORKTREES_DIR = ".c-orch/worktrees"
+DEFAULT_PROPOSALS_FILE = ".c-orch/tasks/proposals.json"
 DEFAULT_UI_HOST = "127.0.0.1"
 DEFAULT_UI_PORT = 8765

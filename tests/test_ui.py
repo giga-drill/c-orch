@@ -9,14 +9,17 @@ from urllib.request import Request, urlopen
 from unittest import mock
 
 from c_orch.runtime import (
+    build_proposals_payload,
     build_queue_payload,
     build_run_payload,
     build_runs_payload,
+    proposal_action,
     queue_action,
     run_action,
     task_action,
 )
 from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.proposal_store import ProposalStore
 from c_orch.task_store import TaskStore
 from c_orch.ui import FALLBACK_INDEX_HTML, build_server
 
@@ -262,6 +265,72 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["current_waiting_point"], "planner_review_retry")
             self.assertEqual(loaded.tasks[0].status, "WAITING")
             self.assertEqual(loaded.tasks[0].reason, "planner_review_retry")
+
+    def test_build_proposals_payload_exposes_plan_review_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1")
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+            run_store.save(manifest)
+            proposal.run_id = manifest.run_id
+            proposal.status = "PLAN_REVIEW_REQUIRED"
+            proposal_store.save(pool)
+
+            payload = build_proposals_payload(root / "proposals.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["summary"]["total_proposals"], 1)
+            self.assertEqual(payload["summary"]["review_required"], 1)
+            self.assertEqual(payload["proposals"][0]["run_id"], manifest.run_id)
+            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["approve-plan", "revise-plan"])
+            self.assertEqual(payload["proposals"][0]["run"]["plan"]["summary"], "Plan summary")
+
+    def test_proposal_approve_queues_approved_plan_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1")
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+            run_store.save(manifest)
+            proposal.run_id = manifest.run_id
+            proposal.status = "PLAN_REVIEW_REQUIRED"
+            proposal_store.save(pool)
+
+            status, payload = proposal_action(
+                root / "proposals.json",
+                proposal.proposal_id,
+                "approve-plan",
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                driver_factory=_unused_driver_factory,
+            )
+            queue = TaskStore(root / "queue.json").load()
+            loaded_manifest = run_store.load(manifest.run_id)
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["proposals"][0]["status"], "QUEUED")
+            self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
+            self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
+            self.assertEqual(loaded_manifest.status, "PLAN_APPROVED")
+            self.assertEqual(loaded_manifest.plan.approval_status, "approved")  # type: ignore[union-attr]
 
     def test_task_action_retry_requeues_failed_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -513,9 +582,13 @@ class UiTests(unittest.TestCase):
 
         self.assertIn("/api/runs", client_source)
         self.assertIn("/api/queue", client_source)
+        self.assertIn("/api/proposals", client_source)
         self.assertIn("/api/queue/actions", client_source)
         self.assertIn("/actions", client_source)
         self.assertIn("allowed_actions", app_source)
+        self.assertIn("待审核计划", app_source)
+        self.assertIn("生成 Planner 方案", app_source)
+        self.assertIn("通过并加入执行队列", app_source)
         self.assertIn("confirm-runtime-restarted", app_source)
         self.assertIn("确认已重启并继续", app_source)
         self.assertIn("确认中...", app_source)
@@ -635,6 +708,18 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["status"], "PLAN_REVIEW_REQUIRED")
             self.assertIn("requires saved failed review evidence", payload["error"])
             driver_cls.assert_not_called()
+
+
+class _UnusedDriverContext:
+    def __enter__(self) -> object:
+        raise AssertionError("driver should not be used")
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+
+def _unused_driver_factory(_codex_path: str) -> _UnusedDriverContext:
+    return _UnusedDriverContext()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ body {
 }
 
 button,
+input,
 textarea {
   font: inherit;
 }
@@ -332,6 +333,23 @@ textarea {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 10px;
+}
+
+input {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+}
+
+.proposalForm,
+.proposalActions {
+  display: grid;
+  gap: 8px;
+}
+
+.proposalForm {
+  margin-top: 10px;
 }
 
 .detailGrid {

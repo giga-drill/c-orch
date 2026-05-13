@@ -1,15 +1,30 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchQueue, fetchRun, fetchRuns, postQueueAction, postRunAction, postTaskAction } from "./api/client";
-import type { AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
+import {
+  fetchProposals,
+  fetchQueue,
+  fetchRun,
+  fetchRuns,
+  postProposal,
+  postProposalAction,
+  postQueueAction,
+  postRunAction,
+  postTaskAction,
+} from "./api/client";
+import type { AllowedProposalAction, AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
 
 export const queryKeys = {
   queue: ["queue"] as const,
+  proposals: ["proposals"] as const,
   runs: ["runs"] as const,
   run: (runId: string) => ["run", runId] as const,
 };
 
 export function useQueueQuery() {
   return useQuery({ queryKey: queryKeys.queue, queryFn: fetchQueue });
+}
+
+export function useProposalsQuery() {
+  return useQuery({ queryKey: queryKeys.proposals, queryFn: fetchProposals });
 }
 
 export function useRunsQuery() {
@@ -69,6 +84,41 @@ export function useQueueActionMutation() {
         queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
         queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
         queryClient.invalidateQueries({ queryKey: ["run"] }),
+      ]);
+    },
+  });
+}
+
+export function useCreateProposalMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ title, prompt }: { title: string; prompt: string }) => postProposal(title, prompt),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.proposals }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
+      ]);
+    },
+  });
+}
+
+export function useProposalActionMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      proposalId,
+      action,
+      payload,
+    }: {
+      proposalId: string;
+      action: AllowedProposalAction;
+      payload?: Record<string, unknown>;
+    }) => postProposalAction(proposalId, action, payload),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.proposals }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
       ]);
     },
   });

@@ -12,6 +12,22 @@ and verification evidence, and asks the Planner to approve or request changes.
 - [MCP-based orchestrator technical design](docs/mcp-orchestrator-design.md)
 - [Architecture principles and state model](docs/architecture-principles.md)
 
+## Workflow Shape
+
+c-orch now separates plan review from execution:
+
+```text
+Plan proposal pool: task idea -> Planner plan -> human approve/revise
+Execution queue: approved plan -> Worker -> Planner review -> apply -> commit
+```
+
+The proposal pool is where a human reviews Planner's plan. Approving a proposal
+adds an execution task that points at the same run, so the Worker starts from
+the approved Planner context. Revising a proposal sends feedback back to the
+same Planner thread and waits for a new plan. The execution queue is reserved
+for plans that have already been approved and can move automatically until a
+restart gate, failure, or task completion.
+
 ## Quick Start
 
 Run from this repo without installing:
@@ -65,6 +81,9 @@ PYTHONPATH=src python3.11 -m c_orch.cli ui \
 ```
 
 When run events are available, the local run dashboard shows a per-run Timeline.
+When a queue file is configured, the dashboard also shows a plan proposal pool
+beside the execution queue. Use the proposal pool for new tasks that should get
+a Planner plan before entering the automated queue.
 
 Common options:
 
@@ -128,9 +147,11 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   that run use the same workspace so review can inspect the same files the
   Worker changed.
 - The current MVP supports one Worker thread with human plan approval before
-  Worker start and retryable review attempts after Worker execution. Queue
-  scheduling can auto-trigger `retry_review` from saved evidence, but
-  `human_plan_review` and `restart` remain explicit human gates.
+  Worker start and retryable review attempts after Worker execution. Dashboard
+  task submission uses a proposal pool so `human_plan_review` happens before
+  the task enters the execution queue. Queue scheduling can auto-trigger
+  `retry_review` from saved evidence, but `restart` remains an explicit human
+  gate.
 - The current MVP does not support parallel runs that modify the same target
   repo. Run such tasks serially; otherwise patch apply can conflict with commits
   made while a Worker was running.

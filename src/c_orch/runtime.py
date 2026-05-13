@@ -11,9 +11,20 @@ from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence
 from .codex_session_logs import CodexSessionLogStore
 from .drivers import CodexDriver
 from .failure_policy import has_retryable_review_failure, has_retryable_review_failure_dict
+from .proposal_store import (
+    PROPOSAL_APPROVED,
+    PROPOSAL_FAILED,
+    PROPOSAL_PLAN_REVIEW_REQUIRED,
+    PROPOSAL_PLAN_REVISING,
+    PROPOSAL_PLANNING,
+    PROPOSAL_QUEUED,
+    ProposalRecord,
+    ProposalStore,
+)
 from .run_store import RunManifest, RunStore
 from .scheduler import OrchestratorLike, SchedulerConfig, TaskScheduler
 from .states import (
+    RUN_PLAN_APPROVED,
     RUN_PLAN_REVIEW_REQUIRED,
     RUN_STATUS_ORDER,
     TERMINAL_RUN_STATUSES,
@@ -24,7 +35,8 @@ from .task_lifecycle import (
     mark_task_for_retry,
     reconcile_queue,
 )
-from .task_store import TaskStore
+from .task_store import TASK_PENDING, TaskRecord, TaskQueue, TaskStore
+from .worktrees import create_worker_worktree
 
 
 Pathish = Union[str, Path]
@@ -44,6 +56,7 @@ class COrchRuntime:
         *,
         runs_dir: Pathish,
         queue_path: Optional[Pathish] = None,
+        proposals_path: Optional[Pathish] = None,
         scheduler_config: Optional[SchedulerConfig] = None,
         driver_factory: Optional[DriverFactory] = None,
         worktree_factory: Optional[Callable[..., Path]] = None,
@@ -51,6 +64,11 @@ class COrchRuntime:
     ) -> None:
         self.runs_dir = Path(runs_dir).expanduser().resolve()
         self.queue_path = Path(queue_path).expanduser().resolve() if queue_path is not None else None
+        self.proposals_path = (
+            Path(proposals_path).expanduser().resolve()
+            if proposals_path is not None
+            else None
+        )
         self._scheduler_config = scheduler_config
         self._external_driver_factory = driver_factory
         self._worktree_factory = worktree_factory
@@ -67,6 +85,9 @@ class COrchRuntime:
 
     def build_queue_payload(self) -> Dict[str, Any]:
         return build_queue_payload(self.queue_path, runs_dir=self.runs_dir)
+
+    def build_proposals_payload(self) -> Dict[str, Any]:
+        return build_proposals_payload(self.proposals_path, runs_dir=self.runs_dir)
 
     def build_run_payload(self, run_id: str) -> Optional[Dict[str, Any]]:
         return build_run_payload(self.runs_dir, run_id)
@@ -113,6 +134,47 @@ class COrchRuntime:
                 action,
                 runs_dir=self.runs_dir,
                 confirmed_by=confirmed_by,
+            )
+            if result is not None and int(result[0]) < 400:
+                self.dispatch_queue_async()
+            return result
+
+    def create_proposal(self, title: Any, prompt: Any) -> RunActionResponse:
+        with self._action_lock:
+            if self.proposals_path is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
+            if self._scheduler_config is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing execution config"}
+            result = create_proposal(
+                self.proposals_path,
+                title,
+                prompt,
+                runs_dir=self.runs_dir,
+                config=self._scheduler_config,
+                driver_factory=self._driver_context,
+                worktree_factory=self._worktree_factory,
+            )
+            return result
+
+    def proposal_action(
+        self,
+        proposal_id: str,
+        action: Any,
+        feedback: Any = None,
+    ) -> RunActionResponse:
+        with self._action_lock:
+            if self.proposals_path is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
+            if self.queue_path is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
+            result = proposal_action(
+                self.proposals_path,
+                proposal_id,
+                action,
+                feedback,
+                runs_dir=self.runs_dir,
+                queue_path=self.queue_path,
+                driver_factory=self._driver_context,
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
@@ -352,6 +414,207 @@ def queue_action(
     return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_path)
 
 
+def create_proposal(
+    proposals_path: Pathish,
+    title: Any,
+    prompt: Any,
+    *,
+    runs_dir: Pathish,
+    config: SchedulerConfig,
+    driver_factory: DriverFactory,
+    worktree_factory: Optional[Callable[..., Path]] = None,
+) -> RunActionResponse:
+    if not isinstance(title, str) or not title.strip():
+        return HTTPStatus.BAD_REQUEST, {"error": "title is required"}
+    if not isinstance(prompt, str) or not prompt.strip():
+        return HTTPStatus.BAD_REQUEST, {"error": "prompt is required"}
+
+    proposals_file = Path(proposals_path).expanduser().resolve()
+    proposal_store = ProposalStore(proposals_file)
+    pool = proposal_store.load_or_create()
+    proposal = proposal_store.add_proposal(pool, title=title.strip(), prompt=prompt.strip())
+    proposal_store.save(pool)
+
+    run_store = RunStore(Path(runs_dir).expanduser().resolve())
+    try:
+        manifest = _create_preflight_run(
+            run_store=run_store,
+            config=config,
+            user_task=proposal.prompt,
+            worktree_factory=worktree_factory,
+        )
+        proposal_store.update_proposal(pool, proposal.proposal_id, run_id=manifest.run_id)
+        proposal_store.save(pool)
+        with driver_factory(config.codex_binary_path) as driver:
+            from .orchestrator import OrchestratorConfig, RunOrchestrator
+
+            orchestrator = RunOrchestrator(
+                store=run_store,
+                driver=driver,
+                config=OrchestratorConfig(
+                    sandbox=config.sandbox,
+                    approval_policy=config.approval_policy,
+                    max_attempts=config.max_attempts,
+                    require_plan_approval=True,
+                    approve_plan=False,
+                ),
+            )
+            manifest = orchestrator.run(manifest)
+        status = _proposal_status_from_run(manifest)
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=status,
+            error=None if status != PROPOSAL_FAILED else "Planner failed to produce a plan.",
+            reason=derive_run_waiting_for(manifest),
+        )
+        proposal_store.save(pool)
+    except Exception as exc:
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=PROPOSAL_FAILED,
+            error=str(exc),
+            reason="proposal_create_failed",
+        )
+        proposal_store.save(pool)
+        return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+
+    return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+
+
+def proposal_action(
+    proposals_path: Pathish,
+    proposal_id: str,
+    action: Any,
+    feedback: Any = None,
+    *,
+    runs_dir: Pathish,
+    queue_path: Pathish,
+    driver_factory: DriverFactory,
+) -> RunActionResponse:
+    if action not in {"approve-plan", "revise-plan"}:
+        return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+    proposals_file = Path(proposals_path).expanduser().resolve()
+    proposal_store = ProposalStore(proposals_file)
+    try:
+        pool = proposal_store.load()
+        proposal = proposal_store.find(pool, proposal_id)
+    except (OSError, ValueError) as exc:
+        return HTTPStatus.NOT_FOUND, {"error": str(exc)}
+    if not proposal.run_id:
+        return HTTPStatus.CONFLICT, {"error": "proposal has no Planner run"}
+    run_store = RunStore(Path(runs_dir).expanduser().resolve())
+    try:
+        manifest = run_store.load(proposal.run_id)
+    except OSError:
+        return HTTPStatus.NOT_FOUND, {"error": "run not found"}
+    if manifest.status != RUN_PLAN_REVIEW_REQUIRED or manifest.plan is None:
+        return HTTPStatus.CONFLICT, {
+            "error": f"proposal requires PLAN_REVIEW_REQUIRED, current status is {manifest.status}",
+            "status": manifest.status,
+        }
+    if action == "revise-plan":
+        if not isinstance(feedback, str) or not feedback.strip():
+            return HTTPStatus.BAD_REQUEST, {"error": "feedback is required for revise-plan"}
+        codex_path = manifest.codex_binary_path or manifest.planner.codex_binary_path
+        if not codex_path:
+            return HTTPStatus.BAD_REQUEST, {"error": "missing codex binary path"}
+        try:
+            with driver_factory(codex_path) as driver:
+                from .orchestrator import OrchestratorConfig, RunOrchestrator
+
+                orchestrator = RunOrchestrator(
+                    store=run_store,
+                    driver=driver,
+                    config=OrchestratorConfig(require_plan_approval=True),
+                )
+                manifest = orchestrator.revise_plan(manifest, feedback.strip())
+        except Exception as exc:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_FAILED,
+                error=str(exc),
+                reason="proposal_revision_failed",
+            )
+            proposal_store.save(pool)
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=_proposal_status_from_run(manifest),
+            error=None,
+            reason=derive_run_waiting_for(manifest),
+        )
+        proposal_store.save(pool)
+        return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+
+    _approve_manifest_plan(run_store, manifest)
+    task_id = _enqueue_approved_proposal(
+        queue_path=queue_path,
+        proposal=proposal,
+        run_id=manifest.run_id,
+    )
+    proposal_store.update_proposal(
+        pool,
+        proposal.proposal_id,
+        status=PROPOSAL_QUEUED,
+        task_id=task_id,
+        error=None,
+        reason="queued_for_execution",
+    )
+    proposal_store.save(pool)
+    run_store.append_event(
+        manifest.run_id,
+        "proposal_plan_approved",
+        "Human approved proposal plan; task queued for execution.",
+        proposal_id=proposal.proposal_id,
+        task_id=task_id,
+        source="dashboard",
+    )
+    return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+
+
+def build_proposals_payload(
+    proposals_path: Optional[Pathish],
+    *,
+    runs_dir: Optional[Pathish] = None,
+) -> Dict[str, Any]:
+    generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    if proposals_path is None:
+        return {
+            "proposals_file": None,
+            "generated_at": generated_at,
+            "pool": None,
+            "proposals": [],
+        }
+    proposals_file = Path(proposals_path).expanduser().resolve()
+    store = ProposalStore(proposals_file)
+    try:
+        pool = store.load()
+    except (OSError, ValueError):
+        return {
+            "proposals_file": str(proposals_file),
+            "generated_at": generated_at,
+            "pool": None,
+            "proposals": [],
+        }
+    run_store = RunStore(Path(runs_dir).expanduser().resolve()) if runs_dir is not None else None
+    proposals = [_summarize_proposal(proposal, run_store=run_store) for proposal in pool.proposals]
+    return {
+        "proposals_file": str(proposals_file),
+        "generated_at": generated_at,
+        "pool": {
+            "pool_id": pool.pool_id,
+            "created_at": pool.created_at,
+            "updated_at": pool.updated_at,
+        },
+        "summary": _proposal_summary(proposals),
+        "proposals": proposals,
+    }
+
+
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     runs_path = Path(runs_dir).expanduser().resolve()
     store = RunStore(runs_path)
@@ -431,6 +694,100 @@ def build_run_payload(runs_dir: Pathish, run_id: str) -> Optional[Dict[str, Any]
         "events": events,
         "worker_activity": _worker_activity(manifest),
     }
+
+
+def _create_preflight_run(
+    *,
+    run_store: RunStore,
+    config: SchedulerConfig,
+    user_task: str,
+    worktree_factory: Optional[Callable[..., Path]],
+) -> RunManifest:
+    manifest = run_store.create_run(
+        cwd=config.cwd,
+        user_task=user_task,
+        planner_model=config.planner_model,
+        worker_model=config.worker_model,
+        codex_binary_path=config.codex_binary_path,
+        planner_reasoning_effort=config.planner_reasoning_effort,
+        worker_reasoning_effort=config.worker_reasoning_effort,
+        planner_service_tier=config.planner_service_tier,
+        worker_service_tier=config.worker_service_tier,
+    )
+    factory = worktree_factory or create_worker_worktree
+    worker = manifest.workers[0]
+    worker.worktree_path = str(
+        factory(
+            repo_path=config.cwd,
+            worktrees_dir=config.worktrees_dir,
+            run_id=manifest.run_id,
+            worker_id=worker.id,
+        )
+    )
+    run_store.save(manifest)
+    return manifest
+
+
+def _proposal_status_from_run(manifest: RunManifest) -> str:
+    if manifest.status == RUN_PLAN_REVIEW_REQUIRED:
+        return PROPOSAL_PLAN_REVIEW_REQUIRED
+    if manifest.status == RUN_PLAN_APPROVED:
+        return PROPOSAL_APPROVED
+    if manifest.status == "PLAN_REVISING":
+        return PROPOSAL_PLAN_REVISING
+    if manifest.status == "FAILED":
+        return PROPOSAL_FAILED
+    return PROPOSAL_PLANNING
+
+
+def _approve_manifest_plan(run_store: RunStore, manifest: RunManifest) -> None:
+    if manifest.plan is None:
+        raise ValueError("manifest has no Planner plan")
+    manifest.plan.approval_status = "approved"
+    manifest.plan.approved_at = run_store.now_iso()
+    manifest.plan.approved_by = "human"
+    manifest.status = RUN_PLAN_APPROVED
+    run_store.save(manifest)
+
+
+def _enqueue_approved_proposal(
+    *,
+    queue_path: Pathish,
+    proposal: ProposalRecord,
+    run_id: str,
+) -> str:
+    queue_file = Path(queue_path).expanduser().resolve()
+    store = TaskStore(queue_file)
+    try:
+        queue = store.load()
+    except OSError:
+        queue = TaskQueue(queue_id="default")
+    task_id = _unique_task_id(queue, proposal.proposal_id)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    queue.tasks.append(
+        TaskRecord(
+            task_id=task_id,
+            title=proposal.title,
+            prompt=proposal.prompt,
+            status=TASK_PENDING,
+            active_run_id=run_id,
+            run_ids=[run_id],
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    store.save(queue)
+    return task_id
+
+
+def _unique_task_id(queue: TaskQueue, preferred: str) -> str:
+    used = {task.task_id for task in queue.tasks}
+    candidate = preferred
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = f"{preferred}-{suffix:02d}"
+    return candidate
 
 
 def _validate_run_action(manifest: Any, action: Any) -> Optional[str]:
@@ -575,6 +932,80 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "next_action": progress.waiting_for,
         "allowed_actions": _allowed_task_actions(task),
     }
+
+
+def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStore]) -> Dict[str, Any]:
+    run_summary = None
+    manifest = None
+    if run_store is not None and proposal.run_id:
+        try:
+            manifest = run_store.load(proposal.run_id)
+        except OSError:
+            manifest = None
+    if manifest is not None:
+        run_summary = _summarize_manifest(
+            manifest.to_dict(),
+            events=run_store.load_events(manifest.run_id) if run_store is not None else [],
+        )
+    status = proposal.status
+    if manifest is not None and status not in {PROPOSAL_QUEUED, PROPOSAL_FAILED}:
+        status = _proposal_status_from_run(manifest)
+    return {
+        "proposal_id": proposal.proposal_id,
+        "title": proposal.title,
+        "prompt": proposal.prompt,
+        "status": status,
+        "run_id": proposal.run_id,
+        "task_id": proposal.task_id,
+        "created_at": proposal.created_at,
+        "updated_at": proposal.updated_at,
+        "error": proposal.error,
+        "reason": proposal.reason,
+        "waiting_for": _proposal_waiting_for(status),
+        "allowed_actions": _allowed_proposal_actions(status, run_summary),
+        "run": run_summary,
+    }
+
+
+def _proposal_summary(proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(proposals)
+    review_required = sum(1 for proposal in proposals if proposal.get("status") == PROPOSAL_PLAN_REVIEW_REQUIRED)
+    queued = sum(1 for proposal in proposals if proposal.get("status") == PROPOSAL_QUEUED)
+    failed = sum(1 for proposal in proposals if proposal.get("status") == PROPOSAL_FAILED)
+    active = sum(
+        1
+        for proposal in proposals
+        if proposal.get("status") in {PROPOSAL_PLANNING, PROPOSAL_PLAN_REVISING}
+    )
+    return {
+        "total_proposals": total,
+        "review_required": review_required,
+        "queued": queued,
+        "failed": failed,
+        "active": active,
+    }
+
+
+def _proposal_waiting_for(status: str) -> str:
+    if status == PROPOSAL_PLAN_REVIEW_REQUIRED:
+        return "human_plan_review"
+    if status == PROPOSAL_PLAN_REVISING:
+        return "planner_revision"
+    if status == PROPOSAL_QUEUED:
+        return "execution_queue"
+    if status == PROPOSAL_FAILED:
+        return "failed"
+    if status == PROPOSAL_APPROVED:
+        return "queue_approval"
+    return "planner"
+
+
+def _allowed_proposal_actions(status: str, run_summary: Optional[Dict[str, Any]]) -> List[str]:
+    if status != PROPOSAL_PLAN_REVIEW_REQUIRED:
+        return []
+    if not run_summary or not run_summary.get("plan"):
+        return []
+    return ["approve-plan", "revise-plan"]
 
 
 def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:

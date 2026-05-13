@@ -48,6 +48,28 @@ another checkout of the same repo.
 
 Keep normal business progress separate from failure handling.
 
+c-orch separates human plan review from the executable task queue. New work
+should first enter the plan proposal pool:
+
+```text
+proposal -> Planner plan -> human plan review -> execution queue
+```
+
+The proposal pool owns ambiguous or still-negotiated work. A proposal may ask
+Planner to revise the plan multiple times in the same Planner thread. Only
+after a human approves the plan does c-orch enqueue an execution task that
+points at the approved run. The execution queue should contain work that is
+already approved to run automatically:
+
+```text
+approved plan -> Worker execution -> Planner review -> apply -> commit
+```
+
+This boundary keeps the queue pipeline from stopping on human plan review. The
+queue may still stop at explicit operational gates such as restart confirmation
+or failed task retry, but it should not treat "waiting for human plan approval"
+as normal executable queue progress.
+
 Business run states describe where the task is in the Planner/Human/Worker
 loop:
 
@@ -93,6 +115,11 @@ special exception state.
 Task state is the user-level lifecycle; run state is one execution attempt.
 One task can have multiple run attempts over time. `active_run_id` points to the
 current attempt and `run_ids` preserves prior attempts for audit.
+
+A queued task may start with an `active_run_id` that already has an approved
+Planner plan. In that case the scheduler must continue the existing run from
+`PLAN_APPROVED` instead of creating a replacement run. This is the handoff from
+proposal pool to execution queue.
 
 Task status should stay coarse:
 

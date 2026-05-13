@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -163,10 +164,17 @@ class TaskStore:
             queue.created_at = queue.updated_at or _now_iso()
         self.validate(queue)
         self.queue_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.queue_path.with_suffix(self.queue_path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as file_obj:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self.queue_path.parent,
+            prefix=f".{self.queue_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file_obj:
             json.dump(queue.to_dict(), file_obj, ensure_ascii=False, indent=2)
             file_obj.write("\n")
+            tmp_path = Path(file_obj.name)
         tmp_path.replace(self.queue_path)
         return self.queue_path
 
