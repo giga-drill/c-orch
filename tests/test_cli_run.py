@@ -273,7 +273,7 @@ approval_policy = "on-request"
             runs_dir = cwd / "runs"
             store = RunStore(runs_dir)
 
-            for status in ("APPROVED", "BLOCKED", "FAILED"):
+            for status in ("APPROVED", "FAILED"):
                 manifest = store.create_run(
                     cwd=cwd,
                     user_task=f"Task for {status}",

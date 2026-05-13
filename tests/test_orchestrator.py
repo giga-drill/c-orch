@@ -201,9 +201,9 @@ class RetryEndToEndDriver:
             if self.review_count == 1:
                 return _session(
                     "planner-thread",
-                    _review("needs_changes", "Fix subtract implementation so tests pass."),
+                    _review("revision_requested", "Fix subtract implementation so tests pass."),
                 )
-            return _session("planner-thread", _review("approved"))
+            return _session("planner-thread", _review("accepted"))
         if thread_id == "worker-thread":
             if self.worker_cwd is None:
                 raise AssertionError("worker reply happened before worker start")
@@ -222,6 +222,107 @@ class RetryEndToEndDriver:
         self.worker_mutations.append("fixed-subtract")
 
 
+class FallbackReviewDriver:
+    def __init__(self, *, fallback_reply: Optional[SessionResult], fallback_error: Optional[Exception] = None) -> None:
+        self.fallback_reply = fallback_reply
+        self.fallback_error = fallback_error
+        self.start_calls: List[Dict[str, Any]] = []
+        self.reply_calls: List[Dict[str, Any]] = []
+
+    def start_session(
+        self,
+        *,
+        role: str,
+        model: str,
+        cwd: str,
+        prompt: str,
+        sandbox: str,
+        approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.start_calls.append(
+            {
+                "role": role,
+                "model": model,
+                "cwd": cwd,
+                "prompt": prompt,
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
+        if role == "planner" and "fallback Planner reviewer" in prompt:
+            if self.fallback_error is not None:
+                raise self.fallback_error
+            if self.fallback_reply is None:
+                raise AssertionError("missing fallback reply")
+            return self.fallback_reply
+        if role == "planner":
+            return _session("planner-thread", _planner_plan())
+        if role == "worker":
+            return _session("worker-thread", _worker_result())
+        raise AssertionError(f"unexpected role: {role}")
+
+    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
+        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+        if thread_id == "planner-thread":
+            raise RuntimeError(f"Session not found for thread_id: {thread_id}")
+        raise AssertionError(f"unexpected thread_id: {thread_id}")
+
+
+class FallbackWorkerReworkDriver:
+    def __init__(self) -> None:
+        self.start_calls: List[Dict[str, Any]] = []
+        self.reply_calls: List[Dict[str, Any]] = []
+        self.worker_start_count = 0
+        self.review_count = 0
+
+    def start_session(
+        self,
+        *,
+        role: str,
+        model: str,
+        cwd: str,
+        prompt: str,
+        sandbox: str,
+        approval_policy: str,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.start_calls.append(
+            {
+                "role": role,
+                "model": model,
+                "cwd": cwd,
+                "prompt": prompt,
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
+        if role == "planner":
+            return _session("planner-thread", _planner_plan())
+        if role == "worker":
+            self.worker_start_count += 1
+            thread_id = "worker-thread" if self.worker_start_count == 1 else "worker-fallback-thread"
+            return _session(thread_id, _worker_result(summary=f"worker attempt {self.worker_start_count}"))
+        raise AssertionError(f"unexpected role: {role}")
+
+    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
+        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+        if thread_id == "planner-thread":
+            self.review_count += 1
+            if self.review_count == 1:
+                return _session("planner-thread", _review("revision_requested", "Add missing state mapping."))
+            return _session("planner-thread", _review("accepted"))
+        if thread_id == "worker-thread":
+            raise RuntimeError(f"Session not found for thread_id: {thread_id}")
+        raise AssertionError(f"unexpected thread_id: {thread_id}")
+
+
 class OrchestratorTests(unittest.TestCase):
     def test_approved_flow_updates_manifest_and_uses_worker_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -236,7 +337,7 @@ class OrchestratorTests(unittest.TestCase):
                     _session("planner-thread", _planner_plan()),
                     _session("worker-thread", _worker_result()),
                 ],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
@@ -279,7 +380,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(verification.calls[0]["commands"], ["python -m unittest"])
             self.assertEqual(verification.calls[0]["cwd"], worktree)
             self.assertIsNotNone(result.review)
-            self.assertEqual(result.review.decision, "approved")
+            self.assertEqual(result.review.decision, "accepted")
             self.assertEqual(len(result.review.evidence_files), 4)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
             self.assertFalse(result.requires_restart)
@@ -295,7 +396,7 @@ class OrchestratorTests(unittest.TestCase):
 
             loaded = store.load(manifest.run_id)
             self.assertEqual(loaded.status, "APPROVED")
-            self.assertEqual(loaded.review.decision, "approved")
+            self.assertEqual(loaded.review.decision, "accepted")
             self.assertEqual(len(loaded.review.evidence_files), 4)
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
@@ -320,7 +421,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[2]["attempt"], 1)
             self.assertEqual(events[2]["worker_id"], "worker-1")
             self.assertEqual(events[3]["status"], "DONE")
-            self.assertEqual(events[7]["decision"], "approved")
+            self.assertEqual(events[7]["decision"], "accepted")
             self.assertTrue(events[8]["applied"])
             self.assertEqual(events[9]["status"], "APPROVED")
 
@@ -374,7 +475,7 @@ class OrchestratorTests(unittest.TestCase):
 
             worker_driver = FakeDriver(
                 start_results=[_session("worker-thread", _worker_result())],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             result = RunOrchestrator(
                 store=store,
@@ -477,7 +578,7 @@ class OrchestratorTests(unittest.TestCase):
             events = store.load_events(manifest.run_id)
             self.assertIn("planner_plan_revision_failed", [event["type"] for event in events])
 
-    def test_needs_changes_reuses_worker_thread_then_reviews_again(self) -> None:
+    def test_revision_requested_reuses_worker_thread_then_reviews_again(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, manifest, _worktree = _create_manifest(root)
@@ -487,9 +588,9 @@ class OrchestratorTests(unittest.TestCase):
                     _session("worker-thread", _worker_result(summary="first pass")),
                 ],
                 reply_results=[
-                    _session("planner-thread", _review("needs_changes", "Add coverage")),
+                    _session("planner-thread", _review("revision_requested", "Add coverage")),
                     _session("worker-thread", _worker_result(summary="second pass")),
-                    _session("planner-thread", _review("approved")),
+                    _session("planner-thread", _review("accepted")),
                 ],
             )
             evidence = FakeEvidenceCollector()
@@ -520,11 +621,37 @@ class OrchestratorTests(unittest.TestCase):
                 store.run_dir(manifest.run_id) / "evidence",
             )
             self.assertIsNotNone(result.review)
-            self.assertEqual(result.review.decision, "approved")
+            self.assertEqual(result.review.decision, "accepted")
             self.assertEqual(len(verification.calls), 2)
             self.assertEqual(len(result.workers[0].evidence_files), 4)
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+
+    def test_revision_requested_falls_back_to_new_worker_when_thread_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FallbackWorkerReworkDriver()
+            applier = FakeDiffApplier()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=applier,
+                verification_runner=FakeVerificationRunner(),
+                config=OrchestratorConfig(max_attempts=2),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(result.workers[0].attempt, 2)
+            self.assertEqual(result.workers[0].thread_id, "worker-fallback-thread")
+            self.assertEqual([call["role"] for call in driver.start_calls], ["planner", "worker", "worker"])
+            self.assertEqual(driver.reply_calls[1]["thread_id"], "worker-thread")
+            self.assertEqual(len(applier.calls), 1)
+            event_types = [event["type"] for event in store.load_events(manifest.run_id)]
+            self.assertIn("worker_rework_fallback_started", event_types)
+            self.assertIn("worker_rework_fallback_thread_started", event_types)
 
     @unittest.skipIf(shutil.which("git") is None, "git is not available")
     def test_retry_flow_end_to_end_from_plan_gate_to_apply(self) -> None:
@@ -583,9 +710,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("All 1 verification command(s) passed.", driver.reply_calls[2]["prompt"])
             self.assertEqual(
                 [attempt.status for attempt in result.review_attempts],
-                ["NEEDS_CHANGES", "APPROVED"],
+                ["REVISION_REQUESTED", "ACCEPTED"],
             )
-            self.assertEqual(result.review.decision, "approved")
+            self.assertEqual(result.review.decision, "accepted")
 
             self.assertIn("def subtract(a, b):", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertIn(
@@ -634,7 +761,7 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(
                 [event.get("decision") for event in events if event["type"] == "planner_review_completed"],
-                ["needs_changes", "approved"],
+                ["revision_requested", "accepted"],
             )
             self.assertEqual(
                 [event.get("summary") for event in events if event["type"] == "verification_finished"],
@@ -644,7 +771,7 @@ class OrchestratorTests(unittest.TestCase):
                 ],
             )
 
-    def test_needs_changes_after_max_attempts_fails_without_extra_worker_reply(self) -> None:
+    def test_revision_requested_after_max_attempts_fails_without_extra_worker_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, manifest, _worktree = _create_manifest(root)
@@ -653,7 +780,7 @@ class OrchestratorTests(unittest.TestCase):
                     _session("planner-thread", _planner_plan()),
                     _session("worker-thread", _worker_result()),
                 ],
-                reply_results=[_session("planner-thread", _review("needs_changes", "Still missing"))],
+                reply_results=[_session("planner-thread", _review("revision_requested", "Still missing"))],
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
@@ -677,7 +804,7 @@ class OrchestratorTests(unittest.TestCase):
                 ["planner-thread"],
             )
             self.assertIsNotNone(result.review)
-            self.assertEqual(result.review.decision, "needs_changes")
+            self.assertEqual(result.review.decision, "revision_requested")
             self.assertEqual(len(applier.calls), 0)
 
             events = store.load_events(manifest.run_id)
@@ -694,7 +821,7 @@ class OrchestratorTests(unittest.TestCase):
                     _session("planner-thread", _planner_plan()),
                     _session("worker-thread", _worker_result()),
                 ],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
@@ -712,7 +839,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.planner.status, "FAILED")
             self.assertEqual(result.workers[0].status, "FAILED")
             self.assertIsNotNone(result.review)
-            self.assertEqual(result.review.decision, "approved")
+            self.assertEqual(result.review.decision, "accepted")
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-apply-output.txt", result.workers[0].evidence_files[-1])
             self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
@@ -721,7 +848,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(loaded.status, "FAILED")
             self.assertEqual(loaded.planner.status, "FAILED")
             self.assertEqual(loaded.workers[0].status, "FAILED")
-            self.assertEqual(loaded.review.decision, "approved")
+            self.assertEqual(loaded.review.decision, "accepted")
 
             events = store.load_events(manifest.run_id)
             self.assertEqual(events[-1]["type"], "run_terminal_status")
@@ -740,7 +867,7 @@ class OrchestratorTests(unittest.TestCase):
                     _session("planner-thread", _planner_plan()),
                     _session("worker-thread", _worker_result()),
                 ],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             evidence = FakeEvidenceCollector(
                 changed_paths=[
@@ -784,7 +911,7 @@ class OrchestratorTests(unittest.TestCase):
                     _session("planner-thread", _planner_plan()),
                     _session("worker-thread", _worker_result()),
                 ],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             evidence = FakeEvidenceCollector(changed_paths=["src/c_orch/run_store.py"])
             verification = FakeVerificationRunner()
@@ -806,39 +933,6 @@ class OrchestratorTests(unittest.TestCase):
             events = store.load_events(manifest.run_id)
             self.assertNotIn("restart_required", [event["type"] for event in events])
 
-    def test_blocked_review_marks_run_blocked_and_logs_terminal_event(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store, manifest, _worktree = _create_manifest(root)
-            driver = FakeDriver(
-                start_results=[
-                    _session("planner-thread", _planner_plan()),
-                    _session("worker-thread", _worker_result()),
-                ],
-                reply_results=[_session("planner-thread", _review("blocked"))],
-            )
-            evidence = FakeEvidenceCollector()
-            verification = FakeVerificationRunner()
-            applier = FakeDiffApplier()
-
-            result = RunOrchestrator(
-                store=store,
-                driver=driver,
-                evidence_collector=evidence,
-                diff_applier=applier,
-                verification_runner=verification,
-            ).run(manifest)
-
-            self.assertEqual(result.status, "BLOCKED")
-            self.assertEqual(result.planner.status, "BLOCKED")
-            self.assertEqual(result.workers[0].status, "BLOCKED")
-            self.assertEqual(len(applier.calls), 0)
-
-            events = store.load_events(manifest.run_id)
-            self.assertEqual(events[-1]["type"], "run_terminal_status")
-            self.assertEqual(events[-1]["status"], "BLOCKED")
-            self.assertEqual(events[-1]["reason"], "review_blocked")
-
     def test_review_failure_preserves_worker_result_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -858,8 +952,8 @@ class OrchestratorTests(unittest.TestCase):
                 verification_runner=FakeVerificationRunner(),
             ).run(manifest)
 
-            self.assertEqual(result.status, "REVIEW_RETRYABLE")
-            self.assertEqual(result.planner.status, "REVIEW_RETRYABLE")
+            self.assertEqual(result.status, "WORK_DONE")
+            self.assertEqual(result.planner.status, "PLAN_APPROVED")
             self.assertEqual(result.workers[0].status, "DONE")
             self.assertIsNotNone(result.workers[0].result)
             self.assertEqual(result.review_attempts[-1].status, "FAILED_RETRYABLE")
@@ -888,11 +982,11 @@ class OrchestratorTests(unittest.TestCase):
                 diff_applier=FakeDiffApplier(),
                 verification_runner=FakeVerificationRunner(),
             ).run(manifest)
-            self.assertEqual(paused.status, "REVIEW_RETRYABLE")
+            self.assertEqual(paused.status, "WORK_DONE")
 
             retry_driver = FakeDriver(
                 start_results=[],
-                reply_results=[_session("planner-thread", _review("approved"))],
+                reply_results=[_session("planner-thread", _review("accepted"))],
             )
             applier = FakeDiffApplier()
             result = RunOrchestrator(
@@ -907,8 +1001,107 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(len(applier.calls), 1)
             self.assertEqual(
                 [attempt.status for attempt in result.review_attempts],
-                ["FAILED_RETRYABLE", "APPROVED"],
+                ["FAILED_RETRYABLE", "ACCEPTED"],
             )
+
+    def test_review_reply_success_does_not_start_fallback_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual([call["role"] for call in driver.start_calls], ["planner", "worker"])
+
+    def test_retry_review_falls_back_to_new_planner_session_when_thread_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            first_driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=first_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+            self.assertEqual(paused.status, "WORK_DONE")
+
+            retry_driver = FallbackReviewDriver(
+                fallback_reply=_session("planner-fallback-thread", _review("accepted")),
+            )
+            applier = FakeDiffApplier()
+            result = RunOrchestrator(
+                store=store,
+                driver=retry_driver,
+                diff_applier=applier,
+            ).retry_review(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(result.planner.thread_id, "planner-fallback-thread")
+            self.assertEqual(retry_driver.reply_calls[0]["thread_id"], "planner-thread")
+            self.assertEqual(retry_driver.start_calls[-1]["role"], "planner")
+            self.assertIn("fallback Planner reviewer", retry_driver.start_calls[-1]["prompt"])
+            self.assertEqual(len(applier.calls), 1)
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertIn("planner_review_fallback_started", event_types)
+            self.assertIn("planner_review_fallback_thread_started", event_types)
+
+    def test_retry_review_fallback_failure_preserves_work_done_and_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            first_driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=first_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+            self.assertEqual(paused.status, "WORK_DONE")
+
+            retry_driver = FallbackReviewDriver(
+                fallback_reply=None,
+                fallback_error=RuntimeError("fallback planner startup failed"),
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=retry_driver,
+            ).retry_review(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "WORK_DONE")
+            self.assertEqual(result.planner.status, "PLAN_APPROVED")
+            self.assertEqual(result.review_attempts[-1].status, "FAILED_RETRYABLE")
+            self.assertIn("fallback planner startup failed", result.review_attempts[-1].error or "")
+            self.assertIsNotNone(result.review)
+            self.assertGreaterEqual(len(result.review.evidence_files), 1)
 
 
 def _create_manifest(root: Path):

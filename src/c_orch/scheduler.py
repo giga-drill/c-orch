@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from .drivers import CodexDriver
+from .failure_policy import has_retryable_review_failure
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
-from .states import RUN_APPROVED, RUN_BLOCKED, RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED
+from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -93,6 +94,16 @@ class TaskScheduler:
                         task.task_id,
                         status=TASK_RUNNING,
                         reason="plan_review_required",
+                    )
+                    self.task_store.save(queue)
+                    return queue
+                if active is not None and has_retryable_review_failure(active):
+                    queue.status = QUEUE_RUNNING
+                    self.task_store.update_task(
+                        queue,
+                        task.task_id,
+                        status=TASK_RUNNING,
+                        reason="review_retry_available",
                     )
                     self.task_store.save(queue)
                     return queue
@@ -211,17 +222,6 @@ class TaskScheduler:
                     task.task_id,
                     status=TASK_RUNNING,
                     reason="plan_review_required",
-                )
-                self.task_store.save(queue)
-                return queue
-
-            if manifest.status == RUN_BLOCKED:
-                queue.status = QUEUE_BLOCKED
-                self.task_store.update_task(
-                    queue,
-                    task.task_id,
-                    status=TASK_BLOCKED,
-                    reason=manifest.status,
                 )
                 self.task_store.save(queue)
                 return queue

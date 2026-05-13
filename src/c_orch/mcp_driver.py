@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from .codex_session_logs import CodexSessionLogStore, CodexSessionSnapshot
 from .codex_discovery import inspect_codex_environment
@@ -22,6 +24,9 @@ class SessionLogStore(Protocol):
         ...
 
 
+ExecResumeRunner = Callable[[str, str, str], SessionResult]
+
+
 class McpCodexDriver:
     def __init__(
         self,
@@ -34,6 +39,7 @@ class McpCodexDriver:
         session_start_grace_seconds: float = 10.0,
         sessions_root: Optional[str] = None,
         session_log_store: Optional[SessionLogStore] = None,
+        exec_resume_runner: Optional[ExecResumeRunner] = None,
     ) -> None:
         self.codex_bin = codex_bin or _resolve_default_codex_bin(client)
         self._client = client
@@ -42,6 +48,7 @@ class McpCodexDriver:
         self._session_recovery_poll_seconds = session_recovery_poll_seconds
         self._session_start_grace_seconds = session_start_grace_seconds
         self._session_log_store = session_log_store or CodexSessionLogStore(sessions_root)
+        self._exec_resume_runner = exec_resume_runner or _codex_exec_resume
         self._tools_checked = False
 
     def __enter__(self) -> "McpCodexDriver":
@@ -85,16 +92,21 @@ class McpCodexDriver:
     def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
         self._ensure_required_tools()
         started_at = time.time()
-        return self._call_tool_with_session_recovery(
-            tool_name="codex-reply",
-            arguments={
-                "threadId": thread_id,
-                "prompt": prompt,
-            },
-            thread_id=thread_id,
-            cwd=None,
-            started_at=started_at,
-        )
+        try:
+            return self._call_tool_with_session_recovery(
+                tool_name="codex-reply",
+                arguments={
+                    "threadId": thread_id,
+                    "prompt": prompt,
+                },
+                thread_id=thread_id,
+                cwd=None,
+                started_at=started_at,
+            )
+        except Exception as exc:
+            if not _is_session_not_found_error(exc):
+                raise
+            return self._exec_resume_runner(self.codex_bin, thread_id, prompt)
 
     def close(self) -> None:
         if self._client is not None:
@@ -197,6 +209,57 @@ def _session_result_from_snapshot(snapshot: CodexSessionSnapshot) -> SessionResu
         "recoveredFromSessionLog": str(Path(snapshot.path)),
     }
     return coerce_session_result(raw)
+
+
+def _codex_exec_resume(codex_bin: str, thread_id: str, prompt: str) -> SessionResult:
+    with tempfile.TemporaryDirectory(prefix="c-orch-resume-") as tmp:
+        output_path = Path(tmp) / "last-message.txt"
+        completed = subprocess.run(
+            [
+                codex_bin,
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                "-o",
+                str(output_path),
+                thread_id,
+                "-",
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(
+                f"Session not found for thread_id: {thread_id}; "
+                "codex exec resume failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        try:
+            content = output_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise DriverError(
+                f"Session not found for thread_id: {thread_id}; "
+                f"codex exec resume did not write output: {exc}"
+            ) from exc
+        if not content:
+            raise DriverError(
+                f"Session not found for thread_id: {thread_id}; "
+                "codex exec resume returned an empty final message"
+            )
+        raw = {
+            "structuredContent": {
+                "threadId": thread_id,
+                "content": content,
+            },
+            "resumedWithCodexExec": True,
+        }
+        return coerce_session_result(raw)
+
+
+def _is_session_not_found_error(error: BaseException) -> bool:
+    return "Session not found for thread_id" in str(error)
 
 
 def _codex_arguments(

@@ -9,9 +9,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 from urllib.parse import unquote
 
 from .codex_session_logs import CodexSessionLogStore
-from .run_store import RunStore
+from .failure_policy import has_retryable_review_failure, has_retryable_review_failure_dict
+from .run_store import RunManifest, RunStore
 from .settings import DEFAULT_UI_HOST, DEFAULT_UI_PORT
-from .states import RUN_STATUS_ORDER, TERMINAL_RUN_STATUSES
+from .states import (
+    RUN_PLAN_REVIEW_REQUIRED,
+    RUN_STATUS_ORDER,
+    TERMINAL_RUN_STATUSES,
+)
 from .task_store import TaskStore
 
 
@@ -135,6 +140,9 @@ def _run_action(
         return None
     if action not in {"approve-plan", "revise-plan", "retry-review"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
+    action_error = _validate_run_action(manifest, action)
+    if action_error:
+        return HTTPStatus.CONFLICT, {"error": action_error, "status": manifest.status}
     if action == "revise-plan":
         if not isinstance(feedback, str) or not feedback.strip():
             return HTTPStatus.BAD_REQUEST, {"error": "feedback is required for revise-plan"}
@@ -176,6 +184,19 @@ def _run_action(
         return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
     payload = build_run_payload(runs_dir, run_id)
     return HTTPStatus.OK, payload or {"ok": True}
+
+
+def _validate_run_action(manifest: Any, action: Any) -> Optional[str]:
+    if action in {"approve-plan", "revise-plan"}:
+        if manifest.status != RUN_PLAN_REVIEW_REQUIRED:
+            return f"{action} requires PLAN_REVIEW_REQUIRED, current status is {manifest.status}"
+        if manifest.plan is None:
+            return f"{action} requires a saved Planner plan"
+        if action == "approve-plan" and manifest.plan.approval_status == "approved":
+            return "Planner plan is already approved"
+    if action == "retry-review" and not has_retryable_review_failure(manifest):
+        return f"retry-review requires saved failed review evidence, current status is {manifest.status}"
+    return None
 
 
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
@@ -278,7 +299,7 @@ def _load_manifest(path: Path) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(data, dict):
         return None
-    return data
+    return RunManifest.from_dict(data).to_dict()
 
 
 def _summarize_manifest(
@@ -331,6 +352,7 @@ def _summarize_manifest(
         } if review else None,
         "review_attempt_count": len(review_attempts),
         "last_review_attempt": _review_attempt_summary(review_attempts[-1]) if review_attempts else None,
+        "can_retry_review": has_retryable_review_failure_dict(manifest),
         "last_event": _event_summary(events[-1]) if events else None,
         "last_error_event": _last_error_event(events or []),
         "plan": {
@@ -599,7 +621,7 @@ INDEX_HTML = """<!doctype html>
     }
     .APPROVED { color: var(--green); border-color: rgba(17,122,85,.3); background: rgba(17,122,85,.08); }
     .FAILED { color: var(--red); border-color: rgba(189,47,47,.3); background: rgba(189,47,47,.08); }
-    .BLOCKED, .NEEDS_CHANGES, .REVIEW_RETRYABLE { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
+    .REVISION_REQUESTED { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     .WORKING, .REVIEWING, .PLANNING, .WORK_DONE, .PLAN_READY, .PLAN_APPROVED { color: var(--blue); border-color: rgba(37,111,146,.3); background: rgba(37,111,146,.08); }
     .PLAN_REVIEW_REQUIRED { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
     .PLAN_REVISING { color: var(--amber); border-color: rgba(179,99,0,.3); background: rgba(179,99,0,.10); }
@@ -789,8 +811,7 @@ INDEX_HTML = """<!doctype html>
       "WORKING",
       "WORK_DONE",
       "REVIEWING",
-      "NEEDS_CHANGES",
-      "REVIEW_RETRYABLE",
+      "REVISION_REQUESTED",
       "DONE"
     ];
     const statusText = {
@@ -803,18 +824,17 @@ INDEX_HTML = """<!doctype html>
       PLAN_REVISING: "Planner 修订方案中",
       PLAN_APPROVED: "方案已通过",
       WORKING: "Worker 执行中",
-      WORK_DONE: "Worker 已完成",
+      WORK_DONE: "Worker 已完成，等待复核",
       REVIEWING: "Planner 复核中",
-      NEEDS_CHANGES: "需要返工",
-      REVIEW_RETRYABLE: "复核可重试",
+      REVISION_REQUESTED: "等待 Worker 修改",
       APPROVED: "已通过",
-      BLOCKED: "阻塞",
       FAILED: "失败",
       RESTART_REQUIRED: "需要重启"
     };
     let runs = [];
     let queueData = null;
     let selected = null;
+    const pendingActions = new Set();
 
     const els = {
       runList: document.getElementById("runList"),
@@ -908,20 +928,31 @@ INDEX_HTML = """<!doctype html>
     }
 
     async function runActionWithPayload(runId, action, actionPayload) {
-      const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/actions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ action, ...actionPayload })
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        alert(text);
+      const key = `${runId}:${action}`;
+      if (pendingActions.has(key)) {
         return;
       }
-      const resultPayload = await response.json();
-      renderDetail(resultPayload);
-      await loadRuns(false);
+      pendingActions.add(key);
+      setActionButtonsDisabled(true);
+      try {
+        const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/actions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ action, ...actionPayload })
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          alert(text);
+          return;
+        }
+        const resultPayload = await response.json();
+        renderDetail(resultPayload);
+        await loadRuns(false);
+      } finally {
+        pendingActions.delete(key);
+        setActionButtonsDisabled(false);
+      }
     }
 
     async function runRevisePlan(runId) {
@@ -968,16 +999,16 @@ INDEX_HTML = """<!doctype html>
         <div style="margin-top:10px">
           <textarea class="planFeedback" id="planFeedback-${escapeHtml(run.run_id)}" placeholder="请输入修改意见，Planner 会在同一线程里重写完整方案 JSON"></textarea>
           <div style="margin-top:8px">
-            <button type="button" onclick="runRevisePlan('${escapeJs(run.run_id)}')">让 Planner 重新生成计划</button>
+            <button type="button" data-run-action="revise-plan" onclick="runRevisePlan('${escapeJs(run.run_id)}')">让 Planner 重新生成计划</button>
           </div>
         </div>
       ` : "";
       const actionButtons = [
         run.status === "PLAN_REVIEW_REQUIRED" && plan
-          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'approve-plan')">通过并启动 Worker</button>${revisePanel}`
+          ? `<button type="button" data-run-action="approve-plan" onclick="runAction('${escapeJs(run.run_id)}', 'approve-plan')">通过并启动 Worker</button>${revisePanel}`
           : "",
-        run.status === "REVIEW_RETRYABLE"
-          ? `<button type="button" onclick="runAction('${escapeJs(run.run_id)}', 'retry-review')">重新让 Planner 复核</button>`
+        run.can_retry_review
+          ? `<button type="button" data-run-action="retry-review" onclick="runAction('${escapeJs(run.run_id)}', 'retry-review')">重新让 Planner 复核</button>`
           : ""
       ].filter(Boolean).join(" ");
       const reviewAttempts = (manifest.review_attempts || []).map(attempt => `
@@ -1105,6 +1136,12 @@ INDEX_HTML = """<!doctype html>
 
     function optionalKv(key, value) {
       return value ? kv(key, value) : "";
+    }
+
+    function setActionButtonsDisabled(disabled) {
+      document.querySelectorAll("[data-run-action]").forEach(button => {
+        button.disabled = Boolean(disabled);
+      });
     }
 
     function formatStatus(value) {

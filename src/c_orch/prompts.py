@@ -4,11 +4,21 @@ import json
 from typing import Iterable, Optional
 
 
+PROJECT_CONTEXT_INSTRUCTIONS = """Project context:
+Before planning, reviewing, or editing, inspect the target repo's README and
+relevant docs when they exist. For c-orch itself, read README.md,
+docs/mcp-orchestrator-design.md, and docs/architecture-principles.md first.
+Keep architecture, state semantics, failure handling, and agent
+responsibilities aligned with those docs."""
+
+
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:
     return f"""You are the Planner for c-orch.
 
 You run inside Codex. Do not edit files. Design the plan, acceptance criteria,
 and a self-contained Worker prompt only.
+
+{PROJECT_CONTEXT_INSTRUCTIONS}
 
 Workspace: {cwd}
 Worker model: {worker_model}
@@ -38,6 +48,8 @@ def worker_prompt(*, planner_worker_prompt: str, acceptance_criteria: Iterable[s
 
 You are not alone in this codebase. Do not revert unrelated changes. Keep edits
 inside the assigned task scope and adapt to existing code.
+
+{PROJECT_CONTEXT_INSTRUCTIONS}
 
 Acceptance criteria:
 {criteria}
@@ -70,6 +82,8 @@ def planner_review_prompt(
     test_path_line = f"\nFull test output file: {test_output_path}" if test_output_path else ""
     return f"""You are the Planner reviewing a Worker result for c-orch.
 
+{PROJECT_CONTEXT_INSTRUCTIONS}
+
 Original plan JSON:
 {json.dumps(original_plan_json, ensure_ascii=False, indent=2)}
 
@@ -84,15 +98,19 @@ Full git diff file: {diff_path}
 Verification summary:
 {test_summary}{test_path_line}
 
-Decide whether the Worker satisfies the acceptance criteria. Return exactly one
-JSON object with this shape:
+Decide whether the Worker satisfies the acceptance criteria. There are only two
+business outcomes: accept the work, or request a concrete Worker revision.
+Infrastructure errors are handled by c-orch, not by this JSON contract.
+
+Return exactly one JSON object with this shape:
 {{
-  "decision": "approved|needs_changes|blocked|failed",
+  "decision": "accepted|revision_requested",
   "reason": "Why",
   "next_worker_prompt": null
 }}
 
-If decision is "needs_changes", next_worker_prompt must be a concrete,
+If decision is "accepted", next_worker_prompt must be null.
+If decision is "revision_requested", next_worker_prompt must be a concrete,
 self-contained instruction for the same Worker thread.
 """
 
@@ -101,6 +119,8 @@ def planner_revision_prompt(*, human_feedback: str) -> str:
     return f"""You are the Planner for c-orch.
 
 The human reviewer asked you to revise your previous plan.
+
+{PROJECT_CONTEXT_INSTRUCTIONS}
 
 Human feedback:
 {human_feedback}
@@ -118,4 +138,61 @@ Return exactly one complete JSON plan object with this shape:
   "verification_commands": ["command to run"],
   "risk_notes": ["Risk note"]
 }}
+"""
+
+
+def planner_review_fallback_prompt(
+    *,
+    user_task: str,
+    original_plan_json: dict,
+    acceptance_criteria: Iterable[str],
+    worker_result_json: dict,
+    diff_summary: str,
+    diff_path: str,
+    test_summary: str,
+    test_output_path: Optional[str] = None,
+) -> str:
+    criteria = "\n".join(f"- {item}" for item in acceptance_criteria)
+    test_path_line = f"\nVerification output path: {test_output_path}" if test_output_path else ""
+    return f"""You are a fallback Planner reviewer for c-orch.
+
+The original Planner thread is not recoverable. You are only reviewing the
+saved Worker result. Do not re-plan. Do not edit files.
+
+{PROJECT_CONTEXT_INSTRUCTIONS}
+
+Original user task:
+{user_task}
+
+Approved/original plan JSON:
+{json.dumps(original_plan_json, ensure_ascii=False, indent=2)}
+
+Acceptance criteria:
+{criteria}
+
+Worker result JSON:
+{json.dumps(worker_result_json, ensure_ascii=False, indent=2)}
+
+Git diff summary:
+{diff_summary}
+
+Full git diff file: {diff_path}
+
+Verification summary:
+{test_summary}{test_path_line}
+
+Decide whether the Worker satisfies the acceptance criteria. There are only two
+business outcomes: accept the work, or request a concrete Worker revision.
+Infrastructure errors are handled by c-orch, not by this JSON contract.
+
+Return exactly one JSON object with this shape:
+{{
+  "decision": "accepted|revision_requested",
+  "reason": "Why",
+  "next_worker_prompt": null
+}}
+
+If decision is "accepted", next_worker_prompt must be null.
+If decision is "revision_requested", next_worker_prompt must be a concrete,
+self-contained instruction for the same Worker thread.
 """

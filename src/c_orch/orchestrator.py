@@ -7,8 +7,10 @@ from typing import Any, Iterable, List, Optional, Protocol, Union
 
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver
+from .failure_policy import has_retryable_review_failure, should_start_replacement_agent
 from .prompts import (
     planner_initial_prompt,
+    planner_review_fallback_prompt,
     planner_revision_prompt,
     planner_review_prompt,
     worker_prompt,
@@ -27,16 +29,14 @@ from .states import (
     REVIEW_ATTEMPT_ACTIVE,
     REVIEW_ATTEMPT_FAILED_RETRYABLE,
     RUN_APPROVED,
-    RUN_BLOCKED,
     RUN_FAILED,
-    RUN_NEEDS_CHANGES,
     RUN_PLAN_APPROVED,
     RUN_PLAN_READY,
     RUN_PLAN_REVISING,
     RUN_PLAN_REVIEW_REQUIRED,
     RUN_PLANNING,
-    RUN_REVIEW_RETRYABLE,
     RUN_REVIEWING,
+    RUN_REVISION_REQUESTED,
     RUN_WORK_DONE,
     RUN_WORKING,
     TERMINAL_RUN_STATUSES,
@@ -182,7 +182,7 @@ class RunOrchestrator:
             if decision is None:
                 return manifest
 
-            if decision.decision == "approved":
+            if decision.decision == "accepted":
                 apply_report = self._apply_reviewed_diff(
                     manifest=manifest,
                     worker=worker,
@@ -202,7 +202,7 @@ class RunOrchestrator:
                 self._save(manifest)
                 return manifest
 
-            if decision.decision == "needs_changes":
+            if decision.decision == "revision_requested":
                 if attempt >= self.config.max_attempts:
                     manifest.status = RUN_FAILED
                     manifest.planner.status = RUN_FAILED
@@ -210,8 +210,8 @@ class RunOrchestrator:
                     self._record_terminal_status(manifest, reason="max_attempts_reached")
                     self._save(manifest)
                     return manifest
-                manifest.status = RUN_NEEDS_CHANGES
-                worker.status = RUN_NEEDS_CHANGES
+                manifest.status = RUN_REVISION_REQUESTED
+                worker.status = RUN_REVISION_REQUESTED
                 self._save(manifest)
                 next_worker_prompt = _rework_worker_prompt(
                     decision.next_worker_prompt or "",
@@ -220,18 +220,10 @@ class RunOrchestrator:
                 )
                 continue
 
-            if decision.decision == "blocked":
-                manifest.status = RUN_BLOCKED
-                manifest.planner.status = RUN_BLOCKED
-                worker.status = RUN_BLOCKED
-                self._record_terminal_status(manifest, reason="review_blocked")
-                self._save(manifest)
-                return manifest
-
             manifest.status = RUN_FAILED
             manifest.planner.status = RUN_FAILED
             worker.status = RUN_FAILED
-            self._record_terminal_status(manifest, reason="review_failed")
+            self._record_terminal_status(manifest, reason="unexpected_review_decision")
             self._save(manifest)
             return manifest
 
@@ -249,8 +241,8 @@ class RunOrchestrator:
 
     def retry_review(self, manifest: RunManifest) -> RunManifest:
         worker = _single_worker(manifest)
-        if manifest.status != RUN_REVIEW_RETRYABLE:
-            raise OrchestratorError("run is not waiting for a retryable Planner review")
+        if not has_retryable_review_failure(manifest):
+            raise OrchestratorError("run is not waiting for a saved Planner review retry")
         if manifest.plan is None:
             raise OrchestratorError("cannot retry review without a saved plan")
         if not worker.result:
@@ -277,7 +269,7 @@ class RunOrchestrator:
         )
         if decision is None:
             return manifest
-        if decision.decision == "approved":
+        if decision.decision == "accepted":
             apply_report = self._apply_reviewed_diff(
                 manifest=manifest,
                 worker=worker,
@@ -292,19 +284,12 @@ class RunOrchestrator:
             )
             self._save(manifest)
             return manifest
-        if decision.decision == "needs_changes":
-            return self._continue_after_needs_changes(manifest, worker, plan, decision)
-        if decision.decision == "blocked":
-            manifest.status = RUN_BLOCKED
-            manifest.planner.status = RUN_BLOCKED
-            worker.status = RUN_BLOCKED
-            self._record_terminal_status(manifest, reason="review_blocked")
-            self._save(manifest)
-            return manifest
+        if decision.decision == "revision_requested":
+            return self._continue_after_revision_requested(manifest, worker, plan, decision)
         manifest.status = RUN_FAILED
         manifest.planner.status = RUN_FAILED
         worker.status = RUN_FAILED
-        self._record_terminal_status(manifest, reason="review_failed")
+        self._record_terminal_status(manifest, reason="unexpected_review_decision")
         self._save(manifest)
         return manifest
 
@@ -490,7 +475,40 @@ class RunOrchestrator:
         else:
             if not worker.thread_id:
                 raise OrchestratorError("cannot continue worker without thread_id")
-            result = self.driver.reply(thread_id=worker.thread_id, prompt=prompt)
+            previous_thread_id = worker.thread_id
+            try:
+                result = self.driver.reply(thread_id=previous_thread_id, prompt=prompt)
+            except Exception as exc:
+                if not should_start_replacement_agent(exc):
+                    raise
+                self._record_event(
+                    manifest,
+                    "worker_rework_fallback_started",
+                    "Worker rework fallback started after unrecoverable thread error",
+                    worker_id=worker.id,
+                    old_thread_id=previous_thread_id,
+                    error=str(exc),
+                )
+                result = self.driver.start_session(
+                    role="worker",
+                    model=worker.model,
+                    cwd=worktree_path,
+                    prompt=prompt,
+                    sandbox=self.config.sandbox,
+                    approval_policy=self.config.approval_policy,
+                    reasoning_effort=worker.reasoning_effort,
+                    service_tier=worker.service_tier,
+                )
+                worker.thread_id = result.thread_id
+                self._save(manifest)
+                self._record_event(
+                    manifest,
+                    "worker_rework_fallback_thread_started",
+                    "Worker rework fallback thread started",
+                    worker_id=worker.id,
+                    old_thread_id=previous_thread_id,
+                    new_thread_id=result.thread_id,
+                )
 
         worker_result = WorkerResult.parse(result.content)
         worker.result = dict(worker_result.raw)
@@ -584,24 +602,23 @@ class RunOrchestrator:
         )
 
         try:
-            result = self.driver.reply(
-                thread_id=manifest.planner.thread_id,
-                prompt=planner_review_prompt(
-                    original_plan_json=plan.raw,
-                    worker_result_json=worker_result.raw,
-                    diff_summary=evidence.summary,
-                    diff_path=str(evidence.patch_path),
-                    test_summary=verification.summary,
-                    test_output_path=str(verification.output_path),
-                ),
+            decision = self._request_review_decision(
+                manifest=manifest,
+                plan=plan,
+                worker_result=worker_result,
+                evidence=evidence,
+                verification=verification,
             )
-            decision = ReviewDecision.parse(result.content)
         except Exception as exc:
             attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
             attempt.completed_at = self.store.now_iso()
             attempt.error = str(exc)
-            manifest.status = RUN_REVIEW_RETRYABLE
-            manifest.planner.status = RUN_REVIEW_RETRYABLE
+            manifest.status = RUN_WORK_DONE
+            manifest.planner.status = (
+                RUN_PLAN_APPROVED
+                if manifest.plan and manifest.plan.approval_status in {"approved", "not_required"}
+                else RUN_PLAN_READY
+            )
             worker.status = WORKER_DONE if worker.status == WORKER_DONE else worker.status
             manifest.review = ReviewRecord(evidence_files=evidence_files)
             self._save(manifest)
@@ -626,8 +643,8 @@ class RunOrchestrator:
             next_worker_prompt=decision.next_worker_prompt,
             evidence_files=evidence_files,
         )
-        if decision.decision == "needs_changes":
-            worker.status = RUN_NEEDS_CHANGES
+        if decision.decision == "revision_requested":
+            worker.status = RUN_REVISION_REQUESTED
         self._save(manifest)
         self._record_event(
             manifest,
@@ -638,7 +655,73 @@ class RunOrchestrator:
         )
         return decision
 
-    def _continue_after_needs_changes(
+    def _request_review_decision(
+        self,
+        *,
+        manifest: RunManifest,
+        plan: PlannerPlan,
+        worker_result: WorkerResult,
+        evidence: DiffEvidence,
+        verification: VerificationReport,
+    ) -> ReviewDecision:
+        if not manifest.planner.thread_id:
+            raise OrchestratorError("cannot review without planner thread_id")
+        primary_prompt = planner_review_prompt(
+            original_plan_json=plan.raw,
+            worker_result_json=worker_result.raw,
+            diff_summary=evidence.summary,
+            diff_path=str(evidence.patch_path),
+            test_summary=verification.summary,
+            test_output_path=str(verification.output_path),
+        )
+        previous_thread_id = manifest.planner.thread_id
+        try:
+            result = self.driver.reply(
+                thread_id=previous_thread_id,
+                prompt=primary_prompt,
+            )
+            return ReviewDecision.parse(result.content)
+        except Exception as exc:
+            if not should_start_replacement_agent(exc):
+                raise
+            self._record_event(
+                manifest,
+                "planner_review_fallback_started",
+                "Planner review fallback started after unrecoverable thread error",
+                old_thread_id=previous_thread_id,
+                error=str(exc),
+            )
+            fallback_result = self.driver.start_session(
+                role="planner",
+                model=manifest.planner.model,
+                cwd=manifest.cwd,
+                prompt=planner_review_fallback_prompt(
+                    user_task=manifest.user_task,
+                    original_plan_json=plan.raw,
+                    acceptance_criteria=plan.acceptance_criteria,
+                    worker_result_json=worker_result.raw,
+                    diff_summary=evidence.summary,
+                    diff_path=str(evidence.patch_path),
+                    test_summary=verification.summary,
+                    test_output_path=str(verification.output_path),
+                ),
+                sandbox=self.config.sandbox,
+                approval_policy=self.config.approval_policy,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
+            )
+            manifest.planner.thread_id = fallback_result.thread_id
+            self._save(manifest)
+            self._record_event(
+                manifest,
+                "planner_review_fallback_thread_started",
+                "Planner review fallback thread started",
+                old_thread_id=previous_thread_id,
+                new_thread_id=fallback_result.thread_id,
+            )
+            return ReviewDecision.parse(fallback_result.content)
+
+    def _continue_after_revision_requested(
         self,
         manifest: RunManifest,
         worker: WorkerRecord,
@@ -685,9 +768,9 @@ class RunOrchestrator:
         )
         if next_decision is None:
             return manifest
-        if next_decision.decision == "needs_changes":
-            return self._continue_after_needs_changes(manifest, worker, plan, next_decision)
-        if next_decision.decision == "approved":
+        if next_decision.decision == "revision_requested":
+            return self._continue_after_revision_requested(manifest, worker, plan, next_decision)
+        if next_decision.decision == "accepted":
             apply_report = self._apply_reviewed_diff(
                 manifest=manifest,
                 worker=worker,
@@ -702,16 +785,10 @@ class RunOrchestrator:
             )
             self._save(manifest)
             return manifest
-        if next_decision.decision == "blocked":
-            manifest.status = RUN_BLOCKED
-            manifest.planner.status = RUN_BLOCKED
-            worker.status = RUN_BLOCKED
-            self._record_terminal_status(manifest, reason="review_blocked")
-        else:
-            manifest.status = RUN_FAILED
-            manifest.planner.status = RUN_FAILED
-            worker.status = RUN_FAILED
-            self._record_terminal_status(manifest, reason="review_failed")
+        manifest.status = RUN_FAILED
+        manifest.planner.status = RUN_FAILED
+        worker.status = RUN_FAILED
+        self._record_terminal_status(manifest, reason="unexpected_review_decision")
         self._save(manifest)
         return manifest
 

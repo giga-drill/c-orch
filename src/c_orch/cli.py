@@ -15,12 +15,8 @@ from .settings import (
     SANDBOX_CHOICES,
     SERVICE_TIER_CHOICES,
 )
-from .states import (
-    RUN_FAILED,
-    RUN_PLAN_REVIEW_REQUIRED,
-    RUN_REVIEW_RETRYABLE,
-    TERMINAL_RUN_STATUSES,
-)
+from .failure_policy import has_retryable_review_failure
+from .states import RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED, TERMINAL_RUN_STATUSES
 
 
 def _json_default(value: Any) -> Any:
@@ -570,7 +566,7 @@ def run_resume(args: argparse.Namespace) -> int:
         print("next: rerun resume with --approve-plan or --revise-plan after human review")
         return 0
 
-    if manifest.status == RUN_REVIEW_RETRYABLE and not args.retry_review:
+    if has_retryable_review_failure(manifest) and not args.retry_review:
         _print_run_summary(
             manifest=manifest,
             manifest_path=store.manifest_path(manifest.run_id),

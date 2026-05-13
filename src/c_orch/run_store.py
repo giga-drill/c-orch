@@ -20,6 +20,15 @@ def _list_of_strings(value: Any) -> List[str]:
     return [str(item) for item in value]
 
 
+def _normalized_status(value: Any) -> str:
+    status = str(value)
+    return {
+        "REVIEW_RETRYABLE": "WORK_DONE",
+        "NEEDS_CHANGES": "REVISION_REQUESTED",
+        "BLOCKED": "FAILED",
+    }.get(status, status)
+
+
 @dataclass
 class PlannerRecord:
     model: str
@@ -47,7 +56,7 @@ class PlannerRecord:
             codex_binary_path=data.get("codex_binary_path"),
             reasoning_effort=data.get("reasoning_effort"),
             service_tier=data.get("service_tier"),
-            status=str(data.get("status", "PENDING")),
+            status=_normalized_status(data.get("status", "PENDING")),
         )
 
 
@@ -87,7 +96,7 @@ class WorkerRecord:
             worktree_path=data.get("worktree_path"),
             reasoning_effort=data.get("reasoning_effort"),
             service_tier=data.get("service_tier"),
-            status=str(data.get("status", "PENDING")),
+            status=_normalized_status(data.get("status", "PENDING")),
             attempt=int(data.get("attempt", 1)),
             evidence_files=_list_of_strings(data.get("evidence_files")),
             result=dict(data["result"]) if isinstance(data.get("result"), dict) else None,
@@ -281,7 +290,7 @@ class RunManifest:
             run_id=str(data.get("run_id", "")),
             cwd=str(data.get("cwd", "")),
             user_task=str(data.get("user_task", "")),
-            status=str(data.get("status", "PENDING")),
+            status=_normalized_status(data.get("status", "PENDING")),
             planner=PlannerRecord.from_dict(data.get("planner") or {}),
             workers=[
                 WorkerRecord.from_dict(worker)

@@ -24,13 +24,18 @@ class ContractTests(unittest.TestCase):
                 '{"status":"unknown","summary":"s","changed_files":[],"verification":[],"blockers":[]}'
             )
 
-    def test_needs_changes_requires_prompt(self) -> None:
+    def test_revision_requested_requires_prompt(self) -> None:
         with self.assertRaises(ContractError):
             ReviewDecision.parse(
-                '{"decision":"needs_changes","reason":"r","next_worker_prompt":null}'
+                '{"decision":"revision_requested","reason":"r","next_worker_prompt":null}'
+            )
+
+    def test_accepted_requires_no_worker_prompt(self) -> None:
+        with self.assertRaises(ContractError):
+            ReviewDecision.parse(
+                '{"decision":"accepted","reason":"r","next_worker_prompt":"keep going"}'
             )
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -118,13 +118,15 @@ class ReviewDecision:
         payload = extract_json_object(text)
         require_fields(payload, ["decision", "reason", "next_worker_prompt"])
         decision = _expect_string(payload, "decision")
-        if decision not in {"approved", "needs_changes", "blocked", "failed"}:
-            raise ContractError("review decision must be approved, needs_changes, blocked, or failed")
+        if decision not in {"accepted", "revision_requested"}:
+            raise ContractError("review decision must be accepted or revision_requested")
         next_prompt = payload.get("next_worker_prompt")
         if next_prompt is not None and not isinstance(next_prompt, str):
             raise ContractError("next_worker_prompt must be a string or null")
-        if decision == "needs_changes" and not next_prompt:
-            raise ContractError("needs_changes requires next_worker_prompt")
+        if decision == "accepted" and next_prompt is not None:
+            raise ContractError("accepted requires next_worker_prompt to be null")
+        if decision == "revision_requested" and not next_prompt:
+            raise ContractError("revision_requested requires next_worker_prompt")
         return cls(
             decision=decision,
             reason=_expect_string(payload, "reason"),
@@ -158,4 +160,3 @@ def _string_list(payload: Mapping[str, Any], field: str, required: bool = True) 
     if not all(isinstance(item, str) for item in values):
         raise ContractError(f"{field} must be a list of strings")
     return list(values)
-

@@ -71,7 +71,7 @@ class UiTests(unittest.TestCase):
             manifest.restart_reason = "Touched runtime code"
             manifest.restart_paths = ["src/c_orch/orchestrator.py"]
             manifest.review = ReviewRecord(
-                decision="approved",
+                decision="accepted",
                 reason="looks good",
                 evidence_files=[str(evidence_path)],
             )
@@ -88,7 +88,7 @@ class UiTests(unittest.TestCase):
             self.assertIsNotNone(payload)
             assert payload is not None
             self.assertEqual(payload["manifest"]["run_id"], manifest.run_id)
-            self.assertEqual(payload["run"]["review"]["decision"], "approved")
+            self.assertEqual(payload["run"]["review"]["decision"], "accepted")
             self.assertEqual(payload["run"]["planner"]["reasoning_effort"], "high")
             self.assertEqual(payload["run"]["plan"]["approval_status"], "approved")
             self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
@@ -151,6 +151,11 @@ class UiTests(unittest.TestCase):
         self.assertIn("通过并启动 Worker", INDEX_HTML)
         self.assertIn("让 Planner 重新生成计划", INDEX_HTML)
         self.assertIn("重新让 Planner 复核", INDEX_HTML)
+        self.assertIn("pendingActions", INDEX_HTML)
+        self.assertIn("setActionButtonsDisabled", INDEX_HTML)
+        self.assertIn("data-run-action=\"approve-plan\"", INDEX_HTML)
+        self.assertIn("data-run-action=\"revise-plan\"", INDEX_HTML)
+        self.assertIn("data-run-action=\"retry-review\"", INDEX_HTML)
 
     def test_run_action_revise_plan_passes_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +190,52 @@ class UiTests(unittest.TestCase):
             self.assertEqual(orchestrator.revise_plan.call_count, 1)
             self.assertEqual(orchestrator.revise_plan.call_args.args[1], "Please update the plan")
             driver_cls.assert_called_once()
+
+    def test_run_action_rejects_approve_plan_outside_plan_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/bin/codex",
+            )
+            manifest.status = "WORKING"
+            manifest.plan = PlanRecord(summary="Plan", worker_prompt="Prompt")
+            store.save(manifest)
+
+            with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls:
+                status, payload = _run_action(root / "runs", manifest.run_id, "approve-plan")
+
+            self.assertEqual(int(status), 409)
+            self.assertEqual(payload["status"], "WORKING")
+            self.assertIn("requires PLAN_REVIEW_REQUIRED", payload["error"])
+            driver_cls.assert_not_called()
+
+    def test_run_action_rejects_retry_review_without_saved_failed_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/bin/codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan", worker_prompt="Prompt")
+            store.save(manifest)
+
+            with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls:
+                status, payload = _run_action(root / "runs", manifest.run_id, "retry-review")
+
+            self.assertEqual(int(status), 409)
+            self.assertEqual(payload["status"], "PLAN_REVIEW_REQUIRED")
+            self.assertIn("requires saved failed review evidence", payload["error"])
+            driver_cls.assert_not_called()
 
 
 if __name__ == "__main__":

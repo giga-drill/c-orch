@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from c_orch.codex_session_logs import CodexSessionSnapshot
-from c_orch.drivers import DriverError
-from c_orch.mcp_client import McpTimeoutError
+from c_orch.drivers import DriverError, SessionResult
+from c_orch.mcp_client import McpTimeoutError, McpToolError
 from c_orch.mcp_driver import McpCodexDriver
 
 
@@ -88,6 +88,53 @@ class McpCodexDriverTests(unittest.TestCase):
             ],
         )
 
+    def test_reply_uses_codex_exec_resume_when_mcp_server_lacks_thread(self) -> None:
+        client = FakeMcpClient([])
+        client.error_on_call = McpToolError("Session not found for thread_id: thr_planner")
+        runner = FakeExecResumeRunner(
+            SessionResult(thread_id="thr_planner", content="resumed reply", raw={})
+        )
+        driver = McpCodexDriver(
+            codex_bin="/bin/codex",
+            client=client,
+            exec_resume_runner=runner,
+        )
+
+        result = driver.reply(thread_id="thr_planner", prompt="Continue")
+
+        self.assertEqual(result.thread_id, "thr_planner")
+        self.assertEqual(result.content, "resumed reply")
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "codex-reply",
+                    {
+                        "threadId": "thr_planner",
+                        "prompt": "Continue",
+                    },
+                )
+            ],
+        )
+        self.assertEqual(runner.calls, [("/bin/codex", "thr_planner", "Continue")])
+
+    def test_reply_does_not_resume_for_non_session_not_found_errors(self) -> None:
+        client = FakeMcpClient([])
+        client.error_on_call = McpToolError("permission denied")
+        runner = FakeExecResumeRunner(
+            SessionResult(thread_id="thr_planner", content="resumed reply", raw={})
+        )
+        driver = McpCodexDriver(
+            codex_bin="/bin/codex",
+            client=client,
+            exec_resume_runner=runner,
+        )
+
+        with self.assertRaisesRegex(McpToolError, "permission denied"):
+            driver.reply(thread_id="thr_planner", prompt="Continue")
+
+        self.assertEqual(runner.calls, [])
+
     def test_missing_codex_tool_raises_before_calling_tool(self) -> None:
         client = FakeMcpClient([])
         client.tools = [{"name": "codex"}]
@@ -151,7 +198,7 @@ class McpCodexDriverTests(unittest.TestCase):
                 cwd=Path("/repo"),
                 source="mcp",
                 has_activity_after_started=True,
-                final_content='{"decision":"approved"}',
+                final_content='{"decision":"accepted"}',
                 final_epoch=1.0,
             )
         )
@@ -164,7 +211,7 @@ class McpCodexDriverTests(unittest.TestCase):
         result = driver.reply(thread_id="thr_planner", prompt="Review")
 
         self.assertEqual(result.thread_id, "thr_planner")
-        self.assertEqual(result.content, '{"decision":"approved"}')
+        self.assertEqual(result.content, '{"decision":"accepted"}')
         self.assertFalse(client.closed)
         self.assertEqual(session_logs.calls[0]["thread_id"], "thr_planner")
         self.assertIsNone(session_logs.calls[0]["cwd"])
@@ -175,7 +222,7 @@ class McpCodexDriverTests(unittest.TestCase):
                 {
                     "structuredContent": {
                         "threadId": "thr_planner",
-                        "content": '{"decision":"approved"}',
+                        "content": '{"decision":"accepted"}',
                     }
                 }
             ]
@@ -210,7 +257,7 @@ class McpCodexDriverTests(unittest.TestCase):
 
         self.assertEqual(plan.thread_id, "thr_planner")
         self.assertEqual(plan.content, '{"status":"plan_ready"}')
-        self.assertEqual(review.content, '{"decision":"approved"}')
+        self.assertEqual(review.content, '{"decision":"accepted"}')
         self.assertFalse(client.closed)
         self.assertEqual([call[0] for call in client.calls], ["codex", "codex-reply"])
 
@@ -253,6 +300,7 @@ class FakeMcpClient:
         self.closed = False
         self.timeout_on_call = False
         self.timeout_next_call = False
+        self.error_on_call: Optional[Exception] = None
 
     def start(self) -> None:
         self.started = True
@@ -264,6 +312,8 @@ class FakeMcpClient:
             raise McpTimeoutError("timeout")
         if self.timeout_on_call:
             raise McpTimeoutError("timeout")
+        if self.error_on_call is not None:
+            raise self.error_on_call
         if not self.results:
             raise AssertionError("unexpected tool call")
         return self.results.pop(0)
@@ -298,6 +348,16 @@ class FakeSessionLogStore:
             }
         )
         return self.snapshot
+
+
+class FakeExecResumeRunner:
+    def __init__(self, result: SessionResult) -> None:
+        self.result = result
+        self.calls: List[tuple[str, str, str]] = []
+
+    def __call__(self, codex_bin: str, thread_id: str, prompt: str) -> SessionResult:
+        self.calls.append((codex_bin, thread_id, prompt))
+        return self.result
 
 
 if __name__ == "__main__":

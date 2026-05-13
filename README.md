@@ -10,6 +10,7 @@ and verification evidence, and asks the Planner to approve or request changes.
 ## Current Design
 
 - [MCP-based orchestrator technical design](docs/mcp-orchestrator-design.md)
+- [Architecture principles and state model](docs/architecture-principles.md)
 
 ## Quick Start
 
@@ -124,8 +125,13 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - The target repo must have a committed base ref before `c-orch run` can create
   Worker git worktrees.
 - The current MVP supports one Worker thread with human plan approval before
-  Worker start and retry-on-review after Worker execution.
+  Worker start and retryable review attempts after Worker execution.
+- Planner review has only two business decisions: `accepted` and
+  `revision_requested`. Failure recovery is handled by c-orch separately from
+  the business state machine.
 - Planner/Worker sessions are created through Codex MCP and written into Codex
   session logs with `source=mcp`.
+- Continuing a saved session first tries MCP `codex-reply`; if a fresh MCP
+  server does not know that thread id, c-orch falls back to `codex exec resume`.
 - Thread naming and richer live progress are left for a future Codex App Server
   driver.

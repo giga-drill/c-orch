@@ -86,7 +86,7 @@ class RunStoreTests(unittest.TestCase):
                 approved_by="human",
             )
             manifest.review = ReviewRecord(
-                decision="needs_changes",
+                decision="revision_requested",
                 reason="Missing regression test",
                 next_worker_prompt="Add coverage",
                 evidence_files=["runs/example/evidence/git-diff.patch"],
@@ -130,7 +130,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.plan_revisions[0].human_feedback, "Tighten scope")
             self.assertEqual(loaded.plan_revisions[0].new_plan["summary"], "new")
             self.assertIsNotNone(loaded.review)
-            self.assertEqual(loaded.review.decision, "needs_changes")
+            self.assertEqual(loaded.review.decision, "revision_requested")
             self.assertEqual(
                 loaded.review.evidence_files,
                 ["runs/example/evidence/git-diff.patch"],

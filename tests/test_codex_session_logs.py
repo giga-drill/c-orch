@@ -116,7 +116,7 @@ class CodexSessionLogStoreTests(unittest.TestCase):
                     ),
                     _task_complete(
                         timestamp="2026-05-11T10:22:00.000Z",
-                        message='{"decision":"approved"}',
+                        message='{"decision":"accepted"}',
                     ),
                 ],
             )
@@ -127,7 +127,7 @@ class CodexSessionLogStoreTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(snapshot)
-            self.assertEqual(snapshot.final_content, '{"decision":"approved"}')
+            self.assertEqual(snapshot.final_content, '{"decision":"accepted"}')
 
     def test_load_recent_activity_summarizes_worker_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

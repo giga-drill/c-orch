@@ -67,8 +67,8 @@ User task
   -> c-orch creates Worker Codex thread through codex()
   -> Worker implements and returns result evidence
   -> c-orch sends Worker result to Planner through codex-reply()
-  -> Planner approves, requests changes, blocks, or escalates
-  -> c-orch either finishes, reworks, or fails
+  -> Planner accepts the work or requests a concrete Worker revision
+  -> c-orch either applies, reworks, or records a system failure
 ```
 
 ## 当前实现状态
@@ -79,7 +79,9 @@ User task
 - `McpCodexDriver` 使用 stdlib newline-delimited JSON-RPC 直接调用 `codex mcp-server`，支持 `tools/list`、`codex` 和 `codex-reply`。
 - `RunStore` 保存 `runs/<run_id>/manifest.json`。
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
-- `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`needs_changes` 返工和最大尝试次数。
+- `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
+- `failure_policy.py` 将可恢复异常从业务状态机中拆出。比如 Planner review 的 Codex session 丢失时，run 保持 `WORK_DONE`，review attempt 记录 `FAILED_RETRYABLE`，UI/CLI 再提供重试动作。
+- `McpCodexDriver.reply()` 已验证：fresh MCP server 对旧 session id 调 `codex-reply` 会返回 `Session not found`，但 `codex exec resume <session-id>` 可以恢复同一个磁盘 session。因此 reply 先走 MCP 快路径，遇到 session-not-found 时降级到 CLI resume；CLI resume 也失败后，才交给 failure policy / replacement agent 兜底。
 - `c-orch run --prepare-only` 只建 manifest/worktree，不调用 Codex。
 - `c-orch run` 默认会通过 MCP 创建 Planner Codex session，把方案写入 manifest，然后暂停在 `PLAN_REVIEW_REQUIRED`。
 - `c-orch resume --approve-plan <run_id>` 会标记人类已通过 Planner 方案，然后创建 Worker Codex session。
@@ -96,9 +98,9 @@ User task
 - 解析 Planner 的结构化输出。
 - 创建 Worker thread。
 - 把 Worker 输出、diff、测试摘要发回 Planner。
-- 控制 `approved`、`needs_changes`、`blocked`、`failed` 等状态。
+- 控制 `accepted` / `revision_requested` 这两个 review 业务结果，以及系统层失败恢复。
 - 保存 `runs/<run_id>/manifest.json`。
-- 控制最大返工次数和升级策略。
+- 控制最大返工次数。
 
 它不负责：
 
@@ -117,7 +119,7 @@ Planner 是一个 Codex thread，不是普通 SDK agent。它的职责：
 - 定义验收标准。
 - 生成 Worker prompt。
 - Review Worker 输出。
-- 决定是否通过、返工、阻塞或升级。
+- 决定是否验收通过，或给 Worker 一个具体返工指令。
 
 模型选择：
 
@@ -133,12 +135,12 @@ Worker 也是 Codex thread。它的职责：
 - 执行 Planner 下发的具体任务。
 - 尽量保持改动范围窄。
 - 运行验证命令。
-- 输出变更摘要、验证证据和阻塞点。
+- 输出变更摘要、验证证据和问题说明。
 
 模型选择：
 
 - 默认 `gpt-5.3-codex-spark`。
-- 返工超过阈值时，可升级到更强模型或拆任务。
+- 返工超过阈值时，当前 MVP 进入 `FAILED`；升级模型或拆任务后续再作为明确功能设计。
 
 工作区隔离：
 
@@ -206,7 +208,7 @@ AppServerCodexDriver
 
 ## 状态机
 
-第一版状态：
+当前业务状态：
 
 ```text
 NEW
@@ -217,10 +219,9 @@ PLAN_APPROVED
 WORKING
 WORK_DONE
 REVIEWING
-NEEDS_CHANGES
+REVISION_REQUESTED
 APPROVED
 FAILED
-BLOCKED
 ```
 
 状态转移：
@@ -235,18 +236,28 @@ PLAN_READY -> WORKING
 WORKING -> WORK_DONE
 WORK_DONE -> REVIEWING
 REVIEWING -> APPROVED
-REVIEWING -> NEEDS_CHANGES
-REVIEWING -> BLOCKED
+REVIEWING -> REVISION_REQUESTED
 REVIEWING -> FAILED
-NEEDS_CHANGES -> WORKING
-BLOCKED -> FAILED
+REVISION_REQUESTED -> WORKING
 ```
+
+Planner review 的正常业务输出只允许：
+
+```text
+accepted
+revision_requested
+```
+
+异常恢复不是业务状态。MCP、Codex session、JSON 解析、验证命令或 apply
+失败等系统问题由 c-orch 的 failure policy、review attempts 和 events 记录。
+例如 review 调用失败后，run 回到 `WORK_DONE`，并通过 `FAILED_RETRYABLE`
+review attempt 表示可以重试复核。
 
 返工规则：
 
-- `needs_changes` 后复用同一个 Worker thread，通过 `codex-reply()` 下发返工 prompt。
+- `revision_requested` 后优先复用同一个 Worker session。当前实现先尝试 MCP `codex-reply()`；如果 fresh MCP server 不认识旧 session id，则自动用 `codex exec resume <session-id>` 继续同一个 Codex session。只有 CLI resume 也失败时，才在同一 worktree 中启动 replacement Worker 执行同一个返工 prompt。
 - 默认最多返工 3 次。
-- 超过 3 次后进入 `FAILED` 或 `ESCALATE`，第一版可先实现为 `FAILED` 并要求人工介入。
+- 超过 3 次后进入 `FAILED`。
 
 ## 数据模型
 
@@ -283,7 +294,7 @@ BLOCKED -> FAILED
     "npm test"
   ],
   "review": {
-    "decision": "needs_changes",
+    "decision": "revision_requested",
     "reason": "Missing regression test",
     "next_worker_prompt": "Add a regression test for ...",
     "evidence_files": [
@@ -356,7 +367,7 @@ Planner review 输出必须包含 JSON：
 
 ```json
 {
-  "decision": "approved",
+  "decision": "accepted",
   "reason": "All acceptance criteria are satisfied.",
   "next_worker_prompt": null
 }
@@ -366,7 +377,7 @@ Planner review 输出必须包含 JSON：
 
 ```json
 {
-  "decision": "needs_changes",
+  "decision": "revision_requested",
   "reason": "Missing regression coverage.",
   "next_worker_prompt": "Add regression tests for ..."
 }
@@ -399,7 +410,7 @@ Planner review 输出必须包含 JSON：
 - 当前 git diff 摘要。
 - git diff 详情文件路径，例如 `runs/<run_id>/evidence/git-diff.patch`。
 - 验证命令结果摘要和详情文件路径。
-- 要求输出 `approved`、`needs_changes`、`blocked` 或 `failed`。
+- 要求输出 `accepted` 或 `revision_requested`。异常恢复由 c-orch 处理，不由 Planner review JSON 表达。
 
 证据策略：
 
@@ -511,9 +522,9 @@ MVP 完成时应满足：
 - Planner 能输出 plan、acceptance criteria 和 worker prompt。
 - Worker 能执行任务并输出结构化结果。
 - Worker 默认在独立 worktree 中执行。
-- Planner 能 review Worker 结果并输出 `approved` 或 `needs_changes`。
+- Planner 能 review Worker 结果并输出 `accepted` 或 `revision_requested`。
 - Planner review prompt 包含 git diff 摘要，并能引用完整 diff 文件。
-- `needs_changes` 时总控能复用 Worker thread 返工。
+- `revision_requested` 时总控能复用 Worker thread 返工；Worker thread 丢失时能在同一 worktree 中启动 replacement Worker。
 - 超过最大返工次数时 run 进入失败状态。
 
 ## 风险
