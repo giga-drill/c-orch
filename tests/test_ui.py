@@ -578,6 +578,7 @@ class UiTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         app_source = (root / "web" / "src" / "components" / "App.tsx").read_text(encoding="utf-8")
         client_source = (root / "web" / "src" / "api" / "client.ts").read_text(encoding="utf-8")
+        main_source = (root / "web" / "src" / "main.tsx").read_text(encoding="utf-8")
         query_source = (root / "web" / "src" / "queries.ts").read_text(encoding="utf-8")
 
         self.assertIn("/api/runs", client_source)
@@ -603,7 +604,11 @@ class UiTests(unittest.TestCase):
         self.assertIn("newestFirst", app_source)
         self.assertIn("useMutation", query_source)
         self.assertIn("invalidateQueries", query_source)
+        self.assertIn("refreshDashboardQueries", query_source)
+        self.assertIn("setQueryData(queryKeys.proposals, payload)", query_source)
         self.assertIn("queryKey: [\"run\"]", query_source)
+        self.assertIn("refetchInterval: 1000", main_source)
+        self.assertIn("refetchIntervalInBackground: true", main_source)
 
     def test_fallback_html_explains_missing_frontend_build(self) -> None:
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)

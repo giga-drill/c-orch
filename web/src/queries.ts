@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   fetchProposals,
   fetchQueue,
@@ -18,6 +18,16 @@ export const queryKeys = {
   runs: ["runs"] as const,
   run: (runId: string) => ["run", runId] as const,
 };
+
+function refreshDashboardQueries(queryClient: QueryClient, runId?: string | null) {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.proposals });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.queue });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.runs });
+  void queryClient.invalidateQueries({ queryKey: ["run"] });
+  if (runId) {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.run(runId) });
+  }
+}
 
 export function useQueueQuery() {
   return useQuery({ queryKey: queryKeys.queue, queryFn: fetchQueue });
@@ -51,12 +61,9 @@ export function useRunActionMutation() {
       action: AllowedRunAction;
       payload?: Record<string, unknown>;
     }) => postRunAction(runId, action, payload),
-    onSuccess: async (_payload, variables) => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.run(variables.runId) }),
-      ]);
+    onSuccess: (payload, variables) => {
+      queryClient.setQueryData(queryKeys.run(variables.runId), payload);
+      refreshDashboardQueries(queryClient, variables.runId);
     },
   });
 }
@@ -66,11 +73,9 @@ export function useTaskActionMutation() {
   return useMutation({
     mutationFn: ({ taskId, action }: { taskId: string; action: AllowedTaskAction }) =>
       postTaskAction(taskId, action),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
-      ]);
+    onSuccess: (payload) => {
+      queryClient.setQueryData(queryKeys.queue, payload);
+      refreshDashboardQueries(queryClient);
     },
   });
 }
@@ -79,12 +84,9 @@ export function useQueueActionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ action }: { action: AllowedQueueAction }) => postQueueAction(action),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
-        queryClient.invalidateQueries({ queryKey: ["run"] }),
-      ]);
+    onSuccess: (payload) => {
+      queryClient.setQueryData(queryKeys.queue, payload);
+      refreshDashboardQueries(queryClient);
     },
   });
 }
@@ -93,11 +95,9 @@ export function useCreateProposalMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ title, prompt }: { title: string; prompt: string }) => postProposal(title, prompt),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.proposals }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
-      ]);
+    onSuccess: (payload) => {
+      queryClient.setQueryData(queryKeys.proposals, payload);
+      refreshDashboardQueries(queryClient);
     },
   });
 }
@@ -114,12 +114,10 @@ export function useProposalActionMutation() {
       action: AllowedProposalAction;
       payload?: Record<string, unknown>;
     }) => postProposalAction(proposalId, action, payload),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.proposals }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
-      ]);
+    onSuccess: (payload, variables) => {
+      queryClient.setQueryData(queryKeys.proposals, payload);
+      const proposal = payload.proposals.find((item) => item.proposal_id === variables.proposalId);
+      refreshDashboardQueries(queryClient, proposal?.run_id);
     },
   });
 }

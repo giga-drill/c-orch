@@ -7,8 +7,10 @@ import "./styles.css";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      refetchInterval: 2000,
+      refetchInterval: 1000,
+      refetchIntervalInBackground: true,
       refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
       retry: 1,
     },
   },
