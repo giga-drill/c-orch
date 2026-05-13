@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Protocol, Union
 
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
-from .drivers import CodexDriver
+from .drivers import CodexDriver, SessionResult
 from .failure_policy import has_retryable_review_failure, should_start_replacement_agent
 from .prompts import (
     planner_initial_prompt,
@@ -47,7 +47,11 @@ from .verification import VerificationReport, run_verification_commands
 from .worktrees import (
     ApplyReport,
     DiffEvidence,
+    GitCommitReport,
     apply_diff_evidence_to_repo,
+    collect_repo_changed_paths,
+    collect_repo_staged_paths,
+    commit_applied_changes,
     collect_diff_evidence,
 )
 
@@ -91,6 +95,36 @@ class DiffApplier(Protocol):
         ...
 
 
+class RepoChangedPathsCollector(Protocol):
+    def __call__(self, repo_path: Pathish) -> List[str]:
+        ...
+
+
+class GitCommitter(Protocol):
+    def __call__(
+        self,
+        *,
+        target_repo_path: Pathish,
+        evidence_dir: Pathish,
+        run_id: str,
+        worker_id: str,
+        planner_review_decision: str,
+        user_task: str,
+        plan_summary: Optional[str],
+        review_reason: Optional[str],
+        changed_paths: List[str],
+        pre_apply_changed_paths: List[str],
+        pre_apply_staged_paths: Optional[List[str]] = None,
+        post_apply_changed_paths: Optional[List[str]] = None,
+    ) -> GitCommitReport:
+        ...
+
+
+class RepoStagedPathsCollector(Protocol):
+    def __call__(self, repo_path: Pathish) -> List[str]:
+        ...
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     sandbox: str = DEFAULT_SANDBOX
@@ -110,6 +144,9 @@ class RunOrchestrator:
         driver: CodexDriver,
         evidence_collector: EvidenceCollector = collect_diff_evidence,
         diff_applier: DiffApplier = apply_diff_evidence_to_repo,
+        repo_changed_paths_collector: RepoChangedPathsCollector = collect_repo_changed_paths,
+        repo_staged_paths_collector: RepoStagedPathsCollector = collect_repo_staged_paths,
+        git_committer: GitCommitter = commit_applied_changes,
         verification_runner: VerificationRunner = run_verification_commands,
         config: Optional[OrchestratorConfig] = None,
     ) -> None:
@@ -117,6 +154,9 @@ class RunOrchestrator:
         self.driver = driver
         self.evidence_collector = evidence_collector
         self.diff_applier = diff_applier
+        self.repo_changed_paths_collector = repo_changed_paths_collector
+        self.repo_staged_paths_collector = repo_staged_paths_collector
+        self.git_committer = git_committer
         self.verification_runner = verification_runner
         self.config = config or OrchestratorConfig()
         if self.config.max_attempts < 1:
@@ -183,24 +223,12 @@ class RunOrchestrator:
                 return manifest
 
             if decision.decision == "accepted":
-                apply_report = self._apply_reviewed_diff(
+                return self._complete_after_accepted_review(
                     manifest=manifest,
                     worker=worker,
                     evidence=evidence,
+                    verification=verification,
                 )
-                if apply_report.applied:
-                    manifest.status = RUN_APPROVED
-                    manifest.planner.status = RUN_APPROVED
-                    worker.status = RUN_APPROVED
-                    self._record_terminal_status(manifest)
-                    self._save(manifest)
-                    return manifest
-                manifest.status = RUN_FAILED
-                manifest.planner.status = RUN_FAILED
-                worker.status = RUN_FAILED
-                self._record_terminal_status(manifest, reason="apply_failed")
-                self._save(manifest)
-                return manifest
 
             if decision.decision == "revision_requested":
                 if attempt >= self.config.max_attempts:
@@ -270,20 +298,12 @@ class RunOrchestrator:
         if decision is None:
             return manifest
         if decision.decision == "accepted":
-            apply_report = self._apply_reviewed_diff(
+            return self._complete_after_accepted_review(
                 manifest=manifest,
                 worker=worker,
                 evidence=evidence,
+                verification=verification,
             )
-            manifest.status = RUN_APPROVED if apply_report.applied else RUN_FAILED
-            manifest.planner.status = manifest.status
-            worker.status = manifest.status
-            self._record_terminal_status(
-                manifest,
-                reason=None if apply_report.applied else "apply_failed",
-            )
-            self._save(manifest)
-            return manifest
         if decision.decision == "revision_requested":
             return self._continue_after_revision_requested(manifest, worker, plan, decision)
         manifest.status = RUN_FAILED
@@ -806,20 +826,12 @@ class RunOrchestrator:
         if next_decision.decision == "revision_requested":
             return self._continue_after_revision_requested(manifest, worker, plan, next_decision)
         if next_decision.decision == "accepted":
-            apply_report = self._apply_reviewed_diff(
+            return self._complete_after_accepted_review(
                 manifest=manifest,
                 worker=worker,
                 evidence=evidence,
+                verification=verification,
             )
-            manifest.status = RUN_APPROVED if apply_report.applied else RUN_FAILED
-            manifest.planner.status = manifest.status
-            worker.status = manifest.status
-            self._record_terminal_status(
-                manifest,
-                reason=None if apply_report.applied else "apply_failed",
-            )
-            self._save(manifest)
-            return manifest
         manifest.status = RUN_FAILED
         manifest.planner.status = RUN_FAILED
         worker.status = RUN_FAILED
@@ -920,6 +932,131 @@ class RunOrchestrator:
                 restart_paths=manifest.restart_paths,
             )
         return apply_report
+
+    def _complete_after_accepted_review(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        verification: VerificationReport,
+    ) -> RunManifest:
+        if _verification_has_failures(verification):
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_event(
+                manifest,
+                "verification_gate_failed",
+                "Verification gate failed; refusing apply and commit.",
+                summary=verification.summary,
+            )
+            self._record_terminal_status(manifest, reason="verification_failed")
+            self._save(manifest)
+            return manifest
+
+        pre_apply_changed_paths = self.repo_changed_paths_collector(manifest.cwd)
+        pre_apply_staged_paths = self.repo_staged_paths_collector(manifest.cwd)
+        apply_report = self._apply_reviewed_diff(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+        )
+        if not apply_report.applied:
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_terminal_status(manifest, reason="apply_failed")
+            self._save(manifest)
+            return manifest
+
+        commit_report = self._commit_applied_diff(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+            pre_apply_changed_paths=pre_apply_changed_paths,
+            pre_apply_staged_paths=pre_apply_staged_paths,
+        )
+        if commit_report.failed:
+            manifest.status = RUN_FAILED
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_terminal_status(manifest, reason="git_commit_failed")
+            self._save(manifest)
+            return manifest
+
+        manifest.status = RUN_APPROVED
+        manifest.planner.status = RUN_APPROVED
+        worker.status = RUN_APPROVED
+        self._record_terminal_status(manifest)
+        self._save(manifest)
+        return manifest
+
+    def _commit_applied_diff(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        pre_apply_changed_paths: List[str],
+        pre_apply_staged_paths: List[str],
+    ) -> GitCommitReport:
+        review_decision = "accepted"
+        review_reason: Optional[str] = None
+        if manifest.review is not None:
+            review_decision = manifest.review.decision or "accepted"
+            review_reason = manifest.review.reason
+        commit_report = self.git_committer(
+            target_repo_path=manifest.cwd,
+            evidence_dir=self._attempt_evidence_dir(manifest, worker),
+            run_id=manifest.run_id,
+            worker_id=worker.id,
+            planner_review_decision=review_decision,
+            user_task=manifest.user_task,
+            plan_summary=manifest.plan.summary if manifest.plan is not None else None,
+            review_reason=review_reason,
+            changed_paths=list(evidence.changed_paths),
+            pre_apply_changed_paths=list(pre_apply_changed_paths),
+            pre_apply_staged_paths=list(pre_apply_staged_paths),
+            post_apply_changed_paths=self.repo_changed_paths_collector(manifest.cwd),
+        )
+        worker.evidence_files = _append_unique(worker.evidence_files, commit_report.evidence_files)
+        if manifest.review is not None:
+            manifest.review.evidence_files = _append_unique(
+                manifest.review.evidence_files,
+                commit_report.evidence_files,
+            )
+        self._save(manifest)
+        if commit_report.committed:
+            self._record_event(
+                manifest,
+                "git_commit_completed",
+                "Git commit completed",
+                commit_hash=commit_report.commit_hash,
+                summary=commit_report.summary,
+                message_path=str(commit_report.message_path),
+                output_path=str(commit_report.output_path),
+            )
+        elif commit_report.skipped:
+            self._record_event(
+                manifest,
+                "git_commit_skipped",
+                "Git commit skipped",
+                summary=commit_report.summary,
+                message_path=str(commit_report.message_path),
+                output_path=str(commit_report.output_path),
+            )
+        else:
+            self._record_event(
+                manifest,
+                "git_commit_failed",
+                "Git commit failed",
+                summary=commit_report.summary,
+                reason=commit_report.failure_reason,
+                message_path=str(commit_report.message_path),
+                output_path=str(commit_report.output_path),
+            )
+        return commit_report
 
     def _restart_trigger_paths(self, changed_paths: List[str]) -> List[str]:
         matched: List[str] = []
@@ -1118,3 +1255,9 @@ def _changed_paths_from_patch(patch: str) -> List[str]:
             seen.add(candidate)
             paths.append(candidate)
     return paths
+
+
+def _verification_has_failures(report: VerificationReport) -> bool:
+    if not report.results:
+        return False
+    return any(result.status != "passed" for result in report.results)

@@ -14,7 +14,7 @@ from c_orch.drivers import SessionResult
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import RunStore
 from c_orch.verification import CommandVerification, VerificationReport
-from c_orch.worktrees import ApplyReport, DiffEvidence, create_worker_worktree
+from c_orch.worktrees import ApplyReport, DiffEvidence, GitCommitReport, create_worker_worktree
 
 
 class FakeDriver:
@@ -125,9 +125,46 @@ class FakeVerificationRunner:
         )
 
 
+class FakeFailingVerificationRunner:
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        commands: List[str],
+        *,
+        cwd: str,
+        evidence_dir: Path,
+    ) -> VerificationReport:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        output_path = evidence_dir / "verification-output.txt"
+        output_path.write_text("fake verification failed output\n", encoding="utf-8")
+        self.calls.append(
+            {
+                "commands": list(commands),
+                "cwd": Path(cwd),
+                "evidence_dir": evidence_dir,
+            }
+        )
+        return VerificationReport(
+            summary="1 of 1 verification command(s) failed.",
+            output_path=output_path,
+            results=[
+                CommandVerification(
+                    command=commands[0] if commands else "python -m unittest",
+                    status="failed",
+                    returncode=1,
+                    summary="fake failed",
+                )
+            ],
+        )
+
+
 class FakeDiffApplier:
-    def __init__(self, *, applied: bool = True) -> None:
+    def __init__(self, *, applied: bool = True, materialize_changes: bool = True) -> None:
         self.applied = applied
+        self.materialize_changes = materialize_changes
         self.calls: List[Dict[str, Any]] = []
 
     def __call__(
@@ -147,10 +184,114 @@ class FakeDiffApplier:
                 "evidence_dir": evidence_dir,
             }
         )
+        if self.applied and self.materialize_changes:
+            target_repo = Path(target_repo_path)
+            for relative_path in diff.changed_paths:
+                destination = target_repo / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    destination.write_text(
+                        destination.read_text(encoding="utf-8") + "\n# applied by fake applier\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    destination.write_text("# applied by fake applier\n", encoding="utf-8")
         return ApplyReport(
             applied=self.applied,
             summary="applied" if self.applied else "failed",
             output_path=output_path,
+        )
+
+
+class FakeGitCommitter:
+    def __init__(
+        self,
+        *,
+        status: str = "committed",
+        failure_reason: Optional[str] = None,
+        commit_hash: str = "abc123",
+    ) -> None:
+        self.status = status
+        self.failure_reason = failure_reason
+        self.commit_hash = commit_hash
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        target_repo_path: str,
+        evidence_dir: Path,
+        run_id: str,
+        worker_id: str,
+        planner_review_decision: str,
+        user_task: str,
+        plan_summary: Optional[str],
+        review_reason: Optional[str],
+        changed_paths: List[str],
+        pre_apply_changed_paths: List[str],
+        pre_apply_staged_paths: Optional[List[str]] = None,
+        post_apply_changed_paths: Optional[List[str]] = None,
+    ) -> GitCommitReport:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        message_path = evidence_dir / "git-commit-message.txt"
+        output_path = evidence_dir / "git-commit-output.txt"
+        hash_path = evidence_dir / "git-commit-hash.txt"
+        message_path.write_text(
+            "\n".join(
+                [
+                    "Test commit",
+                    "",
+                    f"Run-ID: {run_id}",
+                    f"Worker-ID: {worker_id}",
+                    "Planner-Review: accepted",
+                    f"Task: {(user_task.splitlines() or [''])[0]}",
+                    f"Plan-Summary: {plan_summary or 'n/a'}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        output_path.write_text("fake git commit output\n", encoding="utf-8")
+        self.calls.append(
+            {
+                "target_repo_path": target_repo_path,
+                "evidence_dir": evidence_dir,
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "planner_review_decision": planner_review_decision,
+                "user_task": user_task,
+                "plan_summary": plan_summary,
+                "review_reason": review_reason,
+                "changed_paths": list(changed_paths),
+                "pre_apply_changed_paths": list(pre_apply_changed_paths),
+                "pre_apply_staged_paths": list(pre_apply_staged_paths or []),
+                "post_apply_changed_paths": list(post_apply_changed_paths or []),
+            }
+        )
+        if self.status == "committed":
+            hash_path.write_text(f"{self.commit_hash}\n", encoding="utf-8")
+            return GitCommitReport(
+                status="committed",
+                summary="Committed applied changes.",
+                output_path=output_path,
+                message_path=message_path,
+                commit_hash=self.commit_hash,
+                hash_path=hash_path,
+            )
+        if self.status == "skipped":
+            return GitCommitReport(
+                status="skipped",
+                summary="Skipped: no staged changes after git add.",
+                output_path=output_path,
+                message_path=message_path,
+            )
+        return GitCommitReport(
+            status="failed",
+            summary="Failed: git commit returned a non-zero exit code.",
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason=self.failure_reason or "git_commit_failed",
         )
 
 
@@ -385,25 +526,37 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "accepted")
-            self.assertEqual(len(result.review.evidence_files), 4)
+            self.assertEqual(len(result.review.evidence_files), 7)
             self.assertEqual(result.review_attempts[0].workspace_path, str(worktree))
             self.assertEqual(result.review_attempts[0].worker_attempt, 1)
-            self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+            self.assertIn("git-commit-hash.txt", result.review.evidence_files[-1])
             self.assertFalse(result.requires_restart)
             self.assertIsNone(result.restart_reason)
             self.assertEqual(result.restart_paths, [])
-            self.assertEqual(len(result.workers[0].evidence_files), 4)
+            self.assertEqual(len(result.workers[0].evidence_files), 7)
             self.assertEqual(len(applier.calls), 1)
             self.assertEqual(applier.calls[0]["target_repo_path"], Path(manifest.cwd))
             self.assertEqual(
                 applier.calls[0]["evidence_dir"],
                 store.run_dir(manifest.run_id) / "evidence" / "attempt-1",
             )
+            commit_message_path = Path(
+                next(
+                    path
+                    for path in result.review.evidence_files
+                    if path.endswith("git-commit-message.txt")
+                )
+            )
+            commit_message = commit_message_path.read_text(encoding="utf-8")
+            self.assertIn(f"Run-ID: {manifest.run_id}", commit_message)
+            self.assertIn("Worker-ID: worker-1", commit_message)
+            self.assertIn("Planner-Review: accepted", commit_message)
+            self.assertIn("Plan-Summary: Plan it", commit_message)
 
             loaded = store.load(manifest.run_id)
             self.assertEqual(loaded.status, "APPROVED")
             self.assertEqual(loaded.review.decision, "accepted")
-            self.assertEqual(len(loaded.review.evidence_files), 4)
+            self.assertEqual(len(loaded.review.evidence_files), 7)
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
             self.assertEqual(loaded.restart_paths, [])
@@ -421,6 +574,7 @@ class OrchestratorTests(unittest.TestCase):
                     "planner_review_start",
                     "planner_review_completed",
                     "apply_completed",
+                    "git_commit_completed",
                     "run_terminal_status",
                 ],
             )
@@ -429,7 +583,8 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[3]["status"], "DONE")
             self.assertEqual(events[7]["decision"], "accepted")
             self.assertTrue(events[8]["applied"])
-            self.assertEqual(events[9]["status"], "APPROVED")
+            self.assertEqual(events[9]["commit_hash"], _git(Path(manifest.cwd), ["rev-parse", "HEAD"]).strip())
+            self.assertEqual(events[10]["status"], "APPROVED")
 
     def test_plan_review_required_pauses_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -635,9 +790,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("attempt-1", result.review_attempts[0].evidence_files[0])
             self.assertIn("attempt-2", result.review_attempts[1].evidence_files[0])
             self.assertEqual(len(verification.calls), 2)
-            self.assertEqual(len(result.workers[0].evidence_files), 7)
+            self.assertEqual(len(result.workers[0].evidence_files), 10)
             self.assertEqual(len(applier.calls), 1)
-            self.assertIn("git-apply-output.txt", result.review.evidence_files[-1])
+            self.assertIn("git-commit-hash.txt", result.review.evidence_files[-1])
 
     def test_revision_requested_falls_back_to_new_worker_when_thread_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -732,7 +887,12 @@ class OrchestratorTests(unittest.TestCase):
                 "self.assertEqual(subtract(5, 3), 2)",
                 (repo / "tests" / "test_calculator.py").read_text(encoding="utf-8"),
             )
-            self.assertIn("M calculator.py", _git(repo, ["status", "--short"]))
+            self.assertEqual(_git(repo, ["status", "--short"]).strip(), "")
+            self.assertEqual(_git(repo, ["rev-list", "--count", "HEAD"]).strip(), "2")
+            latest_message = _git(repo, ["log", "-1", "--pretty=%B"])
+            self.assertIn(f"Run-ID: {manifest.run_id}", latest_message)
+            self.assertIn("Worker-ID: worker-1", latest_message)
+            self.assertIn("Planner-Review: accepted", latest_message)
             verification = subprocess.run(
                 _retry_e2e_verification_command(),
                 cwd=repo,
@@ -765,6 +925,7 @@ class OrchestratorTests(unittest.TestCase):
                     "planner_review_start",
                     "planner_review_completed",
                     "apply_completed",
+                    "git_commit_completed",
                     "run_terminal_status",
                 ],
             )
@@ -798,12 +959,14 @@ class OrchestratorTests(unittest.TestCase):
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
             applier = FakeDiffApplier()
+            committer = FakeGitCommitter()
 
             result = RunOrchestrator(
                 store=store,
                 driver=driver,
                 evidence_collector=evidence,
                 diff_applier=applier,
+                git_committer=committer,
                 verification_runner=verification,
                 config=OrchestratorConfig(max_attempts=1),
             ).run(manifest)
@@ -819,6 +982,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "revision_requested")
             self.assertEqual(len(applier.calls), 0)
+            self.assertEqual(len(committer.calls), 0)
 
             events = store.load_events(manifest.run_id)
             self.assertEqual(events[-1]["type"], "run_terminal_status")
@@ -870,6 +1034,110 @@ class OrchestratorTests(unittest.TestCase):
             self.assertFalse(result.requires_restart)
             self.assertIsNone(result.restart_reason)
             self.assertEqual(result.restart_paths, [])
+
+    def test_accepted_review_with_failed_verification_fails_without_apply_or_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            evidence = FakeEvidenceCollector()
+            verification = FakeFailingVerificationRunner()
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                git_committer=committer,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(result.planner.status, "FAILED")
+            self.assertEqual(result.workers[0].status, "FAILED")
+            self.assertEqual(len(applier.calls), 0)
+            self.assertEqual(len(committer.calls), 0)
+            events = store.load_events(manifest.run_id)
+            self.assertIn("verification_gate_failed", [event["type"] for event in events])
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["reason"], "verification_failed")
+
+    def test_commit_failure_after_apply_marks_run_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            evidence = FakeEvidenceCollector()
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter(status="failed", failure_reason="git_commit_failed")
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                git_committer=committer,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(result.planner.status, "FAILED")
+            self.assertEqual(result.workers[0].status, "FAILED")
+            self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(len(committer.calls), 1)
+            events = store.load_events(manifest.run_id)
+            self.assertIn("git_commit_failed", [event["type"] for event in events])
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["reason"], "git_commit_failed")
+
+    def test_commit_skip_after_apply_keeps_run_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            evidence = FakeEvidenceCollector(changed_paths=[])
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier(applied=True, materialize_changes=False)
+            committer = FakeGitCommitter(status="skipped")
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                git_committer=committer,
+                verification_runner=verification,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(result.planner.status, "APPROVED")
+            self.assertEqual(result.workers[0].status, "APPROVED")
+            self.assertEqual(len(committer.calls), 1)
+            events = store.load_events(manifest.run_id)
+            self.assertIn("git_commit_skipped", [event["type"] for event in events])
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "APPROVED")
 
     def test_self_modification_marks_restart_required_after_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1169,6 +1437,12 @@ def _create_manifest(root: Path):
     store = RunStore(root / "runs")
     repo = root / "repo"
     repo.mkdir()
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo, ["init"])
+    _git(repo, ["config", "user.email", "c-orch-test@example.com"])
+    _git(repo, ["config", "user.name", "c-orch test"])
+    _git(repo, ["add", "."])
+    _git(repo, ["commit", "-m", "initial"])
     worktree = root / "worktrees" / "run" / "worker-1"
     worktree.mkdir(parents=True)
     manifest = store.create_run(

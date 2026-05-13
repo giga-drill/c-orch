@@ -34,6 +34,36 @@ class ApplyReport:
         return [str(self.output_path)]
 
 
+@dataclass(frozen=True)
+class GitCommitReport:
+    status: str
+    summary: str
+    output_path: Path
+    message_path: Path
+    commit_hash: Optional[str] = None
+    hash_path: Optional[Path] = None
+    failure_reason: Optional[str] = None
+
+    @property
+    def committed(self) -> bool:
+        return self.status == "committed"
+
+    @property
+    def skipped(self) -> bool:
+        return self.status == "skipped"
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
+    @property
+    def evidence_files(self) -> List[str]:
+        files = [str(self.message_path), str(self.output_path)]
+        if self.hash_path is not None:
+            files.append(str(self.hash_path))
+        return files
+
+
 def worker_worktree_path(worktrees_dir: Pathish, run_id: str, worker_id: str) -> Path:
     _validate_path_component(run_id, "run_id")
     _validate_path_component(worker_id, "worker_id")
@@ -151,6 +181,290 @@ def apply_diff_evidence_to_repo(
         applied=applied,
         summary=summary,
         output_path=output_path,
+    )
+
+
+def collect_repo_changed_paths(repo_path: Pathish) -> List[str]:
+    repo = Path(repo_path).expanduser().resolve()
+    tracked = _git_z(["diff", "--name-only", "-z", "HEAD", "--"], cwd=repo)
+    untracked = _git_z(["ls-files", "--others", "--exclude-standard", "-z"], cwd=repo)
+    return sorted(_normalize_path_set([*tracked, *untracked]))
+
+
+def collect_repo_staged_paths(repo_path: Pathish) -> List[str]:
+    repo = Path(repo_path).expanduser().resolve()
+    return sorted(_normalize_path_set(_git_z(["diff", "--cached", "--name-only", "-z", "--"], cwd=repo)))
+
+
+def commit_applied_changes(
+    *,
+    target_repo_path: Pathish,
+    evidence_dir: Pathish,
+    run_id: str,
+    worker_id: str,
+    planner_review_decision: str,
+    user_task: str,
+    plan_summary: Optional[str],
+    review_reason: Optional[str],
+    changed_paths: Sequence[str],
+    pre_apply_changed_paths: Sequence[str],
+    pre_apply_staged_paths: Optional[Sequence[str]] = None,
+    post_apply_changed_paths: Optional[Sequence[str]] = None,
+) -> GitCommitReport:
+    target_repo = Path(target_repo_path).expanduser().resolve()
+    output_dir = Path(evidence_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    message_path = output_dir / "git-commit-message.txt"
+    output_path = output_dir / "git-commit-output.txt"
+    hash_path = output_dir / "git-commit-hash.txt"
+
+    commit_message = _build_commit_message(
+        run_id=run_id,
+        worker_id=worker_id,
+        planner_review_decision=planner_review_decision,
+        user_task=user_task,
+        plan_summary=plan_summary,
+        review_reason=review_reason,
+    )
+    message_path.write_text(commit_message, encoding="utf-8")
+
+    planned_paths = _normalize_path_set(changed_paths)
+    preexisting_paths = _normalize_path_set(pre_apply_changed_paths)
+    preexisting_staged_paths = _normalize_path_set(
+        pre_apply_staged_paths
+        if pre_apply_staged_paths is not None
+        else collect_repo_staged_paths(target_repo)
+    )
+    post_paths = _normalize_path_set(
+        post_apply_changed_paths
+        if post_apply_changed_paths is not None
+        else collect_repo_changed_paths(target_repo)
+    )
+
+    if planner_review_decision != "accepted":
+        summary = "Failed: commit is only allowed for accepted Planner review decisions."
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="invalid_review_decision",
+        )
+
+    if preexisting_staged_paths:
+        summary = (
+            "Failed: repository has preexisting staged changes before commit. "
+            "Refusing to commit mixed staged state."
+        )
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="preexisting_staged_changes",
+        )
+
+    overlapping_paths = sorted(planned_paths & preexisting_paths)
+    if overlapping_paths:
+        summary = (
+            "Failed: preexisting repository changes overlap with applied patch paths. "
+            "Refusing to commit mixed provenance."
+        )
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+                overlapping_paths=overlapping_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="preexisting_overlap",
+        )
+
+    unexpected_paths = sorted(post_paths - preexisting_paths - planned_paths)
+    if unexpected_paths:
+        summary = (
+            "Failed: detected changed paths that are neither preexisting nor part of the "
+            "applied patch."
+        )
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+                unexpected_paths=unexpected_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="unexpected_paths_after_apply",
+        )
+
+    stage_paths = sorted(path for path in planned_paths if path in post_paths)
+    if not stage_paths:
+        summary = "Skipped: apply succeeded but there are no commit-worthy changes in planned paths."
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="skipped",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+        )
+
+    add_result = _git_process(["add", "--", *stage_paths], cwd=target_repo)
+    if add_result.returncode != 0:
+        summary = "Failed: git add returned a non-zero exit code."
+        output_path.write_text(
+            _format_git_commit_execution_output(
+                target_repo=target_repo,
+                summary=summary,
+                add_result=add_result,
+                commit_result=None,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="git_add_failed",
+        )
+
+    staged_paths = _git_z(["diff", "--cached", "--name-only", "-z", "--"], cwd=target_repo)
+    staged_path_set = _normalize_path_set(staged_paths)
+    unexpected_staged_paths = sorted(staged_path_set - planned_paths)
+    if unexpected_staged_paths:
+        summary = (
+            "Failed: staged paths include files outside planned patch paths before commit."
+        )
+        output_path.write_text(
+            _format_git_commit_precheck_output(
+                target_repo=target_repo,
+                summary=summary,
+                planned_paths=planned_paths,
+                preexisting_paths=preexisting_paths,
+                preexisting_staged_paths=preexisting_staged_paths,
+                post_paths=post_paths,
+                post_add_staged_paths=staged_path_set,
+                unexpected_staged_paths=unexpected_staged_paths,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="staged_paths_outside_planned",
+        )
+
+    if not staged_paths:
+        summary = "Skipped: no staged changes after git add."
+        output_path.write_text(
+            _format_git_commit_execution_output(
+                target_repo=target_repo,
+                summary=summary,
+                add_result=add_result,
+                commit_result=None,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="skipped",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+        )
+
+    commit_result = _git_process(["commit", "-F", str(message_path)], cwd=target_repo)
+    if commit_result.returncode != 0:
+        summary = "Failed: git commit returned a non-zero exit code."
+        output_path.write_text(
+            _format_git_commit_execution_output(
+                target_repo=target_repo,
+                summary=summary,
+                add_result=add_result,
+                commit_result=commit_result,
+            ),
+            encoding="utf-8",
+        )
+        return GitCommitReport(
+            status="failed",
+            summary=summary,
+            output_path=output_path,
+            message_path=message_path,
+            failure_reason="git_commit_failed",
+        )
+
+    commit_hash = _git(["rev-parse", "HEAD"], cwd=target_repo).strip()
+    hash_path.write_text(f"{commit_hash}\n", encoding="utf-8")
+    summary = "Committed applied changes."
+    output_path.write_text(
+        _format_git_commit_execution_output(
+            target_repo=target_repo,
+            summary=summary,
+            add_result=add_result,
+            commit_result=commit_result,
+        ),
+        encoding="utf-8",
+    )
+    return GitCommitReport(
+        status="committed",
+        summary=summary,
+        output_path=output_path,
+        message_path=message_path,
+        commit_hash=commit_hash,
+        hash_path=hash_path,
     )
 
 
@@ -294,3 +608,140 @@ def _is_empty_patch_failure(result: subprocess.CompletedProcess[str]) -> bool:
         [result.stdout or "", result.stderr or ""]
     )
     return "No valid patches in input" in combined
+
+
+def _normalize_path_set(paths: Sequence[str]) -> set[str]:
+    return {
+        _normalize_repo_path(path)
+        for path in paths
+        if _normalize_repo_path(path)
+    }
+
+
+def _normalize_repo_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip()
+
+
+def _build_commit_message(
+    *,
+    run_id: str,
+    worker_id: str,
+    planner_review_decision: str,
+    user_task: str,
+    plan_summary: Optional[str],
+    review_reason: Optional[str],
+) -> str:
+    headline_source = (plan_summary or _first_nonempty_line(user_task) or "Apply reviewed worker patch").strip()
+    headline = _truncate_line(headline_source, 72)
+    task_line = _truncate_line(_first_nonempty_line(user_task) or headline_source, 120)
+    summary_line = _truncate_line((plan_summary or headline_source).strip(), 120)
+    lines = [
+        headline,
+        "",
+        f"Run-ID: {run_id}",
+        f"Worker-ID: {worker_id}",
+        f"Planner-Review: {planner_review_decision}",
+        f"Task: {task_line}",
+        f"Plan-Summary: {summary_line}",
+    ]
+    if review_reason:
+        lines.append(f"Review-Reason: {_truncate_line(review_reason.strip(), 160)}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    return ""
+
+
+def _truncate_line(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(limit - 3, 1)].rstrip() + "..."
+
+
+def _format_git_commit_precheck_output(
+    *,
+    target_repo: Path,
+    summary: str,
+    planned_paths: set[str],
+    preexisting_paths: set[str],
+    preexisting_staged_paths: set[str],
+    post_paths: set[str],
+    overlapping_paths: Optional[List[str]] = None,
+    unexpected_paths: Optional[List[str]] = None,
+    post_add_staged_paths: Optional[set[str]] = None,
+    unexpected_staged_paths: Optional[List[str]] = None,
+) -> str:
+    lines = [
+        "# Git commit output",
+        "",
+        f"Summary: {summary}",
+        f"Target repo: {target_repo}",
+        "",
+        "Planned paths:",
+        *(sorted(planned_paths) or ["(none)"]),
+        "",
+        "Pre-apply changed paths:",
+        *(sorted(preexisting_paths) or ["(none)"]),
+        "",
+        "Pre-apply staged paths:",
+        *(sorted(preexisting_staged_paths) or ["(none)"]),
+        "",
+        "Post-apply changed paths:",
+        *(sorted(post_paths) or ["(none)"]),
+    ]
+    if overlapping_paths is not None:
+        lines.extend(["", "Overlapping paths:", *(overlapping_paths or ["(none)"])])
+    if unexpected_paths is not None:
+        lines.extend(["", "Unexpected paths:", *(unexpected_paths or ["(none)"])])
+    if post_add_staged_paths is not None:
+        lines.extend(["", "Staged paths before commit:", *(sorted(post_add_staged_paths) or ["(none)"])])
+    if unexpected_staged_paths is not None:
+        lines.extend(
+            [
+                "",
+                "Unexpected staged paths:",
+                *(unexpected_staged_paths or ["(none)"]),
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_git_commit_execution_output(
+    *,
+    target_repo: Path,
+    summary: str,
+    add_result: subprocess.CompletedProcess[str],
+    commit_result: Optional[subprocess.CompletedProcess[str]],
+) -> str:
+    lines = [
+        "# Git commit output",
+        "",
+        f"Summary: {summary}",
+        f"Target repo: {target_repo}",
+        "",
+    ]
+    lines.extend(
+        _format_command_result(
+            command=["add", "--"],
+            cwd=target_repo,
+            result=add_result,
+        )
+    )
+    if commit_result is not None:
+        lines.append("")
+        lines.extend(
+            _format_command_result(
+                command=["commit", "-F", "<message-file>"],
+                cwd=target_repo,
+                result=commit_result,
+            )
+        )
+    return "\n".join(lines).rstrip() + "\n"
