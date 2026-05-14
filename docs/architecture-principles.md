@@ -46,6 +46,13 @@ For self-modifying runs, `c-orch supervise-ui` is the preferred wrapper around
 the dashboard server. The supervisor owns process restart, while the restarted
 backend still owns clearing the restart gate through the normal queue action.
 
+Worker worktrees isolate code changes, not package caches. Verification must run
+inside the worker worktree, but dependency setup should follow the target
+workspace's lockfile and package manager. For the bundled dashboard frontend,
+`web/pnpm-lock.yaml` is the source of truth: c-orch may prepare the worker
+worktree with `pnpm --dir web install --frozen-lockfile`, which reuses pnpm's
+content-addressed store instead of copying the main checkout's `node_modules`.
+
 Planner and Worker own semantic work:
 
 - Planner designs plans, acceptance criteria, Worker instructions, and review

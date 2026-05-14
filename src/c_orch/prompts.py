@@ -9,7 +9,11 @@ Before planning, reviewing, or editing, inspect the target repo's README and
 relevant docs when they exist. For c-orch itself, read README.md,
 docs/mcp-orchestrator-design.md, and docs/architecture-principles.md first.
 Keep architecture, state semantics, failure handling, and agent
-responsibilities aligned with those docs."""
+responsibilities aligned with those docs.
+
+Choose verification commands from the target workspace's lockfiles. If a web
+frontend has pnpm-lock.yaml, use pnpm commands such as
+`pnpm --dir web run typecheck` and `pnpm --dir web run build` instead of npm."""
 
 
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:

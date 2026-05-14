@@ -806,7 +806,7 @@ class UiTests(unittest.TestCase):
 
     def test_fallback_html_explains_missing_frontend_build(self) -> None:
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)
-        self.assertIn("npm --prefix web run build", FALLBACK_INDEX_HTML)
+        self.assertIn("pnpm --dir web run build", FALLBACK_INDEX_HTML)
 
     def test_dashboard_server_serves_root_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from c_orch.verification import run_verification_commands
 
@@ -47,6 +49,77 @@ class VerificationTests(unittest.TestCase):
 
             self.assertEqual(report.summary, "No verification commands configured.")
             self.assertEqual(report.results, [])
+
+    def test_pnpm_frontend_setup_runs_before_web_package_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            web = root / "web"
+            web.mkdir()
+            (web / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+            (web / "package.json").write_text(
+                '{"scripts":{"typecheck":"printf typeok"}}\n',
+                encoding="utf-8",
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            pnpm = bin_dir / "pnpm"
+            pnpm.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" > pnpm-called.txt\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            pnpm.chmod(0o755)
+
+            with patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+                report = run_verification_commands(
+                    ["cd web && npm run typecheck"],
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                )
+
+            self.assertEqual(report.summary, "All 1 verification command(s) passed.")
+            self.assertEqual(report.results[0].command, "cd web && npm run typecheck")
+            self.assertEqual((root / "pnpm-called.txt").read_text(encoding="utf-8").strip(), "--dir web install --frozen-lockfile")
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("$ pnpm --dir web install --frozen-lockfile", output)
+            self.assertIn("$ cd web && npm run typecheck", output)
+            self.assertIn("typeok", output)
+
+    def test_pnpm_frontend_setup_failure_stops_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            web = root / "web"
+            web.mkdir()
+            (web / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+            (web / "package.json").write_text(
+                '{"scripts":{"typecheck":"printf should-not-run"}}\n',
+                encoding="utf-8",
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            pnpm = bin_dir / "pnpm"
+            pnpm.write_text(
+                "#!/bin/sh\n"
+                "echo setup failed >&2\n"
+                "exit 42\n",
+                encoding="utf-8",
+            )
+            pnpm.chmod(0o755)
+
+            with patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+                report = run_verification_commands(
+                    ["cd web && npm run typecheck"],
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                )
+
+            self.assertEqual(report.summary, "Frontend dependency setup failed.")
+            self.assertEqual(report.results[0].command, "pnpm --dir web install --frozen-lockfile")
+            self.assertEqual(report.results[0].returncode, 42)
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("setup failed", output)
+            self.assertNotIn("should-not-run", output)
 
 
 if __name__ == "__main__":

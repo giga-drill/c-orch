@@ -48,12 +48,27 @@ def run_verification_commands(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "verification-output.txt"
 
+    command_list = [command.strip() for command in commands if command.strip()]
     results: List[CommandVerification] = []
     log_sections: List[str] = []
-    for command in commands:
-        command = command.strip()
-        if not command:
-            continue
+
+    setup = _run_frontend_dependency_setup(
+        worktree=worktree,
+        commands=command_list,
+        timeout_seconds=timeout_seconds,
+    )
+    if setup is not None:
+        setup_result, setup_log = setup
+        log_sections.append(setup_log)
+        if setup_result.status != "passed":
+            output_path.write_text("\n\n".join(log_sections) + "\n", encoding="utf-8")
+            return VerificationReport(
+                summary="Frontend dependency setup failed.",
+                output_path=output_path,
+                results=[setup_result],
+            )
+
+    for command in command_list:
         result, log = _run_one_command(
             command,
             cwd=worktree,
@@ -83,6 +98,43 @@ def run_verification_commands(
         output_path=output_path,
         results=results,
     )
+
+
+def _run_frontend_dependency_setup(
+    *,
+    worktree: Path,
+    commands: List[str],
+    timeout_seconds: float,
+) -> Optional[tuple[CommandVerification, str]]:
+    if not _needs_frontend_dependency_setup(worktree=worktree, commands=commands):
+        return None
+    return _run_one_command(
+        "pnpm --dir web install --frozen-lockfile",
+        cwd=worktree,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _needs_frontend_dependency_setup(*, worktree: Path, commands: List[str]) -> bool:
+    if not commands:
+        return False
+    if not (worktree / "web" / "pnpm-lock.yaml").is_file():
+        return False
+    return any(_looks_like_web_package_command(command) for command in commands)
+
+
+def _looks_like_web_package_command(command: str) -> bool:
+    normalized = " ".join(command.split())
+    markers = (
+        "cd web && npm run ",
+        "cd web && pnpm run ",
+        "npm --prefix web run ",
+        "npm --prefix=web run ",
+        "pnpm --dir web run ",
+        "pnpm --dir=web run ",
+        "pnpm -C web run ",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _run_one_command(

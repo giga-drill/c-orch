@@ -25,7 +25,7 @@ FALLBACK_INDEX_HTML = """<!doctype html>
 <body>
   <main style="font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 48px auto; padding: 0 20px;">
     <h1>c-orch 前端还没有构建</h1>
-    <p>请先在项目根目录运行 <code>npm --prefix web install</code> 和 <code>npm --prefix web run build</code>，然后刷新页面。</p>
+    <p>请先在项目根目录运行 <code>pnpm --dir web install --frozen-lockfile</code> 和 <code>pnpm --dir web run build</code>，然后刷新页面。</p>
   </main>
 </body>
 </html>
