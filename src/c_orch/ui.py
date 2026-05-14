@@ -146,7 +146,7 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
                 return
             action = data.get("action")
             if path == "/api/proposals":
-                result = runtime.create_proposal(data.get("title"), data.get("prompt"))
+                result = runtime.create_proposal(data.get("title"), data.get("prompt"), data.get("cwd"))
             elif path == queue_actions_path:
                 confirmed_by = data.get("confirmed_by")
                 if not isinstance(confirmed_by, str) or not confirmed_by.strip():

@@ -154,7 +154,7 @@ class COrchRuntime:
                 self.dispatch_queue_async()
             return self._attach_state(result)
 
-    def create_proposal(self, title: Any, prompt: Any) -> RunActionResponse:
+    def create_proposal(self, title: Any, prompt: Any, cwd: Any = None) -> RunActionResponse:
         with self._action_lock:
             if self.proposals_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
@@ -164,6 +164,7 @@ class COrchRuntime:
                 self.proposals_path,
                 title,
                 prompt,
+                cwd,
                 runs_dir=self.runs_dir,
                 config=self._scheduler_config,
                 driver_factory=self._driver_context,
@@ -468,6 +469,7 @@ def create_proposal(
     proposals_path: Pathish,
     title: Any,
     prompt: Any,
+    cwd: Any = None,
     *,
     runs_dir: Pathish,
     config: SchedulerConfig,
@@ -478,11 +480,20 @@ def create_proposal(
         return HTTPStatus.BAD_REQUEST, {"error": "title is required"}
     if not isinstance(prompt, str) or not prompt.strip():
         return HTTPStatus.BAD_REQUEST, {"error": "prompt is required"}
+    try:
+        proposal_cwd = _resolve_task_cwd(cwd, default_cwd=config.cwd)
+    except ValueError as exc:
+        return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
 
     proposals_file = Path(proposals_path).expanduser().resolve()
     proposal_store = ProposalStore(proposals_file)
     pool = proposal_store.load_or_create()
-    proposal = proposal_store.add_proposal(pool, title=title.strip(), prompt=prompt.strip())
+    proposal = proposal_store.add_proposal(
+        pool,
+        title=title.strip(),
+        prompt=prompt.strip(),
+        cwd=str(proposal_cwd),
+    )
     proposal_store.save(pool)
 
     run_store = RunStore(Path(runs_dir).expanduser().resolve())
@@ -491,6 +502,7 @@ def create_proposal(
             run_store=run_store,
             config=config,
             user_task=proposal.prompt,
+            task_cwd=proposal_cwd,
             worktree_factory=worktree_factory,
         )
         proposal_store.update_proposal(pool, proposal.proposal_id, run_id=manifest.run_id)
@@ -534,8 +546,8 @@ def create_proposal(
     payload["transition"] = {
         "type": "proposal_created",
         "proposal_id": proposal.proposal_id,
-        "run_id": proposal.run_id,
-        "selected_run_id": proposal.run_id,
+        "run_id": manifest.run_id,
+        "selected_run_id": manifest.run_id,
     }
     return HTTPStatus.OK, payload
 
@@ -619,6 +631,7 @@ def proposal_action(
         queue_path=queue_path,
         proposal=proposal,
         run_id=manifest.run_id,
+        fallback_cwd=manifest.cwd,
     )
     proposal_store.remove_proposal(pool, proposal.proposal_id)
     proposal_store.save(pool)
@@ -822,10 +835,12 @@ def _create_preflight_run(
     run_store: RunStore,
     config: SchedulerConfig,
     user_task: str,
+    task_cwd: Path,
     worktree_factory: Optional[Callable[..., Path]],
 ) -> RunManifest:
+    worktrees_dir = config.resolve_worktrees_dir(task_cwd)
     manifest = run_store.create_run(
-        cwd=config.cwd,
+        cwd=task_cwd,
         user_task=user_task,
         planner_model=config.planner_model,
         worker_model=config.worker_model,
@@ -839,14 +854,34 @@ def _create_preflight_run(
     worker = manifest.workers[0]
     worker.worktree_path = str(
         factory(
-            repo_path=config.cwd,
-            worktrees_dir=config.worktrees_dir,
+            repo_path=task_cwd,
+            worktrees_dir=worktrees_dir,
             run_id=manifest.run_id,
             worker_id=worker.id,
         )
     )
     run_store.save(manifest)
     return manifest
+
+
+def _resolve_task_cwd(raw_cwd: Any, *, default_cwd: Path) -> Path:
+    if raw_cwd is None:
+        target = default_cwd
+    elif not isinstance(raw_cwd, str):
+        raise ValueError("cwd must be a string when provided")
+    else:
+        text = raw_cwd.strip()
+        if not text:
+            raise ValueError("cwd cannot be empty when provided")
+        target = Path(text).expanduser()
+        if not target.is_absolute():
+            target = default_cwd / target
+    resolved = target.expanduser().resolve()
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd must be a directory: {resolved}")
+    return resolved
 
 
 def _proposal_status_from_run(manifest: RunManifest) -> str:
@@ -876,6 +911,7 @@ def _enqueue_approved_proposal(
     queue_path: Pathish,
     proposal: ProposalRecord,
     run_id: str,
+    fallback_cwd: Optional[str] = None,
 ) -> str:
     queue_file = Path(queue_path).expanduser().resolve()
     store = TaskStore(queue_file)
@@ -890,6 +926,7 @@ def _enqueue_approved_proposal(
             task_id=task_id,
             title=proposal.title,
             prompt=proposal.prompt,
+            cwd=proposal.cwd or fallback_cwd,
             status=TASK_PENDING,
             active_run_id=run_id,
             run_ids=[run_id],
@@ -1116,10 +1153,12 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
             active_run = run_store.load(task.active_run_id)
         except OSError:
             active_run = None
+    task_cwd = task.cwd or (active_run.cwd if active_run is not None else None)
     progress = derive_task_progress(task, active_run=active_run)
     return {
         "task_id": task.task_id,
         "title": task.title,
+        "cwd": task_cwd,
         "status": task.status,
         "active_run_id": task.active_run_id,
         "run_ids": list(task.run_ids),
@@ -1158,6 +1197,7 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
                 "acceptance_criteria": _list_value(manifest_dict.get("acceptance_criteria")),
                 "verification_commands": _list_value(manifest_dict.get("verification_commands")),
             }
+    proposal_cwd = proposal.cwd or (manifest.cwd if manifest is not None else None)
     status = proposal.status
     if manifest is not None and status not in {PROPOSAL_QUEUED, PROPOSAL_FAILED}:
         status = _proposal_status_from_run(manifest)
@@ -1165,6 +1205,7 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
         "proposal_id": proposal.proposal_id,
         "title": proposal.title,
         "prompt": proposal.prompt,
+        "cwd": proposal_cwd,
         "status": status,
         "run_id": proposal.run_id,
         "task_id": proposal.task_id,

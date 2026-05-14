@@ -128,11 +128,16 @@ special exception state.
 Task state is the user-level lifecycle; run state is one execution attempt.
 One task can have multiple run attempts over time. `active_run_id` points to the
 current attempt and `run_ids` preserves prior attempts for audit.
+Task/proposal records may persist optional `cwd` (target repo root). Queue
+scheduler must use `task.cwd` for new attempts when present, and only fall back
+to runtime `--cwd` when missing.
 
 A queued task may start with an `active_run_id` that already has an approved
 Planner plan. In that case the scheduler must continue the existing run from
 `PLAN_APPROVED` instead of creating a replacement run. This is the handoff from
 proposal pool to execution queue.
+If `active_run_id` already exists, scheduler must continue using the saved run
+manifest/worktree context and must not overwrite it from current runtime `--cwd`.
 
 Task status should stay coarse:
 
@@ -168,6 +173,8 @@ The current MVP assumes runs that modify the same target repository are
 serialized. It does not support parallel modification of one repo by multiple
 task workspaces. If the target repo changes while a Worker is running, c-orch
 may reject the reviewed patch during apply instead of rebasing or merging it.
+Queue files may mix tasks for different target repos, but same-repo tasks are
+still serialized by this boundary.
 
 ## Agent Context Contract
 

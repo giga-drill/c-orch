@@ -3,12 +3,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import List
 from unittest import mock
 
 from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalPool, ProposalRecord, ProposalStore
-from c_orch.run_store import PlanRecord
+from c_orch.run_store import PlanRecord, RunStore
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
 from c_orch.states import RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
@@ -138,6 +139,7 @@ class RuntimeTests(unittest.TestCase):
                 proposal.proposal_id,
                 run_id=manifest.run_id,
                 status=RUN_PLAN_REVIEW_REQUIRED,
+                cwd=str(repo),
             )
             proposal_store.save(pool)
 
@@ -177,6 +179,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(queue.tasks), 1)
             self.assertEqual(queue.tasks[0].task_id, proposal.proposal_id)
             self.assertEqual(queue.tasks[0].status, "APPROVED")
+            self.assertEqual(queue.tasks[0].cwd, str(repo))
             self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
 
@@ -218,6 +221,69 @@ class RuntimeTests(unittest.TestCase):
             status, payload = runtime.queue_action("confirm-runtime-restarted")
             self.assertEqual(int(status), 400)
             self.assertEqual(payload["error"], "missing queue file")
+
+    def test_create_proposal_with_task_cwd_uses_target_repo_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboard_repo = root / "dashboard-repo"
+            dashboard_repo.mkdir()
+            target_repo = root / "target-repo"
+            target_repo.mkdir()
+            worktree_repo_paths: List[Path] = []
+
+            def worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str, worker_id: str) -> Path:
+                worktree_repo_paths.append(repo_path)
+                worktree = worktrees_dir / run_id / worker_id
+                worktree.mkdir(parents=True, exist_ok=True)
+                return worktree
+
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=dashboard_repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=worktree_factory,
+            )
+
+            with mock.patch("c_orch.orchestrator.RunOrchestrator") as orchestrator_cls:
+                orchestrator = orchestrator_cls.return_value
+
+                def run_side_effect(manifest):  # type: ignore[no-untyped-def]
+                    manifest.status = RUN_PLAN_REVIEW_REQUIRED
+                    manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+                    return manifest
+
+                orchestrator.run.side_effect = run_side_effect
+                status, _payload = runtime.create_proposal("Task 1", "Do task 1", "../target-repo")
+
+            self.assertEqual(int(status), 200)
+            proposal_store = ProposalStore(root / "proposals.json")
+            proposal = proposal_store.load().proposals[0]
+            run_store = RunStore(root / "runs")
+            manifest = run_store.load(proposal.run_id or "")
+
+            self.assertEqual(Path(proposal.cwd or "").resolve(), target_repo.resolve())
+            self.assertEqual(Path(manifest.cwd).resolve(), target_repo.resolve())
+            self.assertEqual([path.resolve() for path in worktree_repo_paths], [target_repo.resolve()])
+
+    def test_create_proposal_rejects_invalid_task_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboard_repo = root / "dashboard-repo"
+            dashboard_repo.mkdir()
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=dashboard_repo),
+                driver_factory=_fake_driver_factory,
+            )
+
+            status, payload = runtime.create_proposal("Task 1", "Do task 1", "./missing-repo")
+
+            self.assertEqual(int(status), 400)
+            self.assertIn("cwd does not exist", payload["error"])
+            proposals = ProposalStore(root / "proposals.json").load_or_create()
+            self.assertEqual(proposals.proposals, [])
 
 
 def _scheduler_config(root: Path) -> SchedulerConfig:

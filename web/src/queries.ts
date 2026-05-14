@@ -116,7 +116,8 @@ export function useQueueActionMutation() {
 export function useCreateProposalMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ title, prompt }: { title: string; prompt: string }) => postProposal(title, prompt),
+    mutationFn: ({ title, prompt, cwd }: { title: string; prompt: string; cwd?: string | null }) =>
+      postProposal(title, prompt, cwd ?? null),
     onSuccess: (payload) => {
       updateStateFromAction(queryClient, payload);
       refreshDashboardQueries(queryClient, selectedRunFromAction(payload));

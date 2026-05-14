@@ -28,6 +28,10 @@ same Planner thread and waits for a new plan. The execution queue is reserved
 for plans that have already been approved and can move automatically until a
 restart gate, failure, or task completion.
 
+Each proposal/task can also bind its own target repository `cwd`. If omitted,
+the runtime falls back to the current `--cwd`. This allows one queue file to
+hold tasks for different repos while preserving per-task run/worktree binding.
+
 ## Quick Start
 
 Run from this repo without installing:
@@ -157,6 +161,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - Each run gets one isolated task workspace. Planner and Worker sessions for
   that run use the same workspace so review can inspect the same files the
   Worker changed.
+- Queue/proposal records persist an optional task-level `cwd` (target repo
+  root). New run attempts use `task.cwd` first, then fall back to runtime
+  `--cwd`.
 - The current MVP supports one Worker thread with human plan approval before
   Worker start and retryable review attempts after Worker execution. Dashboard
   task submission uses a proposal pool so `human_plan_review` happens before
@@ -165,8 +172,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   running the plain dashboard, and the `supervise-ui` wrapper can clear it after
   restarting the UI/runtime child.
 - The current MVP does not support parallel runs that modify the same target
-  repo. Run such tasks serially; otherwise patch apply can conflict with commits
-  made while a Worker was running.
+  repo. Even though different tasks may target different repos, tasks that
+  target the same repo must still run serially; otherwise patch apply can
+  conflict with commits made while a Worker was running.
 - Planner review has only two business decisions: `accepted` and
   `revision_requested`. Failure recovery is handled by c-orch separately from
   the business state machine.

@@ -252,6 +252,7 @@ function ProposalPanel({
   const actionMutation = useProposalActionMutation();
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [cwd, setCwd] = useState("");
   const [feedbackById, setFeedbackById] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const proposalsNewestFirst = newestFirst(payload?.proposals ?? []);
@@ -260,9 +261,14 @@ function ProposalPanel({
   async function createProposal() {
     setError(null);
     try {
-      await createMutation.mutateAsync({ title: title.trim(), prompt: prompt.trim() });
+      await createMutation.mutateAsync({
+        title: title.trim(),
+        prompt: prompt.trim(),
+        cwd: cwd.trim() || null,
+      });
       setTitle("");
       setPrompt("");
+      setCwd("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -310,6 +316,11 @@ function ProposalPanel({
           onChange={(event) => setPrompt(event.target.value)}
           placeholder="任务说明。Planner 会先生成方案，等待你审核后才进入执行队列。"
         />
+        <input
+          value={cwd}
+          onChange={(event) => setCwd(event.target.value)}
+          placeholder="目标仓库路径（可选，默认使用当前运行目录）"
+        />
         <button
           type="button"
           onClick={createProposal}
@@ -333,6 +344,7 @@ function ProposalPanel({
                 <StatusBadge status={proposal.status} />
               </span>
               <span>{proposal.title}</span>
+              <span className="meta">cwd: {displayValue(proposal.cwd)}</span>
               <span className="meta">waiting_for: {displayValue(proposal.waiting_for)}</span>
               <span className="meta">run_id: {displayValue(proposal.run_id)}</span>
             </button>
@@ -460,6 +472,7 @@ function QueuePanel({
                   <StatusBadge status={task.status} />
                 </span>
                 <span>{task.title}</span>
+                <span className="meta">cwd: {displayValue(task.cwd)}</span>
                 <span className="meta">waiting_for: {displayValue(task.waiting_for)}</span>
                 <span className="meta">active_run_id: {displayValue(task.active_run_id)}</span>
               </button>

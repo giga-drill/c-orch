@@ -5,7 +5,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 
 Pathish = Union[str, Path]
@@ -51,6 +51,7 @@ class TaskRecord:
     task_id: str
     title: str
     prompt: str
+    cwd: Optional[str] = None
     status: str = TASK_PENDING
     active_run_id: Optional[str] = None
     run_ids: List[str] = field(default_factory=list)
@@ -65,6 +66,7 @@ class TaskRecord:
             "task_id": self.task_id,
             "title": self.title,
             "prompt": self.prompt,
+            "cwd": self.cwd,
             "status": self.status,
             "active_run_id": self.active_run_id,
             "run_ids": list(self.run_ids),
@@ -87,6 +89,7 @@ class TaskRecord:
             task_id=str(task_id or ""),
             title=str(title or ""),
             prompt=str(prompt or ""),
+            cwd=_optional_text(data.get("cwd")),
             status=str(data.get("status", TASK_PENDING)),
             active_run_id=data.get("active_run_id"),
             run_ids=_string_list(data.get("run_ids")),
@@ -178,7 +181,13 @@ class TaskStore:
         tmp_path.replace(self.queue_path)
         return self.queue_path
 
-    def import_tasks(self, tasks: Iterable[Dict[str, Any]], *, queue_id: str = "default") -> TaskQueue:
+    def import_tasks(
+        self,
+        tasks: Iterable[Dict[str, Any]],
+        *,
+        queue_id: str = "default",
+        cwd_resolver: Optional[Callable[[Any, int], Optional[str]]] = None,
+    ) -> TaskQueue:
         now = _now_iso()
         parsed: List[TaskRecord] = []
         seen_ids = set()
@@ -194,11 +203,14 @@ class TaskStore:
             seen_ids.add(task_id_text)
             title = _as_string(raw_task.get("title"), field_name=f"tasks[{index}].title")
             prompt = _as_string(raw_task.get("prompt"), field_name=f"tasks[{index}].prompt")
+            raw_cwd = raw_task.get("cwd")
+            task_cwd = cwd_resolver(raw_cwd, index) if cwd_resolver is not None else _optional_text(raw_cwd)
             parsed.append(
                 TaskRecord(
                     task_id=task_id_text,
                     title=title,
                     prompt=prompt,
+                    cwd=task_cwd,
                     status=TASK_PENDING,
                     active_run_id=None,
                     run_ids=[],
@@ -247,6 +259,8 @@ class TaskStore:
             task.title = _as_string(task.title, field_name=f"tasks[{index}].title")
             task.prompt = _as_string(task.prompt, field_name=f"tasks[{index}].prompt")
             task.task_id = task_id
+            if task.cwd is not None:
+                task.cwd = _as_string(task.cwd, field_name=f"tasks[{index}].cwd")
             if not task.status:
                 task.status = TASK_PENDING
             if task.run_ids is None:
@@ -257,3 +271,13 @@ class TaskStore:
             if task.task_id == task_id:
                 return task
         raise ValueError(f"task not found: {task_id}")
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    text = str(value).strip()
+    return text or None

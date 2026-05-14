@@ -23,6 +23,7 @@ export interface QueueRecord {
 export interface TaskSummary {
   task_id: string;
   title: string;
+  cwd: string | null;
   status: string;
   active_run_id: string | null;
   run_ids: string[];
@@ -71,6 +72,7 @@ export interface ProposalRecord {
   proposal_id: string;
   title: string;
   prompt: string;
+  cwd: string | null;
   status: string;
   run_id: string | null;
   task_id: string | null;

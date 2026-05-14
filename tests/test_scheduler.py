@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import List, Tuple
 
@@ -254,6 +255,153 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[1].active_run_id, loaded.tasks[1].run_ids[-1])
             self.assertEqual(len(fake.run_ids), 2)
 
+    def test_mixed_task_cwd_creates_runs_and_worktrees_per_task_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_one = root / "repo-one"
+            repo_two = root / "repo-two"
+            repo_one.mkdir()
+            repo_two.mkdir()
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {
+                        "task_id": "task-001",
+                        "title": "Task 1",
+                        "prompt": "Do task 1",
+                        "cwd": str(repo_one),
+                    },
+                    {
+                        "task_id": "task-002",
+                        "title": "Task 2",
+                        "prompt": "Do task 2",
+                        "cwd": str(repo_two),
+                    },
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False), ("APPROVED", False)])
+            repo_paths: List[Path] = []
+
+            def worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str, worker_id: str) -> Path:
+                repo_paths.append(repo_path)
+                worktree = worktrees_dir / run_id / worker_id
+                worktree.mkdir(parents=True, exist_ok=True)
+                return worktree
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+            first_manifest = run_store.load(loaded.tasks[0].run_ids[-1])
+            second_manifest = run_store.load(loaded.tasks[1].run_ids[-1])
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(Path(first_manifest.cwd).resolve(), repo_one.resolve())
+            self.assertEqual(Path(second_manifest.cwd).resolve(), repo_two.resolve())
+            self.assertEqual([path.resolve() for path in repo_paths], [repo_one.resolve(), repo_two.resolve()])
+
+    def test_default_worktrees_dir_rebinds_under_each_task_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_cwd = root / "runtime-repo"
+            runtime_cwd.mkdir()
+            repo_one = root / "repo-one"
+            repo_one.mkdir()
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {
+                        "task_id": "task-001",
+                        "title": "Task 1",
+                        "prompt": "Do task 1",
+                        "cwd": str(repo_one),
+                    }
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+            seen_worktrees_dirs: List[Path] = []
+
+            def worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str, worker_id: str) -> Path:
+                _ = repo_path
+                seen_worktrees_dirs.append(worktrees_dir)
+                worktree = worktrees_dir / run_id / worker_id
+                worktree.mkdir(parents=True, exist_ok=True)
+                return worktree
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=SchedulerConfig(
+                    cwd=runtime_cwd,
+                    runs_dir=root / "runs",
+                    worktrees_dir=runtime_cwd / ".c-orch" / "worktrees",
+                    planner_model="gpt-5.5",
+                    worker_model="gpt-5.3-codex-spark",
+                    codex_binary_path="/bin/codex",
+                    max_attempts=2,
+                    sandbox="workspace-write",
+                    approval_policy="never",
+                ),
+                worktree_factory=worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(
+                [path.resolve() for path in seen_worktrees_dirs],
+                [(repo_one / ".c-orch" / "worktrees").resolve()],
+            )
+
+    def test_retry_preserves_task_cwd_for_new_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_target = root / "target-repo"
+            repo_target.mkdir()
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {
+                        "task_id": "task-001",
+                        "title": "Task 1",
+                        "prompt": "Do task 1",
+                        "cwd": str(repo_target),
+                    }
+                ]
+            )
+            task_store.update_task(queue, "task-001", status=TASK_FAILED, reason="active_run_failed")
+            task_store.save(queue)
+            queue = task_store.load()
+            task_store.update_task(queue, "task-001", status=TASK_PENDING, reason=None)
+            task_store.save(queue)
+
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+            manifest = run_store.load(loaded.tasks[0].active_run_id or loaded.tasks[0].run_ids[-1])
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(Path(loaded.tasks[0].cwd or "").resolve(), repo_target.resolve())
+            self.assertEqual(Path(manifest.cwd).resolve(), repo_target.resolve())
+
     def test_pending_task_with_approved_plan_run_continues_existing_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -296,6 +444,50 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(loaded.tasks[0].run_ids, [manifest.run_id])
             self.assertEqual(fake.run_ids, [manifest.run_id])
+            self.assertEqual(Path(run_store.load(manifest.run_id).cwd).resolve(), (root / "repo").resolve())
+
+    def test_active_run_keeps_manifest_cwd_when_scheduler_default_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_bound = root / "repo-bound"
+            repo_bound.mkdir()
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo_bound,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "PLAN_APPROVED"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_PENDING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+            changed_default = replace(_config(root), cwd=root / "different-default-repo")
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=changed_default,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(fake.run_ids, [manifest.run_id])
+            self.assertEqual(Path(run_store.load(manifest.run_id).cwd).resolve(), repo_bound.resolve())
 
     def test_restart_required_stops_after_current_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

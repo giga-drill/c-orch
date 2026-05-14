@@ -718,7 +718,14 @@ def run_queue_import(args: argparse.Namespace) -> int:
 
     store = TaskStore(queue_path=queue_path)
     try:
-        queue = store.import_tasks(payload)
+        queue = store.import_tasks(
+            payload,
+            cwd_resolver=lambda raw_cwd, index: _resolve_import_task_cwd(
+                raw_cwd,
+                index=index,
+                base_cwd=cwd,
+            ),
+        )
     except ValueError as exc:
         print(f"queue import error: {exc}", file=sys.stderr)
         return 1
@@ -770,7 +777,7 @@ def run_queue_status(args: argparse.Namespace) -> int:
     for task in queue.tasks:
         print(
             f"- {task.task_id} [{task.status}] run={task.active_run_id or '-'} "
-            f"reason={task.reason or '-'} title={task.title}"
+            f"cwd={task.cwd or '-'} reason={task.reason or '-'} title={task.title}"
         )
     return 0
 
@@ -959,6 +966,17 @@ def _resolve_under_cwd(cwd: Path, value: str) -> Path:
     if path.is_absolute():
         return path
     return cwd / path
+
+
+def _resolve_import_task_cwd(raw_cwd: Any, *, index: int, base_cwd: Path) -> Optional[str]:
+    if raw_cwd is None:
+        return None
+    if not isinstance(raw_cwd, str):
+        raise ValueError(f"tasks[{index}].cwd must be a string")
+    text = raw_cwd.strip()
+    if not text:
+        raise ValueError(f"tasks[{index}].cwd cannot be empty")
+    return str(_resolve_under_cwd(base_cwd, text).resolve())
 
 
 def _is_terminal_manifest_status(status: str) -> bool:

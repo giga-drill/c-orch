@@ -14,6 +14,7 @@ from .task_lifecycle import (
     reconcile_queue,
     reconcile_task_with_active_run,
 )
+from .settings import DEFAULT_WORKTREES_DIR
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -58,6 +59,20 @@ class SchedulerConfig:
     planner_service_tier: Optional[str] = None
     worker_service_tier: Optional[str] = None
     max_tasks: Optional[int] = None
+
+    def resolve_task_cwd(self, task_cwd: Optional[str]) -> Path:
+        if task_cwd is None or not task_cwd.strip():
+            return self.cwd.expanduser().resolve()
+        return Path(task_cwd).expanduser().resolve()
+
+    def resolve_worktrees_dir(self, task_cwd: Path) -> Path:
+        worktrees_dir = self.worktrees_dir.expanduser()
+        default_under_runtime = (self.cwd.expanduser().resolve() / DEFAULT_WORKTREES_DIR).resolve()
+        if worktrees_dir.is_absolute() and worktrees_dir.resolve() == default_under_runtime:
+            return (task_cwd / DEFAULT_WORKTREES_DIR).resolve()
+        if worktrees_dir.is_absolute():
+            return worktrees_dir.resolve()
+        return (task_cwd / worktrees_dir).resolve()
 
 
 class TaskScheduler:
@@ -201,8 +216,10 @@ class TaskScheduler:
             self.task_store.save(queue)
 
             try:
+                task_cwd = self.config.resolve_task_cwd(task.cwd)
+                worktrees_dir = self.config.resolve_worktrees_dir(task_cwd)
                 manifest = self.run_store.create_run(
-                    cwd=self.config.cwd,
+                    cwd=task_cwd,
                     user_task=task.prompt,
                     planner_model=self.config.planner_model,
                     worker_model=self.config.worker_model,
@@ -215,8 +232,8 @@ class TaskScheduler:
                 worker = manifest.workers[0]
                 worker.worktree_path = str(
                     self.worktree_factory(
-                        repo_path=self.config.cwd,
-                        worktrees_dir=self.config.worktrees_dir,
+                        repo_path=task_cwd,
+                        worktrees_dir=worktrees_dir,
                         run_id=manifest.run_id,
                         worker_id=worker.id,
                     )
@@ -227,6 +244,7 @@ class TaskScheduler:
                 self.task_store.update_task(
                     queue,
                     task.task_id,
+                    cwd=str(task_cwd),
                     active_run_id=manifest.run_id,
                     run_ids=run_ids,
                 )

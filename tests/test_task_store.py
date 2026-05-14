@@ -20,12 +20,19 @@ class TaskStoreTests(unittest.TestCase):
             queue = store.import_tasks(
                 [
                     {"id": "task-001", "title": "First", "prompt": "Do first"},
-                    {"task_id": "task-002", "title": "Second", "prompt": "Do second"},
+                    {
+                        "task_id": "task-002",
+                        "title": "Second",
+                        "prompt": "Do second",
+                        "cwd": "/tmp/repo-two",
+                    },
                 ]
             )
 
             self.assertEqual(queue.status, "PENDING")
             self.assertEqual([task.task_id for task in queue.tasks], ["task-001", "task-002"])
+            self.assertIsNone(queue.tasks[0].cwd)
+            self.assertEqual(queue.tasks[1].cwd, "/tmp/repo-two")
             self.assertEqual(store.next_pending(queue).task_id, "task-001")
 
             store.update_task(queue, "task-001", status=TASK_APPROVED)
@@ -70,6 +77,7 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(queue.status, "PENDING")
             self.assertIsNone(queue.tasks[0].active_run_id)
             self.assertEqual(queue.tasks[0].run_ids, [])
+            self.assertIsNone(queue.tasks[0].cwd)
 
     def test_save_and_load_persist_run_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +92,7 @@ class TaskStoreTests(unittest.TestCase):
                 queue,
                 "task-001",
                 status=TASK_APPROVED,
+                cwd="/tmp/repo",
                 active_run_id="run-001",
                 run_ids=["run-001", "run-002"],
             )
@@ -91,6 +100,7 @@ class TaskStoreTests(unittest.TestCase):
 
             loaded = store.load()
             self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(loaded.tasks[0].cwd, "/tmp/repo")
             self.assertEqual(loaded.tasks[0].active_run_id, "run-001")
             self.assertEqual(loaded.tasks[0].run_ids, ["run-001", "run-002"])
 

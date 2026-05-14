@@ -36,6 +36,7 @@ class ProposalRecord:
     proposal_id: str
     title: str
     prompt: str
+    cwd: Optional[str] = None
     status: str = PROPOSAL_PLANNING
     run_id: Optional[str] = None
     task_id: Optional[str] = None
@@ -49,6 +50,7 @@ class ProposalRecord:
             "proposal_id": self.proposal_id,
             "title": self.title,
             "prompt": self.prompt,
+            "cwd": self.cwd,
             "status": self.status,
             "run_id": self.run_id,
             "task_id": self.task_id,
@@ -65,6 +67,7 @@ class ProposalRecord:
             proposal_id=str(data.get("proposal_id") or ""),
             title=str(data.get("title") or ""),
             prompt=str(data.get("prompt") or ""),
+            cwd=_optional_text(data.get("cwd")),
             status=str(data.get("status") or PROPOSAL_PLANNING),
             run_id=data.get("run_id"),
             task_id=data.get("task_id"),
@@ -158,12 +161,20 @@ class ProposalStore:
         tmp_path.replace(self.proposals_path)
         return self.proposals_path
 
-    def add_proposal(self, pool: ProposalPool, *, title: str, prompt: str) -> ProposalRecord:
+    def add_proposal(
+        self,
+        pool: ProposalPool,
+        *,
+        title: str,
+        prompt: str,
+        cwd: Optional[str] = None,
+    ) -> ProposalRecord:
         now = _now_iso()
         proposal = ProposalRecord(
             proposal_id=self._new_proposal_id(pool, title=title),
             title=title,
             prompt=prompt,
+            cwd=cwd,
             created_at=now,
             updated_at=now,
         )
@@ -210,6 +221,8 @@ class ProposalStore:
             proposal.proposal_id = proposal_id
             proposal.title = _as_string(proposal.title, field_name=f"proposals[{index}].title")
             proposal.prompt = _as_string(proposal.prompt, field_name=f"proposals[{index}].prompt")
+            if proposal.cwd is not None:
+                proposal.cwd = _as_string(proposal.cwd, field_name=f"proposals[{index}].cwd")
             if not proposal.status:
                 proposal.status = PROPOSAL_PLANNING
 
@@ -237,3 +250,13 @@ def _slug(value: str) -> str:
         if len(chars) >= 48:
             break
     return "".join(chars).strip("-")
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    text = str(value).strip()
+    return text or None

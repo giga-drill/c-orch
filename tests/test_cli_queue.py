@@ -25,12 +25,18 @@ class CliQueueTests(unittest.TestCase):
                 json.dumps(
                     [
                         {"id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
-                        {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                        {
+                            "task_id": "task-002",
+                            "title": "Task 2",
+                            "prompt": "Do task 2",
+                            "cwd": "./target-repo",
+                        },
                     ],
                     ensure_ascii=False,
                 ),
                 encoding="utf-8",
             )
+            (cwd / "target-repo").mkdir()
 
             with redirect_stdout(StringIO()) as import_stdout:
                 exit_code = main(
@@ -59,6 +65,9 @@ class CliQueueTests(unittest.TestCase):
             payload = json.loads(status_stdout.getvalue())
             self.assertEqual(payload["queue"]["status"], "PENDING")
             self.assertEqual(len(payload["queue"]["tasks"]), 2)
+            self.assertIsNone(payload["queue"]["tasks"][0]["cwd"])
+            self.assertEqual(payload["queue"]["tasks"][1]["cwd"], str((cwd / "target-repo").resolve()))
+            self.assertEqual(payload["tasks"][1]["cwd"], str((cwd / "target-repo").resolve()))
 
     def test_queue_run_smoke_with_mock_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

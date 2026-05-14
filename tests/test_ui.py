@@ -167,7 +167,7 @@ class UiTests(unittest.TestCase):
             root = Path(tmp)
             queue_store = TaskStore(root / "queue.json")
             queue = queue_store.import_tasks(
-                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": "/tmp/repo-a"}]
             )
             queue_store.update_task(
                 queue,
@@ -189,6 +189,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(payload["summary"]["current_waiting_point"], "done")
             self.assertEqual(payload["tasks"][0]["task_id"], "task-001")
+            self.assertEqual(payload["tasks"][0]["cwd"], "/tmp/repo-a")
             self.assertEqual(payload["tasks"][0]["active_run_id"], "run-123")
             self.assertEqual(payload["tasks"][0]["run_ids"], ["run-123"])
             self.assertEqual(payload["tasks"][0]["reason"], "done")
@@ -396,6 +397,7 @@ class UiTests(unittest.TestCase):
             )
             run_store.save(manifest)
             proposal.run_id = manifest.run_id
+            proposal.cwd = str(root / "repo-a")
             proposal.status = "PLAN_REVIEW_REQUIRED"
             proposal_store.save(pool)
 
@@ -404,6 +406,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["total_proposals"], 1)
             self.assertEqual(payload["summary"]["review_required"], 1)
             self.assertEqual(payload["proposals"][0]["run_id"], manifest.run_id)
+            self.assertEqual(payload["proposals"][0]["cwd"], str(root / "repo-a"))
             self.assertEqual(payload["proposals"][0]["allowed_actions"], ["approve-plan", "revise-plan"])
             self.assertEqual(payload["proposals"][0]["run"]["plan"]["summary"], "Plan summary")
             self.assertEqual(payload["proposals"][0]["plan_detail"]["summary"], "Plan summary")
@@ -429,6 +432,7 @@ class UiTests(unittest.TestCase):
             manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
             run_store.save(manifest)
             proposal.run_id = manifest.run_id
+            proposal.cwd = str(root / "repo-a")
             proposal.status = "PLAN_REVIEW_REQUIRED"
             proposal_store.save(pool)
 
@@ -449,6 +453,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["transition"]["type"], "proposal_approved_and_queued")
             self.assertEqual(payload["transition"]["run_id"], manifest.run_id)
             self.assertEqual(payload["transition"]["task_id"], proposal.proposal_id)
+            self.assertEqual(queue.tasks[0].cwd, str(root / "repo-a"))
             self.assertTrue(payload["transition"]["removed_from_pool"])
             self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
@@ -740,12 +745,14 @@ class UiTests(unittest.TestCase):
         self.assertIn("/api/runs", client_source)
         self.assertIn("/api/queue", client_source)
         self.assertIn("/api/proposals", client_source)
+        self.assertIn("cwd", client_source)
         self.assertIn("/api/state", client_source)
         self.assertIn("/api/queue/actions", client_source)
         self.assertIn("/actions", client_source)
         self.assertIn("allowed_actions", app_source)
         self.assertIn("待审核计划", app_source)
         self.assertIn("生成 Planner 方案", app_source)
+        self.assertIn("目标仓库路径", app_source)
         self.assertIn("通过并加入执行队列", app_source)
         self.assertIn("ProposalPlanPanel", app_source)
         self.assertIn("完整 Planner 方案", app_source)

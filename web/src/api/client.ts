@@ -74,10 +74,14 @@ export function postQueueAction(action: AllowedQueueAction): Promise<ActionRespo
   });
 }
 
-export function postProposal(title: string, prompt: string): Promise<ActionResponse> {
+export function postProposal(
+  title: string,
+  prompt: string,
+  cwd: string | null = null,
+): Promise<ActionResponse> {
   return requestJson<ActionResponse>("/api/proposals", {
     method: "POST",
-    body: JSON.stringify({ title, prompt }),
+    body: JSON.stringify({ title, prompt, cwd }),
   });
 }
 
