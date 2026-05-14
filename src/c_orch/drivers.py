@@ -26,7 +26,15 @@ class CodexDriver(Protocol):
     ) -> SessionResult:
         ...
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
         ...
 
 

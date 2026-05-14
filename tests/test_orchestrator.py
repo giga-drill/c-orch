@@ -55,8 +55,24 @@ class FakeDriver:
         )
         return self.start_results.pop(0)
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
-        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.reply_calls.append(
+            {
+                "thread_id": thread_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
         return self.reply_results.pop(0)
 
 
@@ -335,8 +351,24 @@ class RetryEndToEndDriver:
             return _session("worker-thread", _worker_result(summary="added subtract with a bug"))
         raise AssertionError(f"unexpected role: {role}")
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
-        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.reply_calls.append(
+            {
+                "thread_id": thread_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
         if thread_id == "planner-thread":
             self.review_count += 1
             if self.review_count == 1:
@@ -406,8 +438,24 @@ class FallbackReviewDriver:
             return _session("worker-thread", _worker_result())
         raise AssertionError(f"unexpected role: {role}")
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
-        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.reply_calls.append(
+            {
+                "thread_id": thread_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
         if thread_id == "planner-thread":
             raise RuntimeError(f"Session not found for thread_id: {thread_id}")
         raise AssertionError(f"unexpected thread_id: {thread_id}")
@@ -452,8 +500,24 @@ class FallbackWorkerReworkDriver:
             return _session(thread_id, _worker_result(summary=f"worker attempt {self.worker_start_count}"))
         raise AssertionError(f"unexpected role: {role}")
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
-        self.reply_calls.append({"thread_id": thread_id, "prompt": prompt})
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.reply_calls.append(
+            {
+                "thread_id": thread_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
+            }
+        )
         if thread_id == "planner-thread":
             self.review_count += 1
             if self.review_count == 1:
@@ -510,6 +574,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("Build the feature", driver.start_calls[1]["prompt"])
             self.assertIn("python -m unittest", driver.start_calls[1]["prompt"])
             self.assertEqual(driver.reply_calls[0]["thread_id"], "planner-thread")
+            self.assertEqual(driver.reply_calls[0]["model"], "planner-model")
+            self.assertEqual(driver.reply_calls[0]["reasoning_effort"], "high")
+            self.assertEqual(driver.reply_calls[0]["service_tier"], "fast")
             self.assertIn("summary for worker-1", driver.reply_calls[0]["prompt"])
             self.assertIn("All fake verification passed.", driver.reply_calls[0]["prompt"])
             self.assertIn("verification-output.txt", driver.reply_calls[0]["prompt"])
@@ -680,6 +747,9 @@ class OrchestratorTests(unittest.TestCase):
                 start_results=[],
                 reply_results=[_session("planner-thread", _planner_plan_revised())],
             )
+            paused.planner.reasoning_effort = "high"
+            paused.planner.service_tier = "fast"
+            store.save(paused)
             revised = RunOrchestrator(
                 store=store,
                 driver=revise_driver,
@@ -698,6 +768,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(len(revise_driver.start_calls), 0)
             self.assertEqual(len(revise_driver.reply_calls), 1)
             self.assertEqual(revise_driver.reply_calls[0]["thread_id"], "planner-thread")
+            self.assertEqual(revise_driver.reply_calls[0]["model"], "planner-model")
+            self.assertEqual(revise_driver.reply_calls[0]["reasoning_effort"], "high")
+            self.assertEqual(revise_driver.reply_calls[0]["service_tier"], "fast")
             self.assertIn("Please tighten scope.", revise_driver.reply_calls[0]["prompt"])
             self.assertEqual(len(revised.plan_revisions), 1)
             self.assertEqual(revised.plan_revisions[0].id, "plan-revision-1")
@@ -743,6 +816,11 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, manifest, _worktree = _create_manifest(root)
+            manifest.planner.reasoning_effort = "high"
+            manifest.planner.service_tier = "fast"
+            manifest.workers[0].reasoning_effort = "medium"
+            manifest.workers[0].service_tier = "flex"
+            store.save(manifest)
             driver = FakeDriver(
                 start_results=[
                     _session("planner-thread", _planner_plan()),
@@ -775,6 +853,15 @@ class OrchestratorTests(unittest.TestCase):
                 [call["thread_id"] for call in driver.reply_calls],
                 ["planner-thread", "worker-thread", "planner-thread"],
             )
+            self.assertEqual(driver.reply_calls[0]["model"], "planner-model")
+            self.assertEqual(driver.reply_calls[0]["reasoning_effort"], "high")
+            self.assertEqual(driver.reply_calls[0]["service_tier"], "fast")
+            self.assertEqual(driver.reply_calls[1]["model"], "worker-model")
+            self.assertEqual(driver.reply_calls[1]["reasoning_effort"], "medium")
+            self.assertEqual(driver.reply_calls[1]["service_tier"], "flex")
+            self.assertEqual(driver.reply_calls[2]["model"], "planner-model")
+            self.assertEqual(driver.reply_calls[2]["reasoning_effort"], "high")
+            self.assertEqual(driver.reply_calls[2]["service_tier"], "fast")
             self.assertIn("Add coverage", driver.reply_calls[1]["prompt"])
             self.assertEqual(len(evidence.calls), 2)
             self.assertEqual(
@@ -798,6 +885,11 @@ class OrchestratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, manifest, _worktree = _create_manifest(root)
+            manifest.planner.reasoning_effort = "high"
+            manifest.planner.service_tier = "fast"
+            manifest.workers[0].reasoning_effort = "medium"
+            manifest.workers[0].service_tier = "flex"
+            store.save(manifest)
             driver = FallbackWorkerReworkDriver()
             applier = FakeDiffApplier()
 
@@ -815,6 +907,12 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.workers[0].thread_id, "worker-fallback-thread")
             self.assertEqual([call["role"] for call in driver.start_calls], ["planner", "worker", "worker"])
             self.assertEqual(driver.reply_calls[1]["thread_id"], "worker-thread")
+            self.assertEqual(driver.reply_calls[0]["model"], "planner-model")
+            self.assertEqual(driver.reply_calls[0]["reasoning_effort"], "high")
+            self.assertEqual(driver.reply_calls[0]["service_tier"], "fast")
+            self.assertEqual(driver.reply_calls[1]["model"], "worker-model")
+            self.assertEqual(driver.reply_calls[1]["reasoning_effort"], "medium")
+            self.assertEqual(driver.reply_calls[1]["service_tier"], "flex")
             self.assertEqual(len(applier.calls), 1)
             event_types = [event["type"] for event in store.load_events(manifest.run_id)]
             self.assertIn("worker_rework_fallback_started", event_types)

@@ -338,6 +338,9 @@ class RunOrchestrator:
             result = self.driver.reply(
                 thread_id=manifest.planner.thread_id,
                 prompt=planner_revision_prompt(human_feedback=normalized_feedback),
+                model=manifest.planner.model,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
             )
             revised = PlannerPlan.parse(result.content)
         except Exception as exc:
@@ -498,7 +501,13 @@ class RunOrchestrator:
                 raise OrchestratorError("cannot continue worker without thread_id")
             previous_thread_id = worker.thread_id
             try:
-                result = self.driver.reply(thread_id=previous_thread_id, prompt=prompt)
+                result = self.driver.reply(
+                    thread_id=previous_thread_id,
+                    prompt=prompt,
+                    model=worker.model,
+                    reasoning_effort=worker.reasoning_effort,
+                    service_tier=worker.service_tier,
+                )
             except Exception as exc:
                 if not should_start_replacement_agent(exc):
                     raise
@@ -706,6 +715,9 @@ class RunOrchestrator:
             result = self.driver.reply(
                 thread_id=previous_thread_id,
                 prompt=primary_prompt,
+                model=manifest.planner.model,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
             )
             self._record_review_recovery_event(manifest, result, old_thread_id=previous_thread_id)
             return ReviewDecision.parse(result.content)

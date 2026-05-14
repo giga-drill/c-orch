@@ -193,5 +193,11 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   session logs with `source=mcp`.
 - Continuing a saved session first tries MCP `codex-reply`; if a fresh MCP
   server does not know that thread id, c-orch falls back to `codex exec resume`.
+- New Planner/Worker sessions pass model config explicitly through MCP `codex`
+  `config` (for example `model_reasoning_effort` and `service_tier`).
+- MCP `codex-reply` is used as-is for existing sessions (`threadId` + `prompt`
+  only), so c-orch does not send per-reply config overrides there. When
+  `codex-reply` must fall back to CLI resume, c-orch explicitly restores saved
+  manifest model settings on `codex exec resume`.
 - Thread naming and richer live progress are left for a future Codex App Server
   driver.

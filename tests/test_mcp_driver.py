@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from c_orch.codex_session_logs import CodexSessionSnapshot
 from c_orch.drivers import DriverError, SessionResult
 from c_orch.mcp_client import McpTimeoutError, McpToolError
-from c_orch.mcp_driver import McpCodexDriver
+from c_orch.mcp_driver import McpCodexDriver, _build_codex_exec_resume_command
 
 
 class McpCodexDriverTests(unittest.TestCase):
@@ -71,7 +71,13 @@ class McpCodexDriverTests(unittest.TestCase):
         )
         driver = McpCodexDriver(client=client)
 
-        result = driver.reply(thread_id="thr_worker", prompt="Continue")
+        result = driver.reply(
+            thread_id="thr_worker",
+            prompt="Continue",
+            model="gpt-5.3-codex",
+            reasoning_effort="medium",
+            service_tier="flex",
+        )
 
         self.assertEqual(result.thread_id, "thr_worker")
         self.assertEqual(result.content, "reply done")
@@ -100,7 +106,13 @@ class McpCodexDriverTests(unittest.TestCase):
             exec_resume_runner=runner,
         )
 
-        result = driver.reply(thread_id="thr_planner", prompt="Continue")
+        result = driver.reply(
+            thread_id="thr_planner",
+            prompt="Continue",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            service_tier="fast",
+        )
 
         self.assertEqual(result.thread_id, "thr_planner")
         self.assertEqual(result.content, "resumed reply")
@@ -116,7 +128,10 @@ class McpCodexDriverTests(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(runner.calls, [("/bin/codex", "thr_planner", "Continue")])
+        self.assertEqual(
+            runner.calls,
+            [("/bin/codex", "thr_planner", "Continue", "gpt-5.5", "high", "fast")],
+        )
 
     def test_reply_does_not_resume_for_non_session_not_found_errors(self) -> None:
         client = FakeMcpClient([])
@@ -208,7 +223,13 @@ class McpCodexDriverTests(unittest.TestCase):
             session_recovery_poll_seconds=0,
         )
 
-        result = driver.reply(thread_id="thr_planner", prompt="Review")
+        result = driver.reply(
+            thread_id="thr_planner",
+            prompt="Review",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            service_tier="fast",
+        )
 
         self.assertEqual(result.thread_id, "thr_planner")
         self.assertEqual(result.content, '{"decision":"accepted"}')
@@ -231,12 +252,21 @@ class McpCodexDriverTests(unittest.TestCase):
             session_recovery_poll_seconds=0,
         )
 
-        result = driver.reply(thread_id="thr_planner", prompt="Review")
+        result = driver.reply(
+            thread_id="thr_planner",
+            prompt="Review",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            service_tier="fast",
+        )
 
         self.assertEqual(result.thread_id, "thr_planner")
         self.assertEqual(result.content, '{"decision":"accepted"}')
         self.assertEqual(result.raw["resumedAfterMcpTimeout"], True)
-        self.assertEqual(runner.calls, [("/bin/codex", "thr_planner", "Review")])
+        self.assertEqual(
+            runner.calls,
+            [("/bin/codex", "thr_planner", "Review", "gpt-5.5", "high", "fast")],
+        )
 
     def test_start_session_recovery_preserves_client_for_planner_reply(self) -> None:
         client = FakeMcpClient(
@@ -311,6 +341,55 @@ class McpCodexDriverTests(unittest.TestCase):
 
         self.assertTrue(client.closed)
 
+    def test_build_codex_exec_resume_command_includes_optional_model_config(self) -> None:
+        command = _build_codex_exec_resume_command(
+            codex_bin="/bin/codex",
+            output_path=Path("/tmp/out.txt"),
+            thread_id="thr_planner",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            service_tier="fast",
+        )
+        self.assertEqual(
+            command,
+            [
+                "/bin/codex",
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                "-m",
+                "gpt-5.5",
+                "-c",
+                "model_reasoning_effort=high",
+                "-c",
+                "service_tier=fast",
+                "-o",
+                "/tmp/out.txt",
+                "thr_planner",
+                "-",
+            ],
+        )
+
+    def test_build_codex_exec_resume_command_omits_empty_optional_model_config(self) -> None:
+        command = _build_codex_exec_resume_command(
+            codex_bin="/bin/codex",
+            output_path=Path("/tmp/out.txt"),
+            thread_id="thr_planner",
+        )
+        self.assertEqual(
+            command,
+            [
+                "/bin/codex",
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                "-o",
+                "/tmp/out.txt",
+                "thr_planner",
+                "-",
+            ],
+        )
+
 
 class FakeMcpClient:
     def __init__(self, results: List[Dict[str, Any]]) -> None:
@@ -375,10 +454,20 @@ class FakeSessionLogStore:
 class FakeExecResumeRunner:
     def __init__(self, result: SessionResult) -> None:
         self.result = result
-        self.calls: List[tuple[str, str, str]] = []
+        self.calls: List[tuple[str, str, str, Optional[str], Optional[str], Optional[str]]] = []
 
-    def __call__(self, codex_bin: str, thread_id: str, prompt: str) -> SessionResult:
-        self.calls.append((codex_bin, thread_id, prompt))
+    def __call__(
+        self,
+        codex_bin: str,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
+        self.calls.append(
+            (codex_bin, thread_id, prompt, model, reasoning_effort, service_tier)
+        )
         return self.result
 
 

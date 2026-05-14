@@ -24,7 +24,10 @@ class SessionLogStore(Protocol):
         ...
 
 
-ExecResumeRunner = Callable[[str, str, str], SessionResult]
+ExecResumeRunner = Callable[
+    [str, str, str, Optional[str], Optional[str], Optional[str]],
+    SessionResult,
+]
 
 
 class McpCodexDriver:
@@ -89,7 +92,15 @@ class McpCodexDriver:
             started_at=started_at,
         )
 
-    def reply(self, *, thread_id: str, prompt: str) -> SessionResult:
+    def reply(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> SessionResult:
         self._ensure_required_tools()
         started_at = time.time()
         try:
@@ -104,13 +115,27 @@ class McpCodexDriver:
                 started_at=started_at,
             )
         except McpTimeoutError:
-            result = self._exec_resume_runner(self.codex_bin, thread_id, prompt)
+            result = self._exec_resume_runner(
+                self.codex_bin,
+                thread_id,
+                prompt,
+                model,
+                reasoning_effort,
+                service_tier,
+            )
             result.raw.setdefault("resumedAfterMcpTimeout", True)
             return result
         except Exception as exc:
             if not _is_session_not_found_error(exc):
                 raise
-            return self._exec_resume_runner(self.codex_bin, thread_id, prompt)
+            return self._exec_resume_runner(
+                self.codex_bin,
+                thread_id,
+                prompt,
+                model,
+                reasoning_effort,
+                service_tier,
+            )
 
     def close(self) -> None:
         if self._client is not None:
@@ -215,20 +240,58 @@ def _session_result_from_snapshot(snapshot: CodexSessionSnapshot) -> SessionResu
     return coerce_session_result(raw)
 
 
-def _codex_exec_resume(codex_bin: str, thread_id: str, prompt: str) -> SessionResult:
+def _build_codex_exec_resume_command(
+    *,
+    codex_bin: str,
+    output_path: Path,
+    thread_id: str,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    service_tier: Optional[str] = None,
+) -> list[str]:
+    command = [
+        codex_bin,
+        "exec",
+        "resume",
+        "--skip-git-repo-check",
+    ]
+    if model:
+        command.extend(["-m", model])
+    if reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
+    if service_tier:
+        command.extend(["-c", f"service_tier={service_tier}"])
+    command.extend(
+        [
+            "-o",
+            str(output_path),
+            thread_id,
+            "-",
+        ]
+    )
+    return command
+
+
+def _codex_exec_resume(
+    codex_bin: str,
+    thread_id: str,
+    prompt: str,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    service_tier: Optional[str] = None,
+) -> SessionResult:
     with tempfile.TemporaryDirectory(prefix="c-orch-resume-") as tmp:
         output_path = Path(tmp) / "last-message.txt"
+        command = _build_codex_exec_resume_command(
+            codex_bin=codex_bin,
+            output_path=output_path,
+            thread_id=thread_id,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+        )
         completed = subprocess.run(
-            [
-                codex_bin,
-                "exec",
-                "resume",
-                "--skip-git-repo-check",
-                "-o",
-                str(output_path),
-                thread_id,
-                "-",
-            ],
+            command,
             input=prompt,
             capture_output=True,
             text=True,
