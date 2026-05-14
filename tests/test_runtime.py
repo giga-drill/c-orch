@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import threading
+import time
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 from unittest import mock
 
 from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalPool, ProposalRecord, ProposalStore
 from c_orch.run_store import PlanRecord, RunStore
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
-from c_orch.states import RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
+from c_orch.states import RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
 from c_orch.task_store import TaskStore
 
 
@@ -30,6 +32,45 @@ class _FakeOrchestrator:
         manifest.status = self.status
         self.run_store.save(manifest)
         self.run_ids.append(manifest.run_id)
+        return manifest
+
+
+class _FakeProposalPlanner:
+    def __init__(
+        self,
+        run_store: RunStore,
+        *,
+        block_event: Optional[threading.Event] = None,
+        block_first_call: bool = False,
+        fail_by_run_id: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.run_store = run_store
+        self.block_event = block_event
+        self.block_first_call = block_first_call
+        self.fail_by_run_id = fail_by_run_id or {}
+        self.run_calls = 0
+        self.run_ids: List[str] = []
+        self.started = threading.Event()
+
+    def run(self, manifest):  # type: ignore[no-untyped-def]
+        self.run_calls += 1
+        self.run_ids.append(manifest.run_id)
+        self.started.set()
+        should_block = self.block_event is not None and (not self.block_first_call or self.run_calls == 1)
+        if should_block:
+            self.block_event.wait(timeout=5)
+        failure_message = self.fail_by_run_id.get(manifest.run_id)
+        if failure_message:
+            raise RuntimeError(failure_message)
+        manifest.status = RUN_PLAN_REVIEW_REQUIRED
+        manifest.plan = PlanRecord(
+            summary=f"Plan for {manifest.run_id}",
+            worker_prompt=f"Implement {manifest.user_task}",
+            risk_notes=["risk-1"],
+        )
+        manifest.acceptance_criteria = [f"accept-{manifest.run_id}"]
+        manifest.verification_commands = ["pytest -q"]
+        self.run_store.save(manifest)
         return manifest
 
 
@@ -222,6 +263,154 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(int(status), 400)
             self.assertEqual(payload["error"], "missing queue file")
 
+    def test_create_proposal_returns_immediately_and_dispatches_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            block_event = threading.Event()
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(
+                run_store,
+                block_event=block_event,
+                block_first_call=True,
+            )
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            start = time.monotonic()
+            status, payload = runtime.create_proposal("Task 1", "Do task 1")
+            elapsed = time.monotonic() - start
+
+            self.assertEqual(int(status), 200)
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(payload["transition"]["type"], "proposal_created")
+            proposal = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(proposal.status, "PLANNING")
+            self.assertIsNotNone(proposal.run_id)
+            self.assertTrue(fake_planner.started.wait(timeout=1.0))
+
+            block_event.set()
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+    def test_proposal_background_planning_success_updates_plan_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status, payload = runtime.create_proposal("Task 1", "Do task 1")
+            self.assertEqual(int(status), 200)
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(len(proposals), 1)
+            proposal = proposals[0]
+            self.assertEqual(proposal["status"], "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(proposal["allowed_actions"], ["approve-plan", "revise-plan"])
+            self.assertIsNotNone(proposal["plan_detail"])
+            self.assertEqual(proposal["plan_detail"]["summary"], f"Plan for {proposal['run_id']}")
+            self.assertEqual(proposal["plan_detail"]["worker_prompt"], "Implement Do task 1")
+            self.assertEqual(proposal["plan_detail"]["acceptance_criteria"], [f"accept-{proposal['run_id']}"])
+            self.assertEqual(proposal["plan_detail"]["verification_commands"], ["pytest -q"])
+
+    def test_proposal_background_planning_failure_persists_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            block_event = threading.Event()
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(
+                run_store,
+                block_event=block_event,
+                block_first_call=True,
+            )
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status, payload = runtime.create_proposal("Task 1", "Do task 1")
+            self.assertEqual(int(status), 200)
+            run_id = payload["transition"]["run_id"]
+            self.assertTrue(fake_planner.started.wait(timeout=1.0))
+            fake_planner.fail_by_run_id[run_id] = "planner exploded"
+            block_event.set()
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+            proposals_payload = runtime.build_proposals_payload()
+            proposal = proposals_payload["proposals"][0]
+            self.assertEqual(proposal["status"], "FAILED")
+            self.assertIn("planner exploded", proposal["error"])
+            self.assertEqual(proposal["reason"], "proposal_planning_failed")
+            manifest = run_store.load(run_id)
+            self.assertEqual(manifest.status, RUN_FAILED)
+
+            manifest.status = "NEW"
+            run_store.save(manifest)
+            refreshed = runtime.build_proposals_payload()["proposals"][0]
+            self.assertEqual(refreshed["status"], "FAILED")
+
+    def test_create_multiple_proposals_keep_unique_run_ids_and_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            block_event = threading.Event()
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(
+                run_store,
+                block_event=block_event,
+                block_first_call=True,
+            )
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            runtime.create_proposal("Task 1", "Do task 1")
+            self.assertTrue(fake_planner.started.wait(timeout=1.0))
+            runtime.create_proposal("Task 2", "Do task 2")
+            runtime.create_proposal("Task 3", "Do task 3")
+            pool = ProposalStore(root / "proposals.json").load()
+            self.assertEqual(len(pool.proposals), 3)
+            self.assertEqual({proposal.status for proposal in pool.proposals}, {"PLANNING"})
+            run_ids_before = [proposal.run_id for proposal in pool.proposals]
+            self.assertTrue(all(run_ids_before))
+            self.assertEqual(len(set(run_ids_before)), 3)
+
+            block_event.set()
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=4))
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(len(proposals), 3)
+            self.assertTrue(all(proposal["status"] == "PLAN_REVIEW_REQUIRED" for proposal in proposals))
+            self.assertEqual(len({proposal["run_id"] for proposal in proposals}), 3)
+
     def test_create_proposal_with_task_cwd_uses_target_repo_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -230,6 +419,8 @@ class RuntimeTests(unittest.TestCase):
             target_repo = root / "target-repo"
             target_repo.mkdir()
             worktree_repo_paths: List[Path] = []
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
 
             def worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str, worker_id: str) -> Path:
                 worktree_repo_paths.append(repo_path)
@@ -243,23 +434,14 @@ class RuntimeTests(unittest.TestCase):
                 scheduler_config=replace(_scheduler_config(root), cwd=dashboard_repo),
                 driver_factory=_fake_driver_factory,
                 worktree_factory=worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
             )
-
-            with mock.patch("c_orch.orchestrator.RunOrchestrator") as orchestrator_cls:
-                orchestrator = orchestrator_cls.return_value
-
-                def run_side_effect(manifest):  # type: ignore[no-untyped-def]
-                    manifest.status = RUN_PLAN_REVIEW_REQUIRED
-                    manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
-                    return manifest
-
-                orchestrator.run.side_effect = run_side_effect
-                status, _payload = runtime.create_proposal("Task 1", "Do task 1", "../target-repo")
+            status, _payload = runtime.create_proposal("Task 1", "Do task 1", "../target-repo")
 
             self.assertEqual(int(status), 200)
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
             proposal_store = ProposalStore(root / "proposals.json")
             proposal = proposal_store.load().proposals[0]
-            run_store = RunStore(root / "runs")
             manifest = run_store.load(proposal.run_id or "")
 
             self.assertEqual(Path(proposal.cwd or "").resolve(), target_repo.resolve())

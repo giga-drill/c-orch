@@ -34,6 +34,9 @@ entrypoints or the queue scheduler. Dashboard actions should return an explicit
 transition result plus a fresh state snapshot, so the frontend can converge even
 when a proposal is removed from the pool or a runtime restart interrupts an
 in-flight request.
+`POST /api/proposals` is also a control-plane action: it should persist proposal
+and run metadata quickly, then let backend async dispatchers continue Planner
+work outside the HTTP request.
 
 The dashboard server keeps a process-lifetime runtime object. That runtime may
 reuse a live Codex MCP driver as a performance and continuity optimization, but

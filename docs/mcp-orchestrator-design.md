@@ -94,6 +94,7 @@ User task
 - `c-orch run --auto-approve-plan` 可跳过人类方案审批点，直接延续旧的一次性执行流程。
 - Dashboard 新任务默认走 proposal pool：Planner 方案被人工通过后，runtime 会把同一个 run 标记为 `PLAN_APPROVED`，再创建 execution queue task。scheduler 看到这个 task 已绑定 approved run 时，会继续该 run，而不是重建 Planner run。
 - proposal approve 入队时，execution task 会继承 proposal 的 `cwd`、`active_run_id` 和 `run_ids`；后续 retry 仍在同一目标 repo 创建新 run attempt。
+- `POST /api/proposals` 不再同步等待 Planner。runtime 先持久化 proposal + preflight run（含 worktree 绑定）并立即返回 `PLANNING`，随后由后台 proposal dispatcher 按后端并发上限异步执行 Planner，成功后把 proposal 更新为 `PLAN_REVIEW_REQUIRED`，失败时更新为 `FAILED` 并持久化错误原因。
 
 ## 组件
 

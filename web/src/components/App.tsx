@@ -36,7 +36,7 @@ const statusText: Record<string, string> = {
   BLOCKED: "阻塞",
   RESTART_REQUIRED: "需要重启",
   NEW: "新建",
-  PLANNING: "Planner 规划中",
+  PLANNING: "Planner 方案生成中",
   PLAN_READY: "计划已生成",
   PLAN_REVIEW_REQUIRED: "等待人工审核计划",
   PLAN_REVISING: "Planner 修改计划中",
@@ -379,7 +379,7 @@ function ProposalPanel({
           onClick={createProposal}
           disabled={createMutation.isPending || !title.trim() || !prompt.trim()}
         >
-          {createMutation.isPending ? "生成计划中..." : "生成 Planner 方案"}
+          {createMutation.isPending ? "创建中..." : "生成 Planner 方案"}
         </button>
       </div>
       {error ? <div className="error">{error}</div> : null}
@@ -401,7 +401,13 @@ function ProposalPanel({
               <span className="meta">waiting_for: {displayValue(proposal.waiting_for)}</span>
               <span className="meta">run_id: {displayValue(proposal.run_id)}</span>
             </button>
-            <ProposalPlanPanel plan={proposal.plan_detail} fallbackSummary={proposal.run?.plan?.summary} />
+            <ProposalPlanPanel
+              status={proposal.status}
+              error={proposal.error}
+              reason={proposal.reason}
+              plan={proposal.plan_detail}
+              fallbackSummary={proposal.run?.plan?.summary}
+            />
             {proposal.allowed_actions.includes("approve-plan") ? (
               <div className="proposalActions">
                 <button
@@ -439,13 +445,30 @@ function ProposalPanel({
 }
 
 function ProposalPlanPanel({
+  status,
+  error,
+  reason,
   plan,
   fallbackSummary,
 }: {
+  status: string;
+  error?: string | null;
+  reason?: string | null;
   plan?: ProposalPlanDetail | null;
   fallbackSummary?: string | null;
 }) {
   if (!plan) {
+    if (status === "PLANNING") {
+      return <p className="meta">Planner 方案生成中...</p>;
+    }
+    if (status === "FAILED") {
+      return (
+        <p className="error">
+          规划失败：{displayValue(error)}
+          {reason ? `（${reason}）` : ""}
+        </p>
+      );
+    }
     return fallbackSummary ? <p>{fallbackSummary}</p> : null;
   }
   return (

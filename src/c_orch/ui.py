@@ -86,6 +86,7 @@ def build_server(
     server = ThreadingHTTPServer((host, port), handler)
     setattr(server, "c_orch_runtime", runtime)
     runtime.dispatch_queue_async()
+    runtime.dispatch_proposals_async()
     return server
 
 

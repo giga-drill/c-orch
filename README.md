@@ -27,6 +27,8 @@ the approved Planner context. Revising a proposal sends feedback back to the
 same Planner thread and waits for a new plan. The execution queue is reserved
 for plans that have already been approved and can move automatically until a
 restart gate, failure, or task completion.
+Proposal creation now returns immediately after persisting proposal/run records;
+Planner plan generation continues in a backend proposal dispatcher thread.
 
 Each proposal/task can also bind its own target repository `cwd`. If omitted,
 the runtime falls back to the current `--cwd`. This allows one queue file to
@@ -187,6 +189,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   backend actions or the scheduler. Successful actions return a transition
   result plus a fresh state snapshot so the UI does not have to infer state from
   stale proposal, queue, or run caches.
+- Proposal planning dispatch is backend-owned. `POST /api/proposals` only
+  creates persistent proposal/run records and triggers async planning; the UI
+  does not block on planner completion.
 - Restart-gate acknowledgment must go through backend queue action
   `POST /api/queue/actions` with `action=confirm-runtime-restarted`; the UI does
   not directly edit run manifests or queue files. The supervisor also uses this

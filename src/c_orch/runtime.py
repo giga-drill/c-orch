@@ -43,6 +43,7 @@ from .worktrees import create_worker_worktree
 Pathish = Union[str, Path]
 RunActionResponse = Optional[Tuple[HTTPStatus, Dict[str, Any]]]
 DriverFactory = Callable[[str], ContextManager[CodexDriver]]
+PROPOSAL_PLANNING_CONCURRENCY = 1
 
 
 class COrchRuntime:
@@ -77,12 +78,17 @@ class COrchRuntime:
         self._action_lock = threading.RLock()
         self._driver_lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
+        self._proposal_dispatch_lock = threading.RLock()
         self._drivers: Dict[str, Any] = {}
         self._dispatch_thread: Optional[threading.Thread] = None
+        self._proposal_dispatch_thread: Optional[threading.Thread] = None
         self._last_dispatch_error: Optional[str] = None
+        self._last_proposal_dispatch_error: Optional[str] = None
         self._runtime_generation = f"{datetime.now().astimezone().isoformat(timespec='seconds')}:{os.getpid()}"
         if self.proposals_path is not None:
             prune_queued_proposals(self.proposals_path)
+        if self.proposals_path is not None and self._scheduler_config is not None:
+            self.dispatch_proposals_async()
 
     def build_runs_payload(self) -> Dict[str, Any]:
         return build_runs_payload(self.runs_dir)
@@ -97,13 +103,20 @@ class COrchRuntime:
         return build_run_payload(self.runs_dir, run_id)
 
     def build_state_payload(self, selected_run_id: Optional[str] = None) -> Dict[str, Any]:
+        queue_dispatch_running = self._dispatch_thread is not None and self._dispatch_thread.is_alive()
+        proposal_dispatch_running = (
+            self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive()
+        )
         return build_state_payload(
             runs_dir=self.runs_dir,
             queue_path=self.queue_path,
             proposals_path=self.proposals_path,
             runtime_generation=self._runtime_generation,
-            dispatch_running=self._dispatch_thread is not None and self._dispatch_thread.is_alive(),
+            dispatch_running=queue_dispatch_running or proposal_dispatch_running,
+            queue_dispatch_running=queue_dispatch_running,
+            proposal_dispatch_running=proposal_dispatch_running,
             last_dispatch_error=self._last_dispatch_error,
+            last_proposal_dispatch_error=self._last_proposal_dispatch_error,
             selected_run_id=selected_run_id,
         )
 
@@ -167,9 +180,10 @@ class COrchRuntime:
                 cwd,
                 runs_dir=self.runs_dir,
                 config=self._scheduler_config,
-                driver_factory=self._driver_context,
                 worktree_factory=self._worktree_factory,
             )
+            if result is not None and int(result[0]) < 400:
+                self.dispatch_proposals_async()
             return self._attach_state(result)
 
     def proposal_action(
@@ -223,6 +237,32 @@ class COrchRuntime:
         thread.join(timeout=timeout)
         return not thread.is_alive()
 
+    def dispatch_proposals_async(self) -> bool:
+        """Start one background proposal planning dispatcher pass."""
+        if self.proposals_path is None or self._scheduler_config is None:
+            return False
+        with self._proposal_dispatch_lock:
+            if self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive():
+                return False
+            self._last_proposal_dispatch_error = None
+            thread = threading.Thread(
+                target=self._dispatch_proposals_worker,
+                name="c-orch-proposal-dispatch",
+                daemon=True,
+            )
+            self._proposal_dispatch_thread = thread
+            thread.start()
+            return True
+
+    def wait_for_proposal_dispatch(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the current background proposal dispatcher pass; mainly used by tests."""
+        with self._proposal_dispatch_lock:
+            thread = self._proposal_dispatch_thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def close(self) -> None:
         with self._driver_lock:
             drivers = list(self._drivers.values())
@@ -267,6 +307,12 @@ class COrchRuntime:
         except Exception as exc:
             self._last_dispatch_error = str(exc)
 
+    def _dispatch_proposals_worker(self) -> None:
+        try:
+            self._run_proposal_dispatch_loop()
+        except Exception as exc:
+            self._last_proposal_dispatch_error = str(exc)
+
     def _run_queue_once(self) -> None:
         if self.queue_path is None or self._scheduler_config is None:
             return
@@ -281,6 +327,167 @@ class COrchRuntime:
                 **self._scheduler_overrides(),
             )
             scheduler.run()
+
+    def _run_proposal_dispatch_loop(self) -> None:
+        if self.proposals_path is None or self._scheduler_config is None:
+            return
+        while True:
+            claimed = self._claim_planning_proposals(limit=PROPOSAL_PLANNING_CONCURRENCY)
+            if not claimed:
+                return
+            for proposal_id, run_id in claimed:
+                self._process_proposal_planning_job(proposal_id=proposal_id, run_id=run_id)
+
+    def _claim_planning_proposals(self, *, limit: int) -> List[Tuple[str, str]]:
+        if self.proposals_path is None:
+            return []
+        with self._action_lock:
+            proposal_store = ProposalStore(self.proposals_path)
+            try:
+                pool = proposal_store.load()
+            except (OSError, ValueError):
+                return []
+            claimed: List[Tuple[str, str]] = []
+            for proposal in pool.proposals:
+                if len(claimed) >= limit:
+                    break
+                if proposal.status != PROPOSAL_PLANNING:
+                    continue
+                if not proposal.run_id:
+                    continue
+                claimed.append((proposal.proposal_id, proposal.run_id))
+            return claimed
+
+    def _process_proposal_planning_job(self, *, proposal_id: str, run_id: str) -> None:
+        if self._scheduler_config is None:
+            return
+        run_store = RunStore(self.runs_dir)
+        try:
+            manifest = run_store.load(run_id)
+        except OSError as exc:
+            self._mark_proposal_planning_failed(
+                proposal_id=proposal_id,
+                run_id=run_id,
+                error=str(exc),
+                reason="proposal_run_not_found",
+            )
+            return
+        if manifest.status not in {"NEW", "PLANNING"}:
+            self._sync_proposal_from_manifest(proposal_id=proposal_id, manifest=manifest)
+            return
+        planner_error: Optional[Exception] = None
+        try:
+            with self._driver_context(self._scheduler_config.codex_binary_path) as driver:
+                orchestrator = self._build_proposal_orchestrator(run_store=run_store, driver=driver)
+                manifest = orchestrator.run(manifest)
+        except Exception as exc:
+            planner_error = exc
+        if planner_error is not None:
+            self._mark_run_failed_after_planner_exception(run_store=run_store, run_id=run_id, error=planner_error)
+            self._mark_proposal_planning_failed(
+                proposal_id=proposal_id,
+                run_id=run_id,
+                error=str(planner_error),
+                reason="proposal_planning_failed",
+            )
+            return
+        self._sync_proposal_from_manifest(proposal_id=proposal_id, manifest=manifest)
+
+    def _build_proposal_orchestrator(self, *, run_store: RunStore, driver: CodexDriver) -> OrchestratorLike:
+        if self._orchestrator_factory is not None:
+            return self._orchestrator_factory()
+        from .orchestrator import OrchestratorConfig, RunOrchestrator
+
+        return RunOrchestrator(
+            store=run_store,
+            driver=driver,
+            config=OrchestratorConfig(
+                sandbox=self._scheduler_config.sandbox,
+                approval_policy=self._scheduler_config.approval_policy,
+                max_attempts=self._scheduler_config.max_attempts,
+                require_plan_approval=True,
+                approve_plan=False,
+            ),
+        )
+
+    def _sync_proposal_from_manifest(self, *, proposal_id: str, manifest: RunManifest) -> None:
+        if self.proposals_path is None:
+            return
+        with self._action_lock:
+            proposal_store = ProposalStore(self.proposals_path)
+            try:
+                pool = proposal_store.load()
+                proposal = proposal_store.find(pool, proposal_id)
+            except (OSError, ValueError):
+                return
+            if proposal.status == PROPOSAL_FAILED:
+                return
+            status = _proposal_status_from_run(manifest)
+            error = None
+            reason = derive_run_waiting_for(manifest)
+            if status == PROPOSAL_FAILED and not error:
+                error = proposal.error or "Planner failed to produce a plan."
+            proposal_store.update_proposal(
+                pool,
+                proposal_id,
+                status=status,
+                error=error,
+                reason=reason,
+            )
+            proposal_store.save(pool)
+
+    def _mark_proposal_planning_failed(
+        self,
+        *,
+        proposal_id: str,
+        run_id: str,
+        error: str,
+        reason: str,
+    ) -> None:
+        if self.proposals_path is None:
+            return
+        with self._action_lock:
+            proposal_store = ProposalStore(self.proposals_path)
+            try:
+                pool = proposal_store.load()
+                proposal_store.find(pool, proposal_id)
+            except (OSError, ValueError):
+                return
+            proposal_store.update_proposal(
+                pool,
+                proposal_id,
+                status=PROPOSAL_FAILED,
+                error=error,
+                reason=reason,
+                run_id=run_id,
+            )
+            proposal_store.save(pool)
+
+    def _mark_run_failed_after_planner_exception(
+        self,
+        *,
+        run_store: RunStore,
+        run_id: str,
+        error: Exception,
+    ) -> None:
+        try:
+            manifest = run_store.load(run_id)
+        except OSError:
+            return
+        if manifest.status != "FAILED":
+            manifest.status = "FAILED"
+            manifest.planner.status = "FAILED"
+            for worker in manifest.workers:
+                if worker.status == "PENDING":
+                    worker.status = "FAILED"
+            run_store.save(manifest)
+        run_store.append_event(
+            run_id,
+            "proposal_planning_failed",
+            "Planner failed while generating proposal plan.",
+            reason="proposal_planning_failed",
+            error=str(error),
+        )
 
     def _scheduler_overrides(self) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
@@ -473,7 +680,6 @@ def create_proposal(
     *,
     runs_dir: Pathish,
     config: SchedulerConfig,
-    driver_factory: DriverFactory,
     worktree_factory: Optional[Callable[..., Path]] = None,
 ) -> RunActionResponse:
     if not isinstance(title, str) or not title.strip():
@@ -505,30 +711,13 @@ def create_proposal(
             task_cwd=proposal_cwd,
             worktree_factory=worktree_factory,
         )
-        proposal_store.update_proposal(pool, proposal.proposal_id, run_id=manifest.run_id)
-        proposal_store.save(pool)
-        with driver_factory(config.codex_binary_path) as driver:
-            from .orchestrator import OrchestratorConfig, RunOrchestrator
-
-            orchestrator = RunOrchestrator(
-                store=run_store,
-                driver=driver,
-                config=OrchestratorConfig(
-                    sandbox=config.sandbox,
-                    approval_policy=config.approval_policy,
-                    max_attempts=config.max_attempts,
-                    require_plan_approval=True,
-                    approve_plan=False,
-                ),
-            )
-            manifest = orchestrator.run(manifest)
-        status = _proposal_status_from_run(manifest)
         proposal_store.update_proposal(
             pool,
             proposal.proposal_id,
-            status=status,
-            error=None if status != PROPOSAL_FAILED else "Planner failed to produce a plan.",
-            reason=derive_run_waiting_for(manifest),
+            run_id=manifest.run_id,
+            status=PROPOSAL_PLANNING,
+            error=None,
+            reason="planner",
         )
         proposal_store.save(pool)
     except Exception as exc:
@@ -537,7 +726,7 @@ def create_proposal(
             proposal.proposal_id,
             status=PROPOSAL_FAILED,
             error=str(exc),
-            reason="proposal_create_failed",
+            reason="proposal_preflight_failed",
         )
         proposal_store.save(pool)
         return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
@@ -737,7 +926,10 @@ def build_state_payload(
     proposals_path: Optional[Pathish],
     runtime_generation: str,
     dispatch_running: bool = False,
+    queue_dispatch_running: bool = False,
+    proposal_dispatch_running: bool = False,
     last_dispatch_error: Optional[str] = None,
+    last_proposal_dispatch_error: Optional[str] = None,
     selected_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     runs_payload = build_runs_payload(runs_dir)
@@ -760,7 +952,10 @@ def build_state_payload(
             "generation": runtime_generation,
             "pid": os.getpid(),
             "dispatch_running": dispatch_running,
+            "queue_dispatch_running": queue_dispatch_running,
+            "proposal_dispatch_running": proposal_dispatch_running,
             "last_dispatch_error": last_dispatch_error,
+            "last_proposal_dispatch_error": last_proposal_dispatch_error,
         },
         "proposals": proposals_payload,
         "queue": queue_payload,

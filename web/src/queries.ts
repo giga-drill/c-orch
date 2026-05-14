@@ -13,6 +13,7 @@ import {
 } from "./api/client";
 import type { AllowedProposalAction, AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
 import type { ActionResponse } from "./api/types";
+import type { DashboardStatePayload } from "./api/types";
 
 export const queryKeys = {
   queue: ["queue"] as const,
@@ -60,7 +61,19 @@ export function useRunsQuery() {
 }
 
 export function useDashboardStateQuery() {
-  return useQuery({ queryKey: queryKeys.state, queryFn: fetchState });
+  return useQuery({
+    queryKey: queryKeys.state,
+    queryFn: fetchState,
+    refetchInterval: (query) => {
+      const payload = query.state.data as DashboardStatePayload | undefined;
+      const activeProposals = payload?.proposals.summary?.active ?? 0;
+      const runtimeBusy = Boolean(
+        payload?.runtime.dispatch_running || payload?.runtime.proposal_dispatch_running,
+      );
+      return activeProposals > 0 || runtimeBusy ? 2000 : false;
+    },
+    refetchIntervalInBackground: true,
+  });
 }
 
 export function useRunQuery(runId: string | null) {

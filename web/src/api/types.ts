@@ -223,7 +223,10 @@ export interface RuntimeState {
   generation: string;
   pid: number;
   dispatch_running: boolean;
+  queue_dispatch_running?: boolean;
+  proposal_dispatch_running?: boolean;
   last_dispatch_error: string | null;
+  last_proposal_dispatch_error?: string | null;
 }
 
 export interface DashboardStatePayload {
