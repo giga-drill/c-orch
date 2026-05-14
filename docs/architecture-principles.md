@@ -31,6 +31,9 @@ The dashboard server keeps a process-lifetime runtime object. That runtime may
 reuse a live Codex MCP driver as a performance and continuity optimization, but
 MCP process memory is volatile cache only. Persisted run manifests, event logs,
 Codex thread ids, and Codex disk sessions remain the recovery source of truth.
+For self-modifying runs, `c-orch supervise-ui` is the preferred wrapper around
+the dashboard server. The supervisor owns process restart, while the restarted
+backend still owns clearing the restart gate through the normal queue action.
 
 Planner and Worker own semantic work:
 
@@ -68,7 +71,9 @@ approved plan -> Worker execution -> Planner review -> apply -> commit
 This boundary keeps the queue pipeline from stopping on human plan review. The
 queue may still stop at explicit operational gates such as restart confirmation
 or failed task retry, but it should not treat "waiting for human plan approval"
-as normal executable queue progress.
+as normal executable queue progress. When the dashboard is supervised, the
+restart confirmation gate can be cleared automatically after the child runtime
+has been restarted.
 
 Business run states describe where the task is in the Planner/Human/Worker
 loop:

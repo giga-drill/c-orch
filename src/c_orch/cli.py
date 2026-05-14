@@ -224,6 +224,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional task queue file for dashboard queue view.",
     )
 
+    supervise_ui = subparsers.add_parser(
+        "supervise-ui",
+        help="Run the local dashboard under a supervisor that auto-restarts restart gates.",
+    )
+    supervise_ui.add_argument("--cwd", default=".", help="Target repository path.")
+    supervise_ui.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    supervise_ui.add_argument("--runs-dir", default=None, help="Run manifest directory.")
+    supervise_ui.add_argument("--host", default=None, help="Host interface to bind.")
+    supervise_ui.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for the local dashboard.",
+    )
+    supervise_ui.add_argument(
+        "--queue-file",
+        default=None,
+        help="Optional task queue file for dashboard queue view.",
+    )
+    supervise_ui.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between supervisor queue checks.",
+    )
+    supervise_ui.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the dashboard child process to become ready.",
+    )
+    supervise_ui.add_argument(
+        "--stop-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for graceful dashboard shutdown before killing it.",
+    )
+
     queue = subparsers.add_parser(
         "queue",
         help="Manage and execute a serial task queue.",
@@ -874,6 +912,44 @@ def run_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_supervise_ui(args: argparse.Namespace) -> int:
+    from .config import load_project_config
+    from .supervisor import DashboardSupervisor, SupervisorConfig, build_ui_command
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.ui.runs_dir)
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    host = args.host or project_config.ui.host
+    port = args.port or project_config.ui.port
+    command = build_ui_command(
+        cwd=cwd,
+        runs_dir=runs_dir,
+        queue_path=queue_path,
+        host=host,
+        port=port,
+        config_path=args.config,
+    )
+    print(f"c-orch supervisor: http://{host}:{port}", flush=True)
+    print(f"runs_dir: {runs_dir}", flush=True)
+    print(f"queue_file: {queue_path}", flush=True)
+    supervisor = DashboardSupervisor(
+        SupervisorConfig(
+            command=command,
+            cwd=cwd,
+            base_url=f"http://{host}:{port}",
+            poll_interval_seconds=args.poll_interval,
+            startup_timeout_seconds=args.startup_timeout,
+            stop_timeout_seconds=args.stop_timeout,
+        )
+    )
+    return supervisor.run_forever()
+
+
 def _resolve_under_cwd(cwd: Path, value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
@@ -967,6 +1043,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_resume(args)
     if args.command == "ui":
         return run_ui(args)
+    if args.command == "supervise-ui":
+        return run_supervise_ui(args)
     if args.command == "queue":
         if args.queue_command == "import":
             return run_queue_import(args)

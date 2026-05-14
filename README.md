@@ -80,6 +80,16 @@ PYTHONPATH=src python3.11 -m c_orch.cli ui \
   --runs-dir runs
 ```
 
+For self-modifying Cork runs, prefer the supervised dashboard. It starts the
+same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the
+child, and then clears the restart gate through the backend queue action:
+
+```bash
+PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs
+```
+
 When run events are available, the local run dashboard shows a per-run Timeline.
 When a queue file is configured, the dashboard also shows a plan proposal pool
 beside the execution queue. Use the proposal pool for new tasks that should get
@@ -150,8 +160,9 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   Worker start and retryable review attempts after Worker execution. Dashboard
   task submission uses a proposal pool so `human_plan_review` happens before
   the task enters the execution queue. Queue scheduling can auto-trigger
-  `retry_review` from saved evidence, but `restart` remains an explicit human
-  gate.
+  `retry_review` from saved evidence. `restart` remains an operational gate when
+  running the plain dashboard, and the `supervise-ui` wrapper can clear it after
+  restarting the UI/runtime child.
 - The current MVP does not support parallel runs that modify the same target
   repo. Run such tasks serially; otherwise patch apply can conflict with commits
   made while a Worker was running.
@@ -163,7 +174,8 @@ has `gpt-5.5`; the older Homebrew CLI does not.
   Codex driver usage, and Orchestrator state transitions.
 - Restart-gate acknowledgment must go through backend queue action
   `POST /api/queue/actions` with `action=confirm-runtime-restarted`; the UI does
-  not directly edit run manifests or queue files.
+  not directly edit run manifests or queue files. The supervisor also uses this
+  backend action after it restarts the dashboard child process.
 - The dashboard server keeps one `COrchRuntime` for its process lifetime. The
   runtime may reuse a live MCP driver for speed, but c-orch still treats MCP
   state as volatile and falls back to `codex exec resume` when needed.
