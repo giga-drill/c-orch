@@ -152,9 +152,15 @@ class RuntimeTests(unittest.TestCase):
                 orchestrator_factory=lambda: fake,
             )
 
-            status, _payload = runtime.proposal_action(proposal.proposal_id, "approve-plan")
+            status, payload = runtime.proposal_action(proposal.proposal_id, "approve-plan")
 
             self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_approved_and_queued")
+            self.assertEqual(payload["transition"]["run_id"], manifest.run_id)
+            self.assertEqual(payload["transition"]["task_id"], proposal.proposal_id)
+            self.assertIn("state", payload)
+            self.assertEqual(payload["state"]["selected_run"]["run"]["run_id"], manifest.run_id)
+            self.assertGreater(payload["state_version"], 0)
             self.assertTrue(runtime.wait_for_dispatch(timeout=2))
 
             loaded_manifest = run_store.load(manifest.run_id)

@@ -102,6 +102,9 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
             if path == "/api/proposals":
                 self._send_json(HTTPStatus.OK, runtime.build_proposals_payload())
                 return
+            if path == "/api/state":
+                self._send_json(HTTPStatus.OK, runtime.build_state_payload())
+                return
             if path.startswith("/api/runs/"):
                 run_id = unquote(path[len("/api/runs/"):])
                 payload = runtime.build_run_payload(run_id)

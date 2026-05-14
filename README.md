@@ -172,6 +172,12 @@ has `gpt-5.5`; the older Homebrew CLI does not.
 - The dashboard UI renders state and sends user intent only. Dashboard actions
   are handled by the backend `COrchRuntime`, which owns action validation,
   Codex driver usage, and Orchestrator state transitions.
+- The dashboard's source of truth is the backend state snapshot at
+  `GET /api/state`. `GET` endpoints are read-only; queue reconciliation for
+  display happens in memory, while persisted state changes happen through
+  backend actions or the scheduler. Successful actions return a transition
+  result plus a fresh state snapshot so the UI does not have to infer state from
+  stale proposal, queue, or run caches.
 - Restart-gate acknowledgment must go through backend queue action
   `POST /api/queue/actions` with `action=confirm-runtime-restarted`; the UI does
   not directly edit run manifests or queue files. The supervisor also uses this

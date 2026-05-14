@@ -4,6 +4,7 @@ import {
   fetchQueue,
   fetchRun,
   fetchRuns,
+  fetchState,
   postProposal,
   postProposalAction,
   postQueueAction,
@@ -11,21 +12,38 @@ import {
   postTaskAction,
 } from "./api/client";
 import type { AllowedProposalAction, AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
+import type { ActionResponse } from "./api/types";
 
 export const queryKeys = {
   queue: ["queue"] as const,
   proposals: ["proposals"] as const,
   runs: ["runs"] as const,
+  state: ["state"] as const,
   run: (runId: string) => ["run", runId] as const,
 };
 
 function refreshDashboardQueries(queryClient: QueryClient, runId?: string | null) {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.state });
   void queryClient.invalidateQueries({ queryKey: queryKeys.proposals });
   void queryClient.invalidateQueries({ queryKey: queryKeys.queue });
   void queryClient.invalidateQueries({ queryKey: queryKeys.runs });
   void queryClient.invalidateQueries({ queryKey: ["run"] });
   if (runId) {
     void queryClient.invalidateQueries({ queryKey: queryKeys.run(runId) });
+  }
+}
+
+function selectedRunFromAction(payload: ActionResponse): string | null {
+  const selected = payload.transition?.selected_run_id ?? payload.transition?.run_id;
+  return selected || null;
+}
+
+function updateStateFromAction(queryClient: QueryClient, payload: ActionResponse) {
+  if (payload.state) {
+    queryClient.setQueryData(queryKeys.state, payload.state);
+    if (payload.state.selected_run) {
+      queryClient.setQueryData(queryKeys.run(payload.state.selected_run.run.run_id), payload.state.selected_run);
+    }
   }
 }
 
@@ -39,6 +57,10 @@ export function useProposalsQuery() {
 
 export function useRunsQuery() {
   return useQuery({ queryKey: queryKeys.runs, queryFn: fetchRuns });
+}
+
+export function useDashboardStateQuery() {
+  return useQuery({ queryKey: queryKeys.state, queryFn: fetchState });
 }
 
 export function useRunQuery(runId: string | null) {
@@ -62,7 +84,7 @@ export function useRunActionMutation() {
       payload?: Record<string, unknown>;
     }) => postRunAction(runId, action, payload),
     onSuccess: (payload, variables) => {
-      queryClient.setQueryData(queryKeys.run(variables.runId), payload);
+      updateStateFromAction(queryClient, payload);
       refreshDashboardQueries(queryClient, variables.runId);
     },
   });
@@ -74,8 +96,8 @@ export function useTaskActionMutation() {
     mutationFn: ({ taskId, action }: { taskId: string; action: AllowedTaskAction }) =>
       postTaskAction(taskId, action),
     onSuccess: (payload) => {
-      queryClient.setQueryData(queryKeys.queue, payload);
-      refreshDashboardQueries(queryClient);
+      updateStateFromAction(queryClient, payload);
+      refreshDashboardQueries(queryClient, selectedRunFromAction(payload));
     },
   });
 }
@@ -85,8 +107,8 @@ export function useQueueActionMutation() {
   return useMutation({
     mutationFn: ({ action }: { action: AllowedQueueAction }) => postQueueAction(action),
     onSuccess: (payload) => {
-      queryClient.setQueryData(queryKeys.queue, payload);
-      refreshDashboardQueries(queryClient);
+      updateStateFromAction(queryClient, payload);
+      refreshDashboardQueries(queryClient, selectedRunFromAction(payload));
     },
   });
 }
@@ -96,8 +118,8 @@ export function useCreateProposalMutation() {
   return useMutation({
     mutationFn: ({ title, prompt }: { title: string; prompt: string }) => postProposal(title, prompt),
     onSuccess: (payload) => {
-      queryClient.setQueryData(queryKeys.proposals, payload);
-      refreshDashboardQueries(queryClient);
+      updateStateFromAction(queryClient, payload);
+      refreshDashboardQueries(queryClient, selectedRunFromAction(payload));
     },
   });
 }
@@ -114,10 +136,9 @@ export function useProposalActionMutation() {
       action: AllowedProposalAction;
       payload?: Record<string, unknown>;
     }) => postProposalAction(proposalId, action, payload),
-    onSuccess: (payload, variables) => {
-      queryClient.setQueryData(queryKeys.proposals, payload);
-      const proposal = payload.proposals.find((item) => item.proposal_id === variables.proposalId);
-      refreshDashboardQueries(queryClient, proposal?.run_id);
+    onSuccess: (payload) => {
+      updateStateFromAction(queryClient, payload);
+      refreshDashboardQueries(queryClient, selectedRunFromAction(payload));
     },
   });
 }

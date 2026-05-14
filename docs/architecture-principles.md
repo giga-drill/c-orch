@@ -27,6 +27,14 @@ render run/task state and send user intent to the backend. Backend runtime code
 owns action validation, Codex driver usage, Orchestrator calls, and manifest
 updates.
 
+The dashboard reads a backend-authored state snapshot. `GET` endpoints must be
+pure reads: they may derive display summaries in memory, but they must not write
+queue, proposal, or run files. State changes must happen through backend action
+entrypoints or the queue scheduler. Dashboard actions should return an explicit
+transition result plus a fresh state snapshot, so the frontend can converge even
+when a proposal is removed from the pool or a runtime restart interrupts an
+in-flight request.
+
 The dashboard server keeps a process-lifetime runtime object. That runtime may
 reuse a live Codex MCP driver as a performance and continuity optimization, but
 MCP process memory is volatile cache only. Persisted run manifests, event logs,

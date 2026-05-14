@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from http import HTTPStatus
 import json
+import os
 from pathlib import Path
 import threading
 from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence, Tuple, Union
@@ -79,6 +80,7 @@ class COrchRuntime:
         self._drivers: Dict[str, Any] = {}
         self._dispatch_thread: Optional[threading.Thread] = None
         self._last_dispatch_error: Optional[str] = None
+        self._runtime_generation = f"{datetime.now().astimezone().isoformat(timespec='seconds')}:{os.getpid()}"
         if self.proposals_path is not None:
             prune_queued_proposals(self.proposals_path)
 
@@ -93,6 +95,17 @@ class COrchRuntime:
 
     def build_run_payload(self, run_id: str) -> Optional[Dict[str, Any]]:
         return build_run_payload(self.runs_dir, run_id)
+
+    def build_state_payload(self, selected_run_id: Optional[str] = None) -> Dict[str, Any]:
+        return build_state_payload(
+            runs_dir=self.runs_dir,
+            queue_path=self.queue_path,
+            proposals_path=self.proposals_path,
+            runtime_generation=self._runtime_generation,
+            dispatch_running=self._dispatch_thread is not None and self._dispatch_thread.is_alive(),
+            last_dispatch_error=self._last_dispatch_error,
+            selected_run_id=selected_run_id,
+        )
 
     def run_action(
         self,
@@ -111,7 +124,7 @@ class COrchRuntime:
             if self.queue_path is not None:
                 reconcile_queue_file(queue_path=self.queue_path, runs_dir=self.runs_dir)
                 self.dispatch_queue_async()
-            return result
+            return self._attach_state(result, selected_run_id=run_id)
 
     def task_action(self, task_id: str, action: Any) -> RunActionResponse:
         with self._action_lock:
@@ -125,7 +138,7 @@ class COrchRuntime:
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
-            return result
+            return self._attach_state(result)
 
     def queue_action(self, action: Any, *, confirmed_by: str = "dashboard") -> RunActionResponse:
         with self._action_lock:
@@ -139,7 +152,7 @@ class COrchRuntime:
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
-            return result
+            return self._attach_state(result)
 
     def create_proposal(self, title: Any, prompt: Any) -> RunActionResponse:
         with self._action_lock:
@@ -156,7 +169,7 @@ class COrchRuntime:
                 driver_factory=self._driver_context,
                 worktree_factory=self._worktree_factory,
             )
-            return result
+            return self._attach_state(result)
 
     def proposal_action(
         self,
@@ -180,7 +193,8 @@ class COrchRuntime:
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
-            return result
+            selected_run_id = _selected_run_from_payload(result[1]) if result is not None else None
+            return self._attach_state(result, selected_run_id=selected_run_id)
 
     def dispatch_queue_async(self) -> bool:
         """Start one background queue scheduler pass when execution is configured."""
@@ -275,6 +289,23 @@ class COrchRuntime:
             overrides["orchestrator_factory"] = self._orchestrator_factory
         return overrides
 
+    def _attach_state(
+        self,
+        result: RunActionResponse,
+        *,
+        selected_run_id: Optional[str] = None,
+    ) -> RunActionResponse:
+        if result is None:
+            return None
+        status, payload = result
+        if int(status) < 400:
+            payload = dict(payload)
+            selected = selected_run_id or _selected_run_from_payload(payload)
+            state = self.build_state_payload(selected_run_id=selected)
+            payload["state"] = state
+            payload["state_version"] = state["version"]
+        return status, payload
+
 
 def run_action(
     runs_dir: Pathish,
@@ -337,7 +368,14 @@ def run_action(
         )
         return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
     payload = build_run_payload(runs_path, run_id)
-    return HTTPStatus.OK, payload or {"ok": True}
+    if payload is None:
+        payload = {"ok": True}
+    payload["transition"] = {
+        "type": f"run_{action}_completed",
+        "run_id": run_id,
+        "selected_run_id": run_id,
+    }
+    return HTTPStatus.OK, payload
 
 
 def task_action(
@@ -363,7 +401,12 @@ def task_action(
     except ValueError as exc:
         return HTTPStatus.CONFLICT, {"error": str(exc)}
     store.save(queue)
-    return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_dir)
+    payload = build_queue_payload(queue_file, runs_dir=runs_dir)
+    payload["transition"] = {
+        "type": "task_requeued",
+        "task_id": task_id,
+    }
+    return HTTPStatus.OK, payload
 
 
 def queue_action(
@@ -413,7 +456,12 @@ def queue_action(
 
     reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
     queue_store.save(queue)
-    return HTTPStatus.OK, build_queue_payload(queue_file, runs_dir=runs_path)
+    payload = build_queue_payload(queue_file, runs_dir=runs_path)
+    payload["transition"] = {
+        "type": "runtime_restart_confirmed",
+        "confirmed_by": confirmed_by,
+    }
+    return HTTPStatus.OK, payload
 
 
 def create_proposal(
@@ -482,7 +530,14 @@ def create_proposal(
         proposal_store.save(pool)
         return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
 
-    return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+    payload = build_proposals_payload(proposals_file, runs_dir=runs_dir)
+    payload["transition"] = {
+        "type": "proposal_created",
+        "proposal_id": proposal.proposal_id,
+        "run_id": proposal.run_id,
+        "selected_run_id": proposal.run_id,
+    }
+    return HTTPStatus.OK, payload
 
 
 def proposal_action(
@@ -550,7 +605,14 @@ def proposal_action(
             reason=derive_run_waiting_for(manifest),
         )
         proposal_store.save(pool)
-        return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload = build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_plan_revised",
+            "proposal_id": proposal.proposal_id,
+            "run_id": manifest.run_id,
+            "selected_run_id": manifest.run_id,
+        }
+        return HTTPStatus.OK, payload
 
     _approve_manifest_plan(run_store, manifest)
     task_id = _enqueue_approved_proposal(
@@ -568,7 +630,17 @@ def proposal_action(
         task_id=task_id,
         source="dashboard",
     )
-    return HTTPStatus.OK, build_proposals_payload(proposals_file, runs_dir=runs_dir)
+    payload = build_proposals_payload(proposals_file, runs_dir=runs_dir)
+    payload["transition"] = {
+        "type": "proposal_approved_and_queued",
+        "proposal_id": proposal.proposal_id,
+        "run_id": manifest.run_id,
+        "task_id": task_id,
+        "selected_run_id": manifest.run_id,
+        "removed_from_pool": True,
+        "queued": True,
+    }
+    return HTTPStatus.OK, payload
 
 
 def prune_queued_proposals(proposals_path: Pathish) -> int:
@@ -645,6 +717,40 @@ def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     }
 
 
+def build_state_payload(
+    *,
+    runs_dir: Pathish,
+    queue_path: Optional[Pathish],
+    proposals_path: Optional[Pathish],
+    runtime_generation: str,
+    dispatch_running: bool = False,
+    last_dispatch_error: Optional[str] = None,
+    selected_run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    runs_payload = build_runs_payload(runs_dir)
+    queue_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
+    proposals_payload = build_proposals_payload(proposals_path, runs_dir=runs_dir)
+    selected_run = build_run_payload(runs_dir, selected_run_id) if selected_run_id else None
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "version": _state_version(
+            runs_dir=Path(runs_dir).expanduser().resolve(),
+            queue_path=Path(queue_path).expanduser().resolve() if queue_path is not None else None,
+            proposals_path=Path(proposals_path).expanduser().resolve() if proposals_path is not None else None,
+        ),
+        "runtime": {
+            "generation": runtime_generation,
+            "pid": os.getpid(),
+            "dispatch_running": dispatch_running,
+            "last_dispatch_error": last_dispatch_error,
+        },
+        "proposals": proposals_payload,
+        "queue": queue_payload,
+        "runs": runs_payload,
+        "selected_run": selected_run,
+    }
+
+
 def build_queue_payload(
     queue_path: Optional[Pathish],
     *,
@@ -671,8 +777,7 @@ def build_queue_payload(
         }
     run_store = RunStore(Path(runs_dir).expanduser().resolve()) if runs_dir is not None else None
     if run_store is not None:
-        if reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso):
-            store.save(queue)
+        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
     tasks = [_summarize_task(task, run_store=run_store) for task in queue.tasks]
     return {
         "queue_file": str(queue_file),
@@ -798,6 +903,59 @@ def _unique_task_id(queue: TaskQueue, preferred: str) -> str:
         suffix += 1
         candidate = f"{preferred}-{suffix:02d}"
     return candidate
+
+
+def _selected_run_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    transition = payload.get("transition")
+    if isinstance(transition, dict):
+        selected = transition.get("selected_run_id") or transition.get("run_id")
+        if isinstance(selected, str) and selected:
+            return selected
+    run = payload.get("run")
+    if isinstance(run, dict):
+        run_id = run.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            return run_id
+    state = payload.get("state")
+    if isinstance(state, dict):
+        selected_run = state.get("selected_run")
+        if isinstance(selected_run, dict):
+            run = selected_run.get("run")
+            if isinstance(run, dict):
+                run_id = run.get("run_id")
+                if isinstance(run_id, str) and run_id:
+                    return run_id
+    return None
+
+
+def _state_version(
+    *,
+    runs_dir: Path,
+    queue_path: Optional[Path],
+    proposals_path: Optional[Path],
+) -> int:
+    mtimes: List[int] = []
+    for path in (queue_path, proposals_path):
+        if path is None:
+            continue
+        try:
+            mtimes.append(path.stat().st_mtime_ns)
+        except OSError:
+            continue
+    try:
+        for path in runs_dir.glob("*/manifest.json"):
+            try:
+                mtimes.append(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+        for path in runs_dir.glob("*/events.jsonl"):
+            try:
+                mtimes.append(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return max(mtimes, default=0)
 
 
 def _validate_run_action(manifest: Any, action: Any) -> Optional[str]:

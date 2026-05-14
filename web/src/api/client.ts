@@ -1,8 +1,10 @@
 import type {
+  ActionResponse,
   AllowedQueueAction,
   AllowedProposalAction,
   AllowedRunAction,
   AllowedTaskAction,
+  DashboardStatePayload,
   ProposalsPayload,
   QueuePayload,
   RunPayload,
@@ -43,33 +45,37 @@ export function fetchRun(runId: string): Promise<RunPayload> {
   return requestJson<RunPayload>(`/api/runs/${encodeURIComponent(runId)}`);
 }
 
+export function fetchState(): Promise<DashboardStatePayload> {
+  return requestJson<DashboardStatePayload>("/api/state");
+}
+
 export function postRunAction(
   runId: string,
   action: AllowedRunAction,
   payload: Record<string, unknown> = {},
-): Promise<RunPayload> {
-  return requestJson<RunPayload>(`/api/runs/${encodeURIComponent(runId)}/actions`, {
+): Promise<ActionResponse> {
+  return requestJson<ActionResponse>(`/api/runs/${encodeURIComponent(runId)}/actions`, {
     method: "POST",
     body: JSON.stringify({ action, ...payload }),
   });
 }
 
-export function postTaskAction(taskId: string, action: AllowedTaskAction): Promise<QueuePayload> {
-  return requestJson<QueuePayload>(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
+export function postTaskAction(taskId: string, action: AllowedTaskAction): Promise<ActionResponse> {
+  return requestJson<ActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
     method: "POST",
     body: JSON.stringify({ action }),
   });
 }
 
-export function postQueueAction(action: AllowedQueueAction): Promise<QueuePayload> {
-  return requestJson<QueuePayload>("/api/queue/actions", {
+export function postQueueAction(action: AllowedQueueAction): Promise<ActionResponse> {
+  return requestJson<ActionResponse>("/api/queue/actions", {
     method: "POST",
     body: JSON.stringify({ action }),
   });
 }
 
-export function postProposal(title: string, prompt: string): Promise<ProposalsPayload> {
-  return requestJson<ProposalsPayload>("/api/proposals", {
+export function postProposal(title: string, prompt: string): Promise<ActionResponse> {
+  return requestJson<ActionResponse>("/api/proposals", {
     method: "POST",
     body: JSON.stringify({ title, prompt }),
   });
@@ -79,8 +85,8 @@ export function postProposalAction(
   proposalId: string,
   action: AllowedProposalAction,
   payload: Record<string, unknown> = {},
-): Promise<ProposalsPayload> {
-  return requestJson<ProposalsPayload>(`/api/proposals/${encodeURIComponent(proposalId)}/actions`, {
+): Promise<ActionResponse> {
+  return requestJson<ActionResponse>(`/api/proposals/${encodeURIComponent(proposalId)}/actions`, {
     method: "POST",
     body: JSON.stringify({ action, ...payload }),
   });

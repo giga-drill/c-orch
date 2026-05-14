@@ -41,6 +41,7 @@ export interface QueuePayload {
   queue: QueueRecord | null;
   summary?: QueueSummary;
   tasks: TaskSummary[];
+  transition?: TransitionResult;
 }
 
 export interface ProposalSummary {
@@ -79,6 +80,7 @@ export interface ProposalsPayload {
   pool: ProposalPoolRecord | null;
   summary?: ProposalSummary;
   proposals: ProposalRecord[];
+  transition?: TransitionResult;
 }
 
 export interface AgentSummary {
@@ -199,4 +201,40 @@ export interface RunPayload {
   evidence_files: EvidenceFile[];
   events: RunEvent[];
   worker_activity: WorkerActivity[];
+  transition?: TransitionResult;
+}
+
+export interface RuntimeState {
+  generation: string;
+  pid: number;
+  dispatch_running: boolean;
+  last_dispatch_error: string | null;
+}
+
+export interface DashboardStatePayload {
+  generated_at: string;
+  version: number;
+  runtime: RuntimeState;
+  proposals: ProposalsPayload;
+  queue: QueuePayload;
+  runs: RunsPayload;
+  selected_run: RunPayload | null;
+}
+
+export interface TransitionResult {
+  type: string;
+  proposal_id?: string;
+  task_id?: string;
+  run_id?: string;
+  selected_run_id?: string;
+  removed_from_pool?: boolean;
+  queued?: boolean;
+  confirmed_by?: string;
+}
+
+export interface ActionResponse {
+  transition?: TransitionResult;
+  state?: DashboardStatePayload;
+  state_version?: number;
+  [key: string]: unknown;
 }

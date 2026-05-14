@@ -13,6 +13,7 @@ from c_orch.runtime import (
     build_queue_payload,
     build_run_payload,
     build_runs_payload,
+    build_state_payload,
     proposal_action,
     queue_action,
     run_action,
@@ -178,7 +179,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["next_action"], "done")
             self.assertEqual(payload["tasks"][0]["allowed_actions"], [])
 
-    def test_build_queue_payload_reconciles_failed_active_run(self) -> None:
+    def test_build_queue_payload_derives_failed_active_run_without_saving(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             queue_store = TaskStore(root / "queue.json")
@@ -214,10 +215,10 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
             self.assertEqual(payload["summary"]["completed_tasks"], 0)
             self.assertEqual(payload["summary"]["running_tasks"], 0)
-            self.assertEqual(loaded.status, "FAILED")
-            self.assertEqual(loaded.tasks[0].status, "FAILED")
+            self.assertEqual(loaded.status, "PENDING")
+            self.assertEqual(loaded.tasks[0].status, "RUNNING")
 
-    def test_build_queue_payload_reconciles_planner_review_retry_waiting_point(self) -> None:
+    def test_build_queue_payload_derives_planner_review_retry_without_saving(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             queue_store = TaskStore(root / "queue.json")
@@ -263,8 +264,41 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["next_action"], "planner_review_retry")
             self.assertEqual(payload["tasks"][0]["allowed_actions"], [])
             self.assertEqual(payload["summary"]["current_waiting_point"], "planner_review_retry")
-            self.assertEqual(loaded.tasks[0].status, "WAITING")
-            self.assertEqual(loaded.tasks[0].reason, "planner_review_retry")
+            self.assertEqual(loaded.tasks[0].status, "RUNNING")
+            self.assertIsNone(loaded.tasks[0].reason)
+
+    def test_build_state_payload_includes_version_and_runtime_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            run_store.save(manifest)
+            proposal_store = ProposalStore(root / "proposals.json")
+            proposal_store.create()
+            queue_store = TaskStore(root / "queue.json")
+            queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+
+            payload = build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                runtime_generation="test-generation",
+                selected_run_id=manifest.run_id,
+            )
+
+            self.assertEqual(payload["runtime"]["generation"], "test-generation")
+            self.assertGreater(payload["version"], 0)
+            self.assertEqual(payload["queue"]["summary"]["total_tasks"], 1)
+            self.assertEqual(payload["proposals"]["summary"]["total_proposals"], 0)
+            self.assertEqual(payload["runs"]["runs"][0]["run_id"], manifest.run_id)
+            self.assertEqual(payload["selected_run"]["run"]["run_id"], manifest.run_id)
 
     def test_build_proposals_payload_exposes_plan_review_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,6 +362,10 @@ class UiTests(unittest.TestCase):
             self.assertEqual(int(status), 200)
             self.assertEqual(payload["summary"]["total_proposals"], 0)
             self.assertEqual(payload["proposals"], [])
+            self.assertEqual(payload["transition"]["type"], "proposal_approved_and_queued")
+            self.assertEqual(payload["transition"]["run_id"], manifest.run_id)
+            self.assertEqual(payload["transition"]["task_id"], proposal.proposal_id)
+            self.assertTrue(payload["transition"]["removed_from_pool"])
             self.assertEqual(queue.tasks[0].active_run_id, manifest.run_id)
             self.assertEqual(queue.tasks[0].run_ids, [manifest.run_id])
             self.assertEqual(loaded_manifest.status, "PLAN_APPROVED")
@@ -552,8 +590,41 @@ class UiTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-            self.assertEqual(body["queue"]["status"], "APPROVED")
+            self.assertEqual(body["transition"]["type"], "runtime_restart_confirmed")
+            self.assertEqual(body["state"]["queue"]["queue"]["status"], "APPROVED")
             self.assertFalse(run_store.load(manifest.run_id).requires_restart)
+
+    def test_dashboard_state_route_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            TaskStore(root / "queue.json").import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            ProposalStore(root / "proposals.json").create()
+
+            server = build_server(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                host="127.0.0.1",
+                port=0,
+            )
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/api/state", timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                runtime = getattr(server, "c_orch_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertIn("runtime", body)
+            self.assertIn("version", body)
+            self.assertEqual(body["queue"]["summary"]["total_tasks"], 1)
+            self.assertEqual(body["proposals"]["summary"]["total_proposals"], 0)
+            self.assertIn("runs", body)
 
     def test_plan_review_run_does_not_expose_dashboard_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -585,6 +656,7 @@ class UiTests(unittest.TestCase):
         self.assertIn("/api/runs", client_source)
         self.assertIn("/api/queue", client_source)
         self.assertIn("/api/proposals", client_source)
+        self.assertIn("/api/state", client_source)
         self.assertIn("/api/queue/actions", client_source)
         self.assertIn("/actions", client_source)
         self.assertIn("allowed_actions", app_source)
@@ -608,8 +680,12 @@ class UiTests(unittest.TestCase):
         self.assertIn("useMutation", query_source)
         self.assertIn("invalidateQueries", query_source)
         self.assertIn("refreshDashboardQueries", query_source)
-        self.assertIn("setQueryData(queryKeys.proposals, payload)", query_source)
+        self.assertIn("useDashboardStateQuery", query_source)
+        self.assertIn("updateStateFromAction", query_source)
+        self.assertIn("selectedRunFromAction", query_source)
         self.assertIn("queryKey: [\"run\"]", query_source)
+        self.assertIn("state_version", app_source)
+        self.assertIn("runtimeGeneration", app_source)
         self.assertIn("refetchInterval: 1000", main_source)
         self.assertIn("refetchIntervalInBackground: true", main_source)
 

@@ -18,13 +18,11 @@ import type {
 } from "../api/types";
 import {
   useCreateProposalMutation,
+  useDashboardStateQuery,
   useProposalActionMutation,
-  useProposalsQuery,
   useQueueActionMutation,
-  useQueueQuery,
   useRunActionMutation,
   useRunQuery,
-  useRunsQuery,
   useTaskActionMutation,
 } from "../queries";
 
@@ -69,22 +67,33 @@ function pickTaskRun(task: TaskSummary): string | null {
 }
 
 export function App() {
-  const queueQuery = useQueueQuery();
-  const proposalsQuery = useProposalsQuery();
-  const runsQuery = useRunsQuery();
+  const stateQuery = useDashboardStateQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const detailRef = useRef<HTMLElement | null>(null);
+  const runtimeGenerationRef = useRef<string | null>(null);
+  const queuePayload = stateQuery.data?.queue;
+  const proposalsPayload = stateQuery.data?.proposals;
+  const runsPayload = stateQuery.data?.runs;
   const activeRunId = useMemo(() => {
-    const task = queueQuery.data?.tasks.find((item) => item.active_run_id);
+    const task = queuePayload?.tasks.find((item) => item.active_run_id);
     return task?.active_run_id ?? null;
-  }, [queueQuery.data]);
-  const firstRunId = runsQuery.data?.runs[0]?.run_id ?? null;
+  }, [queuePayload]);
+  const firstRunId = runsPayload?.runs[0]?.run_id ?? null;
 
   useEffect(() => {
     if (!selectedRunId) {
       setSelectedRunId(activeRunId ?? firstRunId);
     }
   }, [activeRunId, firstRunId, selectedRunId]);
+
+  useEffect(() => {
+    const generation = stateQuery.data?.runtime.generation;
+    if (!generation) return;
+    if (runtimeGenerationRef.current && runtimeGenerationRef.current !== generation) {
+      void stateQuery.refetch();
+    }
+    runtimeGenerationRef.current = generation;
+  }, [stateQuery.data?.runtime.generation]);
 
   const runQuery = useRunQuery(selectedRunId);
 
@@ -97,15 +106,13 @@ export function App() {
 
   async function refreshAll() {
     await Promise.all([
-      proposalsQuery.refetch(),
-      queueQuery.refetch(),
-      runsQuery.refetch(),
+      stateQuery.refetch(),
       runQuery.refetch(),
     ]);
   }
 
-  const isLoading = queueQuery.isLoading || proposalsQuery.isLoading || runsQuery.isLoading;
-  const error = proposalsQuery.error ?? queueQuery.error ?? runsQuery.error ?? runQuery.error;
+  const isLoading = stateQuery.isLoading;
+  const error = stateQuery.error ?? runQuery.error;
 
   return (
     <main className="shell">
@@ -118,24 +125,29 @@ export function App() {
           <button
             type="button"
             onClick={refreshAll}
-            disabled={proposalsQuery.isFetching || queueQuery.isFetching || runsQuery.isFetching}
+            disabled={stateQuery.isFetching}
           >
             刷新
           </button>
         </header>
         {error ? <div className="error">{error.message}</div> : null}
         {isLoading ? <div className="empty">正在加载运行状态...</div> : null}
-        <SystemStatus queuePayload={queueQuery.data} runsGeneratedAt={runsQuery.data?.generated_at} />
+        <SystemStatus
+          queuePayload={queuePayload}
+          runsGeneratedAt={runsPayload?.generated_at}
+          runtimeGeneration={stateQuery.data?.runtime.generation}
+          stateVersion={stateQuery.data?.version}
+        />
         <ProposalPanel
-          payload={proposalsQuery.data}
+          payload={proposalsPayload}
           onSelectRun={selectRun}
         />
         <QueuePanel
-          payload={queueQuery.data}
+          payload={queuePayload}
           selectedRunId={selectedRunId}
           onSelectRun={selectRun}
         />
-        <RunList runs={runsQuery.data?.runs ?? []} selectedRunId={selectedRunId} onSelectRun={selectRun} />
+        <RunList runs={runsPayload?.runs ?? []} selectedRunId={selectedRunId} onSelectRun={selectRun} />
       </aside>
       <section className="content" ref={detailRef}>
         <RunDetail
@@ -152,9 +164,13 @@ export function App() {
 function SystemStatus({
   queuePayload,
   runsGeneratedAt,
+  runtimeGeneration,
+  stateVersion,
 }: {
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
+  runtimeGeneration?: string;
+  stateVersion?: number;
 }) {
   const queueActionMutation = useQueueActionMutation();
   const [queueActionError, setQueueActionError] = useState<string | null>(null);
@@ -183,6 +199,14 @@ function SystemStatus({
       <div>
         <span className="label">updated</span>
         <strong>{displayValue(queuePayload?.generated_at ?? runsGeneratedAt)}</strong>
+      </div>
+      <div>
+        <span className="label">state_version</span>
+        <strong>{displayValue(stateVersion)}</strong>
+      </div>
+      <div>
+        <span className="label">runtime</span>
+        <strong>{displayValue(runtimeGeneration)}</strong>
       </div>
       {restartRequired ? (
         <>
@@ -351,7 +375,7 @@ function QueuePanel({
     setTaskError(null);
     try {
       const result = await taskMutation.mutateAsync({ taskId: task.task_id, action });
-      const latest = result.tasks.find((item) => item.task_id === task.task_id);
+      const latest = result.state?.queue.tasks.find((item) => item.task_id === task.task_id);
       const runId = latest ? pickTaskRun(latest) : pickTaskRun(task);
       if (runId) onSelectRun(runId);
     } catch (error) {
