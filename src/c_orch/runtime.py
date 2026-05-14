@@ -730,7 +730,12 @@ def build_state_payload(
     runs_payload = build_runs_payload(runs_dir)
     queue_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
     proposals_payload = build_proposals_payload(proposals_path, runs_dir=runs_dir)
-    selected_run = build_run_payload(runs_dir, selected_run_id) if selected_run_id else None
+    focused_run_id = selected_run_id or _focused_run_id(
+        proposals_payload=proposals_payload,
+        queue_payload=queue_payload,
+        runs_payload=runs_payload,
+    )
+    selected_run = build_run_payload(runs_dir, focused_run_id) if focused_run_id else None
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "version": _state_version(
@@ -747,6 +752,7 @@ def build_state_payload(
         "proposals": proposals_payload,
         "queue": queue_payload,
         "runs": runs_payload,
+        "focused_run_id": focused_run_id,
         "selected_run": selected_run,
     }
 
@@ -928,6 +934,31 @@ def _selected_run_from_payload(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _focused_run_id(
+    *,
+    proposals_payload: Dict[str, Any],
+    queue_payload: Dict[str, Any],
+    runs_payload: Dict[str, Any],
+) -> Optional[str]:
+    for proposal in reversed(_list_value(proposals_payload.get("proposals"))):
+        if not isinstance(proposal, dict):
+            continue
+        if proposal.get("waiting_for") == "human_plan_review" and proposal.get("run_id"):
+            return str(proposal["run_id"])
+
+    for task in reversed(_list_value(queue_payload.get("tasks"))):
+        if not isinstance(task, dict):
+            continue
+        run_id = task.get("active_run_id")
+        if run_id and task.get("waiting_for") != "done":
+            return str(run_id)
+
+    runs = _list_value(runs_payload.get("runs"))
+    if runs and isinstance(runs[0], dict) and runs[0].get("run_id"):
+        return str(runs[0]["run_id"])
+    return None
+
+
 def _state_version(
     *,
     runs_dir: Path,
@@ -1105,16 +1136,28 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
 def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStore]) -> Dict[str, Any]:
     run_summary = None
     manifest = None
+    plan_detail = None
     if run_store is not None and proposal.run_id:
         try:
             manifest = run_store.load(proposal.run_id)
         except OSError:
             manifest = None
     if manifest is not None:
+        manifest_dict = manifest.to_dict()
         run_summary = _summarize_manifest(
-            manifest.to_dict(),
+            manifest_dict,
             events=run_store.load_events(manifest.run_id) if run_store is not None else [],
         )
+        plan = _dict_value(manifest_dict.get("plan"))
+        if plan:
+            plan_detail = {
+                "approval_status": plan.get("approval_status"),
+                "summary": plan.get("summary"),
+                "worker_prompt": plan.get("worker_prompt"),
+                "risk_notes": _list_value(plan.get("risk_notes")),
+                "acceptance_criteria": _list_value(manifest_dict.get("acceptance_criteria")),
+                "verification_commands": _list_value(manifest_dict.get("verification_commands")),
+            }
     status = proposal.status
     if manifest is not None and status not in {PROPOSAL_QUEUED, PROPOSAL_FAILED}:
         status = _proposal_status_from_run(manifest)
@@ -1132,6 +1175,7 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
         "waiting_for": _proposal_waiting_for(status),
         "allowed_actions": _allowed_proposal_actions(status, run_summary),
         "run": run_summary,
+        "plan_detail": plan_detail,
     }
 
 
@@ -1238,6 +1282,8 @@ def _event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": event.get("timestamp"),
         "type": event.get("type"),
         "message": event.get("message"),
+        "summary": event.get("summary"),
+        "reason": event.get("reason"),
         "worker_id": event.get("worker_id"),
         "attempt": event.get("attempt"),
         "decision": event.get("decision"),
@@ -1278,15 +1324,31 @@ def _evidence_details(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     details = []
     for value in _unique_strings(paths):
         path = Path(value).expanduser()
+        exists = path.exists()
+        size = path.stat().st_size if exists else None
         details.append(
             {
                 "path": value,
                 "name": path.name,
-                "exists": path.exists(),
-                "size": path.stat().st_size if path.exists() else None,
+                "exists": exists,
+                "size": size,
+                "preview": _text_preview(path, size=size) if exists else None,
             }
         )
     return details
+
+
+def _text_preview(path: Path, *, size: Optional[int]) -> Optional[str]:
+    if size is None or size > 20_000:
+        return None
+    if path.suffix.lower() not in {".txt", ".md", ".json", ".jsonl", ".log"}:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")[:8_000]
+    except UnicodeDecodeError:
+        return None
+    except OSError:
+        return None
 
 
 def _worker_activity(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:

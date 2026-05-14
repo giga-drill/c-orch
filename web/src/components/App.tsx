@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type {
   AllowedRunAction,
@@ -6,6 +6,7 @@ import type {
   AgentSummary,
   EvidenceFile,
   ManifestRecord,
+  ProposalPlanDetail,
   ProposalRecord,
   ProposalsPayload,
   QueuePayload,
@@ -69,22 +70,27 @@ function pickTaskRun(task: TaskSummary): string | null {
 export function App() {
   const stateQuery = useDashboardStateQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [manualSelection, setManualSelection] = useState(false);
   const detailRef = useRef<HTMLElement | null>(null);
   const runtimeGenerationRef = useRef<string | null>(null);
   const queuePayload = stateQuery.data?.queue;
   const proposalsPayload = stateQuery.data?.proposals;
   const runsPayload = stateQuery.data?.runs;
-  const activeRunId = useMemo(() => {
-    const task = queuePayload?.tasks.find((item) => item.active_run_id);
-    return task?.active_run_id ?? null;
-  }, [queuePayload]);
+  const focusedRunId = stateQuery.data?.focused_run_id ?? null;
   const firstRunId = runsPayload?.runs[0]?.run_id ?? null;
+  const selectedRunExists = Boolean(
+    selectedRunId && runsPayload?.runs.some((run) => run.run_id === selectedRunId),
+  );
 
   useEffect(() => {
-    if (!selectedRunId) {
-      setSelectedRunId(activeRunId ?? firstRunId);
+    if (!manualSelection && focusedRunId && selectedRunId !== focusedRunId) {
+      setSelectedRunId(focusedRunId);
+      return;
     }
-  }, [activeRunId, firstRunId, selectedRunId]);
+    if (!selectedRunId || !selectedRunExists) {
+      setSelectedRunId(focusedRunId ?? firstRunId);
+    }
+  }, [focusedRunId, firstRunId, manualSelection, selectedRunExists, selectedRunId]);
 
   useEffect(() => {
     const generation = stateQuery.data?.runtime.generation;
@@ -96,8 +102,18 @@ export function App() {
   }, [stateQuery.data?.runtime.generation]);
 
   const runQuery = useRunQuery(selectedRunId);
+  const stateSelectedRun = stateQuery.data?.selected_run;
+  const runPayload =
+    stateSelectedRun && stateSelectedRun.run.run_id === selectedRunId
+      ? stateSelectedRun
+      : runQuery.data;
+  const isRunLoading =
+    Boolean(selectedRunId) &&
+    !runPayload &&
+    (runQuery.isLoading || runQuery.isFetching || stateQuery.isLoading);
 
   function selectRun(runId: string) {
+    setManualSelection(true);
     setSelectedRunId(runId);
     window.setTimeout(() => {
       detailRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
@@ -151,8 +167,8 @@ export function App() {
       </aside>
       <section className="content" ref={detailRef}>
         <RunDetail
-          payload={runQuery.data}
-          isLoading={runQuery.isLoading}
+          payload={runPayload}
+          isLoading={isRunLoading}
           selectedRunId={selectedRunId}
           onSelectRun={selectRun}
         />
@@ -320,7 +336,7 @@ function ProposalPanel({
               <span className="meta">waiting_for: {displayValue(proposal.waiting_for)}</span>
               <span className="meta">run_id: {displayValue(proposal.run_id)}</span>
             </button>
-            {proposal.run?.plan?.summary ? <p>{proposal.run.plan.summary}</p> : null}
+            <ProposalPlanPanel plan={proposal.plan_detail} fallbackSummary={proposal.run?.plan?.summary} />
             {proposal.allowed_actions.includes("approve-plan") ? (
               <div className="proposalActions">
                 <button
@@ -354,6 +370,35 @@ function ProposalPanel({
         {payload && payload.proposals.length === 0 ? <div className="empty">暂无待审核计划。</div> : null}
       </div>
     </section>
+  );
+}
+
+function ProposalPlanPanel({
+  plan,
+  fallbackSummary,
+}: {
+  plan?: ProposalPlanDetail | null;
+  fallbackSummary?: string | null;
+}) {
+  if (!plan) {
+    return fallbackSummary ? <p>{fallbackSummary}</p> : null;
+  }
+  return (
+    <div className="proposalPlan">
+      {plan.summary ? <p>{plan.summary}</p> : null}
+      <Collapsible title="完整 Planner 方案" open>
+        {plan.worker_prompt ? <pre>{plan.worker_prompt}</pre> : <p className="meta">暂无 Worker 指令。</p>}
+      </Collapsible>
+      <Collapsible title="验收标准">
+        <BulletList items={plan.acceptance_criteria} />
+      </Collapsible>
+      <Collapsible title="验证命令">
+        <BulletList items={plan.verification_commands} code />
+      </Collapsible>
+      <Collapsible title="风险说明">
+        <BulletList items={plan.risk_notes} />
+      </Collapsible>
+    </div>
   );
 }
 
@@ -536,6 +581,7 @@ function RunDetail({
         onAction={runAction}
       />
       {actionError ? <div className="error">{actionError}</div> : null}
+      <FailurePanel run={run} events={payload.events} files={payload.evidence_files} />
 
       <div className="metrics">
         <Metric label="Planner" value={formatStatus(run.planner.status)} />
@@ -602,6 +648,42 @@ function RunDetail({
         </section>
       </div>
     </div>
+  );
+}
+
+function FailurePanel({
+  run,
+  events,
+  files,
+}: {
+  run: RunListItem;
+  events: RunEvent[];
+  files: EvidenceFile[];
+}) {
+  const latestFailure =
+    run.last_error_event ??
+    newestFirst(events).find((event) => String(event.type ?? "").endsWith("_failed"));
+  if (run.status !== "FAILED" && !latestFailure) return null;
+  const verification = newestFirst(events).find((event) => event.type === "verification_finished");
+  const verificationOutput = files.find((file) => file.name === "verification-output.txt" && file.preview);
+
+  return (
+    <section className="failurePanel">
+      <div className="timelineTop">
+        <h2>失败原因</h2>
+        <StatusBadge status={latestFailure?.type ?? run.status} />
+      </div>
+      <p>{displayValue(latestFailure?.message ?? "Run 已失败。")}</p>
+      {latestFailure?.summary ? <p className="meta">{displayValue(latestFailure.summary)}</p> : null}
+      {latestFailure?.reason ? <p className="meta">reason: {displayValue(latestFailure.reason)}</p> : null}
+      {verification?.summary ? <p className="meta">verification: {displayValue(verification.summary)}</p> : null}
+      {latestFailure ? <p className="meta mono">{eventDetails(latestFailure)}</p> : null}
+      {verificationOutput ? (
+        <Collapsible title="verification-output.txt" open>
+          <pre>{verificationOutput.preview}</pre>
+        </Collapsible>
+      ) : null}
+    </section>
   );
 }
 
@@ -677,9 +759,16 @@ function EvidenceList({ files }: { files: EvidenceFile[] }) {
   return (
     <ul className="plainList">
       {files.map((file) => (
-        <li key={file.path}>
-          <span className="mono">{file.name}</span>
-          <span className="meta">{file.exists ? `${file.size ?? 0} bytes` : "缺失"}</span>
+        <li key={file.path} className="evidenceItem">
+          <div className="evidenceTop">
+            <span className="mono">{file.name}</span>
+            <span className="meta">{file.exists ? `${file.size ?? 0} bytes` : "缺失"}</span>
+          </div>
+          {file.preview ? (
+            <Collapsible title="预览">
+              <pre>{file.preview}</pre>
+            </Collapsible>
+          ) : null}
         </li>
       ))}
     </ul>
@@ -775,9 +864,9 @@ function StatusBadge({ status }: { status?: string | null }) {
   return <span className={`badge ${status ?? ""}`}>{formatStatus(status)}</span>;
 }
 
-function Collapsible({ title, children }: { title: string; children: ReactNode }) {
+function Collapsible({ title, children, open = false }: { title: string; children: ReactNode; open?: boolean }) {
   return (
-    <details>
+    <details open={open}>
       <summary>{title}</summary>
       <div>{children}</div>
     </details>

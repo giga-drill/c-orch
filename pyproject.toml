@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Codex-native Planner/Worker workflow orchestrator."
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 c-orch = "c_orch.cli:main"
 

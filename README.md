@@ -102,9 +102,9 @@ Common options:
 --planner-model gpt-5.5
 --worker-model gpt-5.3-codex
 --planner-reasoning-effort high
---worker-reasoning-effort medium
+--worker-reasoning-effort high
 --planner-service-tier fast
---worker-service-tier flex
+--worker-service-tier fast
 --auto-approve-plan
 --max-attempts 3
 --sandbox workspace-write
@@ -124,7 +124,8 @@ service_tier = "fast"
 
 [worker]
 model = "gpt-5.3-codex"
-reasoning_effort = "medium"
+reasoning_effort = "high"
+service_tier = "fast"
 
 [run]
 max_attempts = 3

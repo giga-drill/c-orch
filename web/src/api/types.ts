@@ -58,6 +58,15 @@ export interface ProposalPoolRecord {
   updated_at: string;
 }
 
+export interface ProposalPlanDetail {
+  approval_status: string | null;
+  summary: string | null;
+  worker_prompt: string | null;
+  risk_notes: string[];
+  acceptance_criteria: string[];
+  verification_commands: string[];
+}
+
 export interface ProposalRecord {
   proposal_id: string;
   title: string;
@@ -72,6 +81,7 @@ export interface ProposalRecord {
   waiting_for: string;
   allowed_actions: AllowedProposalAction[];
   run: RunListItem | null;
+  plan_detail: ProposalPlanDetail | null;
 }
 
 export interface ProposalsPayload {
@@ -114,6 +124,8 @@ export interface RunListItem {
   workers: AgentSummary[];
   review: { decision: string | null; reason: string | null } | null;
   review_attempt_count: number;
+  last_event: RunEvent | null;
+  last_error_event: RunEvent | null;
   can_retry_review: boolean;
   plan: { approval_status?: string | null; summary?: string | null } | null;
   plan_revision_count: number;
@@ -163,6 +175,7 @@ export interface EvidenceFile {
   name: string;
   exists: boolean;
   size: number | null;
+  preview: string | null;
 }
 
 export interface RunEvent {
@@ -218,6 +231,7 @@ export interface DashboardStatePayload {
   proposals: ProposalsPayload;
   queue: QueuePayload;
   runs: RunsPayload;
+  focused_run_id: string | null;
   selected_run: RunPayload | null;
 }
 

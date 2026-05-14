@@ -11,6 +11,8 @@ from .settings import (
     DEFAULT_PLANNER_MODELS,
     DEFAULT_PLANNER_REASONING_EFFORT,
     DEFAULT_WORKER_MODEL,
+    DEFAULT_WORKER_REASONING_EFFORT,
+    DEFAULT_WORKER_SERVICE_TIER,
     REASONING_EFFORT_CHOICES,
     SANDBOX_CHOICES,
     SERVICE_TIER_CHOICES,
@@ -463,6 +465,7 @@ def _resolve_execution_config(
         "worker_reasoning_effort": _first_value(
             getattr(args, "worker_reasoning_effort", None),
             project_config.worker.reasoning_effort,
+            DEFAULT_WORKER_REASONING_EFFORT,
         ),
         "planner_service_tier": _first_value(
             getattr(args, "planner_service_tier", None),
@@ -471,6 +474,7 @@ def _resolve_execution_config(
         "worker_service_tier": _first_value(
             getattr(args, "worker_service_tier", None),
             project_config.worker.service_tier,
+            DEFAULT_WORKER_SERVICE_TIER,
         ),
         "max_attempts": getattr(args, "max_attempts", None) or project_config.run.max_attempts,
         "sandbox": getattr(args, "sandbox", None) or project_config.run.sandbox,

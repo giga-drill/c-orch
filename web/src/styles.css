@@ -131,6 +131,7 @@ pre {
 .systemStatus,
 .stateStrip,
 .actionBar,
+.failurePanel,
 .empty,
 .error {
   border: 1px solid var(--line);
@@ -143,7 +144,8 @@ pre {
 .agentCard,
 .systemStatus,
 .stateStrip,
-.actionBar {
+.actionBar,
+.failurePanel {
   padding: 12px;
 }
 
@@ -321,6 +323,13 @@ pre {
   align-items: flex-start;
 }
 
+.failurePanel {
+  display: grid;
+  gap: 8px;
+  border-color: #efb5b5;
+  background: #fff4f4;
+}
+
 .revisionBox {
   flex: 1 1 420px;
   display: grid;
@@ -343,7 +352,8 @@ input {
 }
 
 .proposalForm,
-.proposalActions {
+.proposalActions,
+.proposalPlan {
   display: grid;
   gap: 8px;
 }
@@ -406,6 +416,17 @@ details > div {
 }
 
 .plainList li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.plainList li.evidenceItem {
+  display: grid;
+  justify-content: stretch;
+}
+
+.evidenceTop {
   display: flex;
   justify-content: space-between;
   gap: 10px;

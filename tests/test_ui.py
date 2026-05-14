@@ -68,8 +68,10 @@ class UiTests(unittest.TestCase):
                 worker_model="gpt-5.3-codex",
             )
             evidence_path = root / "runs" / manifest.run_id / "evidence" / "git-diff.patch"
+            verification_path = root / "runs" / manifest.run_id / "evidence" / "verification-output.txt"
             evidence_path.parent.mkdir(parents=True)
             evidence_path.write_text("diff\n", encoding="utf-8")
+            verification_path.write_text("pytest failed\nNo module named pytest\n", encoding="utf-8")
             manifest.status = "APPROVED"
             manifest.planner.reasoning_effort = "high"
             manifest.planner.service_tier = "fast"
@@ -88,7 +90,7 @@ class UiTests(unittest.TestCase):
                     new_plan={"summary": "new"},
                 )
             )
-            manifest.workers[0].evidence_files = [str(evidence_path)]
+            manifest.workers[0].evidence_files = [str(evidence_path), str(verification_path)]
             manifest.workers[0].reasoning_effort = "medium"
             manifest.workers[0].service_tier = "flex"
             manifest.requires_restart = True
@@ -97,7 +99,7 @@ class UiTests(unittest.TestCase):
             manifest.review = ReviewRecord(
                 decision="accepted",
                 reason="looks good",
-                evidence_files=[str(evidence_path)],
+                evidence_files=[str(evidence_path), str(verification_path)],
             )
             store.save(manifest)
             store.append_event(
@@ -105,6 +107,13 @@ class UiTests(unittest.TestCase):
                 "planner_start",
                 "Planner started",
                 attempt=1,
+            )
+            store.append_event(
+                manifest.run_id,
+                "verification_gate_failed",
+                "Verification gate failed",
+                summary="2 of 3 verification command(s) failed.",
+                reason="verification_failed",
             )
 
             payload = build_run_payload(root / "runs", manifest.run_id)
@@ -118,7 +127,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
             self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
             self.assertEqual(payload["run"]["review_attempt_count"], 0)
-            self.assertEqual(payload["run"]["evidence_count"], 1)
+            self.assertEqual(payload["run"]["evidence_count"], 2)
             self.assertEqual(payload["run"]["waiting_for"], "restart")
             self.assertEqual(payload["run"]["next_action"], "restart")
             self.assertEqual(payload["run"]["allowed_actions"], [])
@@ -137,8 +146,17 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["manifest"]["restart_paths"], ["src/c_orch/orchestrator.py"])
             self.assertEqual(payload["evidence_files"][0]["name"], "git-diff.patch")
             self.assertTrue(payload["evidence_files"][0]["exists"])
+            verification_file = next(
+                file for file in payload["evidence_files"] if file["name"] == "verification-output.txt"
+            )
+            self.assertIn("No module named pytest", verification_file["preview"])
             self.assertEqual(payload["events"][0]["type"], "planner_start")
             self.assertEqual(payload["events"][0]["attempt"], 1)
+            self.assertEqual(payload["run"]["last_error_event"]["type"], "verification_gate_failed")
+            self.assertEqual(
+                payload["run"]["last_error_event"]["summary"],
+                "2 of 3 verification command(s) failed.",
+            )
 
     def test_build_run_payload_rejects_path_traversal_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,7 +316,62 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["queue"]["summary"]["total_tasks"], 1)
             self.assertEqual(payload["proposals"]["summary"]["total_proposals"], 0)
             self.assertEqual(payload["runs"]["runs"][0]["run_id"], manifest.run_id)
+            self.assertEqual(payload["focused_run_id"], manifest.run_id)
             self.assertEqual(payload["selected_run"]["run"]["run_id"], manifest.run_id)
+
+    def test_build_state_payload_focuses_attention_run_without_selected_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_store = RunStore(root / "runs")
+            completed = run_store.create_run(
+                cwd=root,
+                user_task="Completed task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            completed.status = "APPROVED"
+            run_store.save(completed)
+            failed = run_store.create_run(
+                cwd=root,
+                user_task="Failed task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            failed.status = "FAILED"
+            run_store.save(failed)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "done", "title": "Done", "prompt": "Done"},
+                    {"task_id": "failed", "title": "Failed", "prompt": "Failed"},
+                ]
+            )
+            queue_store.update_task(
+                queue,
+                "done",
+                status="APPROVED",
+                active_run_id=completed.run_id,
+                run_ids=[completed.run_id],
+            )
+            queue_store.update_task(
+                queue,
+                "failed",
+                status="FAILED",
+                active_run_id=failed.run_id,
+                run_ids=[failed.run_id],
+            )
+            queue_store.save(queue)
+            ProposalStore(root / "proposals.json").create()
+
+            payload = build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                runtime_generation="test-generation",
+            )
+
+            self.assertEqual(payload["focused_run_id"], failed.run_id)
+            self.assertEqual(payload["selected_run"]["run"]["run_id"], failed.run_id)
 
     def test_build_proposals_payload_exposes_plan_review_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,7 +387,13 @@ class UiTests(unittest.TestCase):
                 worker_model="gpt-5.3-codex",
             )
             manifest.status = "PLAN_REVIEW_REQUIRED"
-            manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+            manifest.acceptance_criteria = ["Acceptance 1"]
+            manifest.verification_commands = ["pytest"]
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Do the work",
+                risk_notes=["Risk 1"],
+            )
             run_store.save(manifest)
             proposal.run_id = manifest.run_id
             proposal.status = "PLAN_REVIEW_REQUIRED"
@@ -327,6 +406,11 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["proposals"][0]["run_id"], manifest.run_id)
             self.assertEqual(payload["proposals"][0]["allowed_actions"], ["approve-plan", "revise-plan"])
             self.assertEqual(payload["proposals"][0]["run"]["plan"]["summary"], "Plan summary")
+            self.assertEqual(payload["proposals"][0]["plan_detail"]["summary"], "Plan summary")
+            self.assertEqual(payload["proposals"][0]["plan_detail"]["worker_prompt"], "Do the work")
+            self.assertEqual(payload["proposals"][0]["plan_detail"]["risk_notes"], ["Risk 1"])
+            self.assertEqual(payload["proposals"][0]["plan_detail"]["acceptance_criteria"], ["Acceptance 1"])
+            self.assertEqual(payload["proposals"][0]["plan_detail"]["verification_commands"], ["pytest"])
 
     def test_proposal_approve_queues_approved_plan_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,6 +747,11 @@ class UiTests(unittest.TestCase):
         self.assertIn("待审核计划", app_source)
         self.assertIn("生成 Planner 方案", app_source)
         self.assertIn("通过并加入执行队列", app_source)
+        self.assertIn("ProposalPlanPanel", app_source)
+        self.assertIn("完整 Planner 方案", app_source)
+        self.assertIn("FailurePanel", app_source)
+        self.assertIn("失败原因", app_source)
+        self.assertIn("verification-output.txt", app_source)
         self.assertIn("confirm-runtime-restarted", app_source)
         self.assertIn("确认已重启并继续", app_source)
         self.assertIn("确认中...", app_source)
@@ -675,6 +764,10 @@ class UiTests(unittest.TestCase):
         self.assertIn("验收标准", app_source)
         self.assertIn("验证命令", app_source)
         self.assertIn("newestFirst", app_source)
+        self.assertIn("focusedRunId", app_source)
+        self.assertIn("focused_run_id", app_source)
+        self.assertIn("manualSelection", app_source)
+        self.assertIn("stateSelectedRun", app_source)
         self.assertIn("scrollIntoView", app_source)
         self.assertIn("正在切换 run 详情", app_source)
         self.assertIn("useMutation", query_source)

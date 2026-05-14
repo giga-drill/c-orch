@@ -71,6 +71,51 @@ class CliRunTests(unittest.TestCase):
             self.assertEqual(manifest.workers[0].worktree_path, str(worktree_path))
             self.assertEqual(manifest.status, "NEW")
 
+    def test_run_prepare_only_uses_worker_execution_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            runs_dir = root / "runs"
+            worktree_path = root / "worktrees" / "run" / "worker-1"
+            report = CodexEnvironmentReport(
+                candidates=(),
+                selected=CodexCandidateReport(
+                    path="/Applications/Codex.app/Contents/Resources/codex",
+                    source="macos_app",
+                    version="codex-cli test",
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    usable=True,
+                ),
+            )
+
+            with mock.patch(
+                "c_orch.codex_discovery.inspect_codex_environment",
+                return_value=report,
+            ), mock.patch(
+                "c_orch.worktrees.create_worker_worktree",
+                return_value=worktree_path,
+            ), redirect_stdout(StringIO()):
+                exit_code = main(
+                    [
+                        "run",
+                        "--prepare-only",
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        str(runs_dir),
+                        "Implement feature X",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            run_ids = [path.name for path in runs_dir.iterdir()]
+            manifest = RunStore(runs_dir).load(run_ids[0])
+            self.assertEqual(manifest.planner.reasoning_effort, "high")
+            self.assertIsNone(manifest.planner.service_tier)
+            self.assertEqual(manifest.workers[0].reasoning_effort, "high")
+            self.assertEqual(manifest.workers[0].service_tier, "fast")
+
     def test_run_prepare_only_uses_project_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
