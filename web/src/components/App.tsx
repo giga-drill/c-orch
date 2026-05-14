@@ -62,9 +62,62 @@ function newestFirst<T>(items?: T[] | null): T[] {
   return Array.isArray(items) ? items.slice().reverse() : [];
 }
 
+const QUEUE_PREVIEW_LIMIT = 5;
+
 function pickTaskRun(task: TaskSummary): string | null {
   if (task.active_run_id) return task.active_run_id;
   return task.run_ids.length ? task.run_ids[task.run_ids.length - 1] : null;
+}
+
+function parseTimestamp(value?: string | null): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasActionableWaitingPoint(value?: string | null): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized !== "-" && normalized !== "done";
+}
+
+function isActionableWaitingTask(task: TaskSummary): boolean {
+  if (task.status !== "WAITING") return false;
+  if (task.allowed_actions.length > 0) return true;
+  return (
+    hasActionableWaitingPoint(task.waiting_for) ||
+    hasActionableWaitingPoint(task.next_action)
+  );
+}
+
+function queueTaskPriority(task: TaskSummary, selectedRunId: string | null): number {
+  const taskRunId = pickTaskRun(task);
+  if (selectedRunId && taskRunId === selectedRunId) return 0;
+  if (task.status === "RUNNING") return 1;
+  if (isActionableWaitingTask(task)) return 2;
+  if (task.status === "FAILED") return 3;
+  return 4;
+}
+
+function sortQueueTasks(tasks: TaskSummary[], selectedRunId: string | null): TaskSummary[] {
+  return tasks
+    .map((task, index) => ({ task, index }))
+    .sort((left, right) => {
+      const priorityDiff =
+        queueTaskPriority(left.task, selectedRunId) - queueTaskPriority(right.task, selectedRunId);
+      if (priorityDiff !== 0) return priorityDiff;
+
+      const leftUpdated = parseTimestamp(left.task.updated_at);
+      const rightUpdated = parseTimestamp(right.task.updated_at);
+      if (leftUpdated !== null && rightUpdated !== null && leftUpdated !== rightUpdated) {
+        return rightUpdated - leftUpdated;
+      }
+      if (leftUpdated !== null && rightUpdated === null) return -1;
+      if (leftUpdated === null && rightUpdated !== null) return 1;
+      return left.index - right.index;
+    })
+    .map((entry) => entry.task);
 }
 
 export function App() {
@@ -425,8 +478,20 @@ function QueuePanel({
 }) {
   const taskMutation = useTaskActionMutation();
   const [taskError, setTaskError] = useState<string | null>(null);
+  const [showAllTasks, setShowAllTasks] = useState(false);
   const summary = payload?.summary;
-  const tasksNewestFirst = newestFirst(payload?.tasks ?? []);
+  const queueTasks = payload?.tasks ?? [];
+  const sortedTasks = sortQueueTasks(queueTasks, selectedRunId);
+  const hasHiddenTasks = sortedTasks.length > QUEUE_PREVIEW_LIMIT;
+  const visibleTasks =
+    hasHiddenTasks && !showAllTasks ? sortedTasks.slice(0, QUEUE_PREVIEW_LIMIT) : sortedTasks;
+  const hiddenTaskCount = sortedTasks.length - visibleTasks.length;
+
+  useEffect(() => {
+    if (!hasHiddenTasks && showAllTasks) {
+      setShowAllTasks(false);
+    }
+  }, [hasHiddenTasks, showAllTasks]);
 
   async function runTaskAction(task: TaskSummary, action: AllowedTaskAction) {
     setTaskError(null);
@@ -454,9 +519,20 @@ function QueuePanel({
           <span>失败 {summary.failed_tasks}</span>
         </div>
       ) : null}
+      {hasHiddenTasks ? (
+        <div className="queueDisplayMeta">
+          <span>
+            显示 {visibleTasks.length} / 总数 {sortedTasks.length}
+            {hiddenTaskCount > 0 ? `，隐藏 ${hiddenTaskCount} 条` : ""}
+          </span>
+          <button type="button" onClick={() => setShowAllTasks((current) => !current)}>
+            {showAllTasks ? "收起" : "显示全部"}
+          </button>
+        </div>
+      ) : null}
       {taskError ? <div className="error">{taskError}</div> : null}
-      <div className="taskList">
-        {tasksNewestFirst.map((task) => {
+      <div className={showAllTasks ? "taskList queueTaskList expanded" : "taskList queueTaskList"}>
+        {visibleTasks.map((task) => {
           const taskRunId = pickTaskRun(task);
           const selected = Boolean(taskRunId && taskRunId === selectedRunId);
           return (
@@ -488,7 +564,7 @@ function QueuePanel({
             </article>
           );
         })}
-        {payload && payload.tasks.length === 0 ? <div className="empty">暂无任务。</div> : null}
+        {payload && queueTasks.length === 0 ? <div className="empty">暂无任务。</div> : null}
       </div>
     </section>
   );

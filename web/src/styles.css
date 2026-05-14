@@ -201,6 +201,21 @@ pre {
   padding: 2px 8px;
 }
 
+.queueDisplayMeta {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queueDisplayMeta button {
+  min-height: 28px;
+  padding: 0 10px;
+}
+
 .taskList,
 .runList,
 .detail,
@@ -211,6 +226,12 @@ pre {
 
 .runsPanel {
   min-height: 0;
+}
+
+.queueTaskList.expanded {
+  max-height: 48vh;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .runList {

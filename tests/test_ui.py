@@ -741,6 +741,7 @@ class UiTests(unittest.TestCase):
         client_source = (root / "web" / "src" / "api" / "client.ts").read_text(encoding="utf-8")
         main_source = (root / "web" / "src" / "main.tsx").read_text(encoding="utf-8")
         query_source = (root / "web" / "src" / "queries.ts").read_text(encoding="utf-8")
+        style_source = (root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("/api/runs", client_source)
         self.assertIn("/api/queue", client_source)
@@ -763,6 +764,11 @@ class UiTests(unittest.TestCase):
         self.assertIn("确认已重启并继续", app_source)
         self.assertIn("确认中...", app_source)
         self.assertIn("queueActionError", app_source)
+        self.assertIn("QUEUE_PREVIEW_LIMIT = 5", app_source)
+        self.assertIn("显示全部", app_source)
+        self.assertIn("收起", app_source)
+        self.assertIn("隐藏", app_source)
+        self.assertIn("queueTaskList", app_source)
         self.assertNotIn("通过并启动 Worker", app_source)
         self.assertNotIn("让 Planner 重新生成计划", app_source)
         self.assertIn("重新让 Planner 复核", app_source)
@@ -788,6 +794,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("runtimeGeneration", app_source)
         self.assertIn("refetchInterval: 1000", main_source)
         self.assertIn("refetchIntervalInBackground: true", main_source)
+        self.assertIn(".queueTaskList.expanded", style_source)
+        self.assertIn("max-height: 48vh", style_source)
 
     def test_fallback_html_explains_missing_frontend_build(self) -> None:
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)
