@@ -70,13 +70,16 @@ export function useDashboardStateQuery() {
     refetchInterval: (query) => {
       const payload = query.state.data as DashboardStatePayload | undefined;
       const activeProposals = payload?.proposals.summary?.active ?? 0;
+      const reviewRequiredProposals = payload?.proposals.summary?.review_required ?? 0;
+      const queuedProposals = payload?.proposals.summary?.queued ?? 0;
       const runningTasks = payload?.queue.summary?.running_tasks ?? 0;
       const runtimeBusy = Boolean(
         payload?.runtime.dispatch_running ||
           payload?.runtime.queue_dispatch_running ||
           payload?.runtime.proposal_dispatch_running,
       );
-      return activeProposals > 0 || runningTasks > 0 || runtimeBusy ? 2000 : false;
+      const proposalWorkVisible = activeProposals > 0 || reviewRequiredProposals > 0 || queuedProposals > 0;
+      return proposalWorkVisible || runningTasks > 0 || runtimeBusy ? 2000 : false;
     },
     refetchIntervalInBackground: true,
   });

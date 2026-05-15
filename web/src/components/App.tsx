@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type {
   AllowedRunAction,
   AllowedTaskAction,
@@ -25,6 +26,7 @@ import {
   useRunActionMutation,
   useRunQuery,
   useTaskActionMutation,
+  refreshDashboardQueries,
 } from "../queries";
 
 const statusText: Record<string, string> = {
@@ -146,6 +148,23 @@ function runRevision(run: RunListItem): string {
 function pickTaskRun(task: TaskSummary): string | null {
   if (task.active_run_id) return task.active_run_id;
   return task.run_ids.length ? task.run_ids[task.run_ids.length - 1] : null;
+}
+
+function usePendingActionRefresh(enabled: boolean, runId?: string | null) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!enabled) return;
+    const refresh = () => {
+      void refreshDashboardQueries(queryClient, runId);
+    };
+    const initialRefresh = window.setTimeout(refresh, 1000);
+    const interval = window.setInterval(refresh, 2000);
+    return () => {
+      window.clearTimeout(initialRefresh);
+      window.clearInterval(interval);
+    };
+  }, [enabled, queryClient, runId]);
 }
 
 function parseTimestamp(value?: string | null): number | null {
@@ -326,6 +345,7 @@ function SystemStatus({
   const queue = queuePayload?.queue;
   const restartRequired = queue?.status === "RESTART_REQUIRED";
   const currentQueueRevision = queueRevision(queuePayload);
+  usePendingActionRefresh(Boolean(pendingQueueAction));
 
   useEffect(() => {
     if (pendingQueueAction && currentQueueRevision !== pendingQueueAction.observedRevision) {
@@ -406,6 +426,7 @@ function ProposalPanel({
   const [error, setError] = useState<string | null>(null);
   const proposalsNewestFirst = newestFirst(payload?.proposals ?? []);
   const summary = payload?.summary;
+  usePendingActionRefresh(Boolean(pendingProposalAction));
 
   useEffect(() => {
     if (!pendingProposalAction) return;
@@ -636,6 +657,7 @@ function QueuePanel({
   const visibleTasks =
     hasHiddenTasks && !showAllTasks ? sortedTasks.slice(0, QUEUE_PREVIEW_LIMIT) : sortedTasks;
   const hiddenTaskCount = sortedTasks.length - visibleTasks.length;
+  usePendingActionRefresh(Boolean(pendingTaskAction), selectedRunId);
 
   useEffect(() => {
     if (!hasHiddenTasks && showAllTasks) {
@@ -818,6 +840,7 @@ function RunDetail({
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingRunAction, setPendingRunAction] = useState<PendingRunAction | null>(null);
   const currentRun = payload?.run;
+  usePendingActionRefresh(Boolean(pendingRunAction), currentRun?.run_id ?? selectedRunId);
 
   useEffect(() => {
     if (!pendingRunAction || !currentRun) return;
