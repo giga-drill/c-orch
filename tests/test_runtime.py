@@ -203,6 +203,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(payload["transition"]["task_id"], proposal.proposal_id)
             self.assertIn("state", payload)
             self.assertEqual(payload["state"]["selected_run"]["run"]["run_id"], manifest.run_id)
+            self.assertIn("timing", payload["state"]["selected_run"]["run"])
             self.assertGreater(payload["state_version"], 0)
             self.assertTrue(runtime.wait_for_dispatch(timeout=2))
 

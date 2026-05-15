@@ -34,6 +34,12 @@ entrypoints or the queue scheduler. Dashboard actions should return an explicit
 transition result plus a fresh state snapshot, so the frontend can converge even
 when a proposal is removed from the pool or a runtime restart interrupts an
 in-flight request.
+Run phase timing follows the same boundary: phase segments and transition
+timestamps are backend-authored run-manifest data, and UI timing panels must
+render backend `run.timing` summary directly instead of inferring business phase
+durations from raw event logs in the browser. Legacy runs that predate manifest
+timing can use backend best-effort fallback summaries derived from
+`events`/`created_at`/`updated_at` with explicit `missing` or `partial` markers.
 `POST /api/proposals` is also a control-plane action: it should persist proposal
 and run metadata quickly, then let backend async dispatchers continue Planner
 work outside the HTTP request.

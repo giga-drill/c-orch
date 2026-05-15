@@ -652,6 +652,10 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(events[8]["applied"])
             self.assertEqual(events[9]["commit_hash"], _git(Path(manifest.cwd), ["rev-parse", "HEAD"]).strip())
             self.assertEqual(events[10]["status"], "APPROVED")
+            self.assertIsNotNone(result.timing)
+            phase_names = [segment["phase"] for segment in result.timing.get("segments", [])]
+            self.assertIn("planning", phase_names)
+            self.assertIn("worker_execution", phase_names)
 
     def test_plan_review_required_pauses_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -979,6 +983,11 @@ class OrchestratorTests(unittest.TestCase):
                 ["REVISION_REQUESTED", "ACCEPTED"],
             )
             self.assertEqual(result.review.decision, "accepted")
+            self.assertIsNotNone(result.timing)
+            phase_names = [segment["phase"] for segment in result.timing.get("segments", [])]
+            self.assertEqual(phase_names.count("worker_execution"), 2)
+            self.assertEqual(phase_names.count("planner_review"), 2)
+            self.assertEqual(phase_names.count("revision_wait"), 1)
 
             self.assertIn("def subtract(a, b):", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertIn(
@@ -1437,6 +1446,58 @@ class OrchestratorTests(unittest.TestCase):
                 [attempt.status for attempt in result.review_attempts],
                 ["FAILED_RETRYABLE", "ACCEPTED"],
             )
+
+    def test_retry_review_revision_requested_records_revision_wait_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            first_driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=first_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+            self.assertEqual(paused.status, "WORK_DONE")
+            self.assertEqual(paused.review_attempts[-1].status, "FAILED_RETRYABLE")
+
+            retry_driver = FakeDriver(
+                start_results=[],
+                reply_results=[
+                    _session("planner-thread", _review("revision_requested", "Please tighten fix.")),
+                    _session("worker-thread", _worker_result(summary="retry rework done")),
+                    _session("planner-thread", _review("accepted")),
+                ],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=retry_driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).retry_review(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(
+                [attempt.status for attempt in result.review_attempts],
+                ["FAILED_RETRYABLE", "REVISION_REQUESTED", "ACCEPTED"],
+            )
+            self.assertEqual(
+                [call["thread_id"] for call in retry_driver.reply_calls],
+                ["planner-thread", "worker-thread", "planner-thread"],
+            )
+            self.assertIsNotNone(result.timing)
+            phase_names = [segment["phase"] for segment in result.timing.get("segments", [])]
+            self.assertGreaterEqual(phase_names.count("planner_review"), 2)
+            self.assertEqual(phase_names.count("revision_wait"), 1)
+            self.assertGreaterEqual(phase_names.count("worker_execution"), 2)
 
     def test_retry_review_records_recovery_after_mcp_timeout_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

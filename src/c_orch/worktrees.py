@@ -154,6 +154,8 @@ def apply_diff_evidence_to_repo(
     empty_patch_noop = patch_is_empty and _is_empty_patch_failure(check_result)
 
     apply_result: Optional[subprocess.CompletedProcess[str]] = None
+    three_way_check_result: Optional[subprocess.CompletedProcess[str]] = None
+    three_way_apply_result: Optional[subprocess.CompletedProcess[str]] = None
     applied = check_result.returncode == 0 or empty_patch_noop
     if check_result.returncode == 0 and not patch_is_empty:
         apply_result = _git_process(
@@ -162,14 +164,38 @@ def apply_diff_evidence_to_repo(
             stdin=diff.patch,
         )
         applied = apply_result.returncode == 0
+    elif check_result.returncode != 0 and not empty_patch_noop and not patch_is_empty:
+        three_way_check_result = _git_process(
+            ["apply", "--3way", "--check", "--binary", "-"],
+            cwd=target_repo,
+            stdin=diff.patch,
+        )
+        if three_way_check_result.returncode == 0:
+            three_way_apply_result = _git_process(
+                ["apply", "--3way", "--binary", "-"],
+                cwd=target_repo,
+                stdin=diff.patch,
+            )
+            applied = three_way_apply_result.returncode == 0
 
     summary = "Patch applied successfully."
     if patch_is_empty:
         summary = "No-op: empty patch."
-    if check_result.returncode != 0 and not empty_patch_noop:
+    if three_way_apply_result is not None and three_way_apply_result.returncode == 0:
+        summary = "Patch applied successfully with git apply --3way."
+    elif (
+        check_result.returncode != 0
+        and not empty_patch_noop
+        and (
+            three_way_check_result is None
+            or three_way_check_result.returncode != 0
+        )
+    ):
         summary = "Failed: git apply --check rejected the patch."
     elif apply_result is not None and apply_result.returncode != 0:
         summary = "Failed: git apply could not apply the patch."
+    elif three_way_apply_result is not None and three_way_apply_result.returncode != 0:
+        summary = "Failed: git apply --3way could not apply the patch."
 
     output_path.write_text(
         _format_apply_output(
@@ -178,6 +204,8 @@ def apply_diff_evidence_to_repo(
             status_result=status_result,
             check_result=check_result,
             apply_result=apply_result,
+            three_way_check_result=three_way_check_result,
+            three_way_apply_result=three_way_apply_result,
             summary=summary,
         ),
         encoding="utf-8",
@@ -581,6 +609,8 @@ def _format_apply_output(
     status_result: subprocess.CompletedProcess[str],
     check_result: subprocess.CompletedProcess[str],
     apply_result: Optional[subprocess.CompletedProcess[str]],
+    three_way_check_result: Optional[subprocess.CompletedProcess[str]],
+    three_way_apply_result: Optional[subprocess.CompletedProcess[str]],
     summary: str,
 ) -> str:
     sections = OrderedDict()
@@ -608,6 +638,24 @@ def _format_apply_output(
                 command=["apply", "--binary", "-"],
                 cwd=target_repo,
                 result=apply_result,
+            )
+        )
+    if three_way_check_result is not None:
+        lines.append("")
+        lines.extend(
+            _format_command_result(
+                command=["apply", "--3way", "--check", "--binary", "-"],
+                cwd=target_repo,
+                result=three_way_check_result,
+            )
+        )
+    if three_way_apply_result is not None:
+        lines.append("")
+        lines.extend(
+            _format_command_result(
+                command=["apply", "--3way", "--binary", "-"],
+                cwd=target_repo,
+                result=three_way_apply_result,
             )
         )
     return "\n".join(lines).rstrip() + "\n"

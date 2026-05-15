@@ -58,6 +58,18 @@ function displayValue(value: unknown): string {
   return String(value);
 }
 
+function formatDurationSeconds(value: unknown): string {
+  const total = Number(value);
+  if (!Number.isFinite(total) || total < 0) return "-";
+  const whole = Math.floor(total);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const seconds = whole % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function newestFirst<T>(items?: T[] | null): T[] {
   return Array.isArray(items) ? items.slice().reverse() : [];
 }
@@ -729,6 +741,10 @@ function RunDetail({
         <Metric label="复核次数" value={run.review_attempt_count} />
         <Metric label="证据" value={run.evidence_count} />
       </div>
+      <section className="section">
+        <h2>阶段耗时</h2>
+        <PhaseTimingPanel run={run} />
+      </section>
 
       <div className="detailGrid">
         <section className="section">
@@ -974,6 +990,31 @@ function Timeline({ events }: { events: RunEvent[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+function PhaseTimingPanel({ run }: { run: RunListItem }) {
+  const timing = run.timing;
+  const phases = timing?.phases ?? [];
+  if (!timing) return <p className="meta">暂无阶段耗时。</p>;
+  return (
+    <div className="timingPanel">
+      <div className="timingTotals">
+        <span>来源: {displayValue(timing.source)}</span>
+        <span>总耗时: {formatDurationSeconds(timing.total?.duration_seconds)}</span>
+        <span>状态: {displayValue(timing.total?.status)}</span>
+      </div>
+      <ul className="timingList">
+        {phases.map((phase) => (
+          <li key={phase.phase} className="timingRow">
+            <span>{phase.label}</span>
+            <span>count {phase.count}</span>
+            <span>{formatDurationSeconds(phase.total_duration_seconds)}</span>
+            <StatusBadge status={phase.status} />
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

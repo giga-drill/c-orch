@@ -262,6 +262,7 @@ class RunManifest:
     review_attempts: List[ReviewAttemptRecord]
     created_at: str
     updated_at: str
+    timing: Optional[Dict[str, Any]] = None
     codex_binary_path: Optional[str] = None
     requires_restart: bool = False
     restart_reason: Optional[str] = None
@@ -283,6 +284,7 @@ class RunManifest:
             "review_attempts": [attempt.to_dict() for attempt in self.review_attempts],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "timing": dict(self.timing) if isinstance(self.timing, dict) else None,
             "codex_binary_path": self.codex_binary_path,
             "requires_restart": self.requires_restart,
             "restart_reason": self.restart_reason,
@@ -320,6 +322,7 @@ class RunManifest:
             ] if isinstance(review_attempts, list) else [],
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            timing=dict(data.get("timing")) if isinstance(data.get("timing"), dict) else None,
             codex_binary_path=data.get("codex_binary_path"),
             requires_restart=bool(data.get("requires_restart", False)),
             restart_reason=data.get("restart_reason"),
@@ -386,6 +389,7 @@ class RunStore:
             review_attempts=[],
             created_at=now,
             updated_at=now,
+            timing={"version": 1, "segments": []},
             codex_binary_path=codex_path,
         )
         self.save(manifest, touch=False)

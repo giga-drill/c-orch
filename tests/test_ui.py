@@ -56,6 +56,8 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["runs"][0]["status"], "WORKING")
             self.assertEqual(payload["runs"][0]["planner"]["thread_id"], "planner-thread")
             self.assertEqual(payload["runs"][0]["workers"][0]["thread_id"], "worker-thread")
+            self.assertIn("timing", payload["runs"][0])
+            self.assertIn("total", payload["runs"][0]["timing"])
 
     def test_build_run_payload_includes_manifest_and_evidence_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +124,8 @@ class UiTests(unittest.TestCase):
             assert payload is not None
             self.assertEqual(payload["manifest"]["run_id"], manifest.run_id)
             self.assertEqual(payload["run"]["review"]["decision"], "accepted")
+            self.assertIn("timing", payload["run"])
+            self.assertIn("phases", payload["run"]["timing"])
             self.assertEqual(payload["run"]["planner"]["reasoning_effort"], "high")
             self.assertEqual(payload["run"]["plan"]["approval_status"], "approved")
             self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
@@ -161,6 +165,46 @@ class UiTests(unittest.TestCase):
     def test_build_run_payload_rejects_path_traversal_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(build_run_payload(Path(tmp) / "runs", "../outside"))
+
+    def test_legacy_manifest_without_timing_uses_fallback_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Legacy timing fallback",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            run_store.save(manifest)
+            run_store.append_event(manifest.run_id, "planner_start", "Planner started")
+            run_store.append_event(manifest.run_id, "planner_plan_ready", "Planner plan ready")
+            run_store.append_event(manifest.run_id, "plan_review_required", "Human plan review required")
+
+            manifest_path = root / "runs" / manifest.run_id / "manifest.json"
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw.pop("timing", None)
+            manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            run_payload = build_run_payload(root / "runs", manifest.run_id)
+            runs_payload = build_runs_payload(root / "runs")
+            state_payload = build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=None,
+                proposals_path=None,
+                runtime_generation="legacy-test",
+                selected_run_id=manifest.run_id,
+            )
+
+            assert run_payload is not None
+            self.assertEqual(run_payload["run"]["timing"]["source"], "legacy_fallback")
+            self.assertIn("phases", run_payload["run"]["timing"])
+            self.assertEqual(runs_payload["runs"][0]["timing"]["source"], "legacy_fallback")
+            self.assertEqual(
+                state_payload["selected_run"]["run"]["timing"]["source"],
+                "legacy_fallback",
+            )
 
     def test_build_queue_payload_includes_task_run_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

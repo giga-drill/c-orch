@@ -18,6 +18,7 @@ from .settings import (
     SERVICE_TIER_CHOICES,
 )
 from .failure_policy import has_retryable_review_failure
+from .phase_timing import record_run_status_transition
 from .states import RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED, TERMINAL_RUN_STATUSES
 
 
@@ -541,7 +542,12 @@ def run_prepare(args: argparse.Namespace) -> int:
                 )
         except Exception as exc:
             if not _is_terminal_manifest_status(manifest.status):
-                manifest.status = RUN_FAILED
+                record_run_status_transition(
+                    manifest,
+                    RUN_FAILED,
+                    store.now_iso(),
+                    metadata={"reason": "cli_run_exception"},
+                )
             store.save(manifest)
             _print_run_summary(
                 manifest=manifest,
@@ -676,7 +682,12 @@ def run_resume(args: argparse.Namespace) -> int:
                 manifest = orchestrator.run(manifest)
     except Exception as exc:
         if not revise_feedback and not _is_terminal_manifest_status(manifest.status):
-            manifest.status = RUN_FAILED
+            record_run_status_transition(
+                manifest,
+                RUN_FAILED,
+                store.now_iso(),
+                metadata={"reason": "cli_resume_exception"},
+            )
         store.save(manifest)
         _print_run_summary(
             manifest=manifest,

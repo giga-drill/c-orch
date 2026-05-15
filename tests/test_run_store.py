@@ -57,12 +57,17 @@ class RunStoreTests(unittest.TestCase):
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
             self.assertEqual(loaded.restart_paths, [])
+            self.assertIsInstance(loaded.timing, dict)
+            self.assertEqual(loaded.timing.get("version"), 1)
+            self.assertEqual(loaded.timing.get("segments"), [])
 
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["run_id"], manifest.run_id)
             self.assertFalse(raw["requires_restart"])
             self.assertIsNone(raw["restart_reason"])
             self.assertEqual(raw["restart_paths"], [])
+            self.assertEqual(raw["timing"]["version"], 1)
+            self.assertEqual(raw["timing"]["segments"], [])
 
     def test_save_updates_review_and_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +147,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.review_attempts[0].workspace_path, "/tmp/workspace")
             self.assertEqual(loaded.review_attempts[0].error, "Timed out")
             self.assertEqual(loaded.workers[0].result["summary"], "done")
+            self.assertIsNotNone(loaded.timing)
 
     def test_append_event_and_load_events_preserve_order_and_optional_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,12 +226,14 @@ class RunStoreTests(unittest.TestCase):
             raw.pop("requires_restart", None)
             raw.pop("restart_reason", None)
             raw.pop("restart_paths", None)
+            raw.pop("timing", None)
             manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             loaded = store.load(manifest.run_id)
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
             self.assertEqual(loaded.restart_paths, [])
+            self.assertIsNone(loaded.timing)
 
 
 if __name__ == "__main__":

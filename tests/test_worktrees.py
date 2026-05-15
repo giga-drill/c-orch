@@ -6,8 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Sequence
+from unittest import mock
 
 from c_orch.worktrees import (
+    DiffEvidence,
     apply_diff_evidence_to_repo,
     commit_applied_changes,
     collect_repo_changed_paths,
@@ -164,6 +166,41 @@ class WorktreeTests(unittest.TestCase):
             self.assertIn("apply --check --binary", output)
             self.assertIn("returncode:", output)
             self.assertIn("stderr:", output)
+
+    def test_apply_diff_evidence_to_repo_uses_three_way_when_direct_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            diff_evidence = DiffEvidence(
+                summary_path=root / "summary.md",
+                patch_path=root / "patch.diff",
+                summary="summary",
+                patch="diff --git a/README.md b/README.md\n",
+                changed_paths=["README.md"],
+            )
+            calls = []
+
+            def fake_git_process(args, *, cwd, stdin=None):
+                calls.append(list(args))
+                if args == ["status", "--short"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+                if args == ["apply", "--check", "--binary", "-"]:
+                    return subprocess.CompletedProcess(args, 1, stdout="", stderr="direct check failed")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+            with mock.patch("c_orch.worktrees._git_process", side_effect=fake_git_process):
+                report = apply_diff_evidence_to_repo(
+                    diff_evidence,
+                    repo,
+                    root / "runs" / "run-1" / "evidence",
+                )
+
+            self.assertTrue(report.applied)
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("Patch applied successfully with git apply --3way.", output)
+            self.assertIn("apply --3way --check --binary", output)
+            self.assertIn(["apply", "--3way", "--binary", "-"], calls)
 
     def test_collect_repo_changed_paths_includes_tracked_and_untracked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,6 +17,7 @@ from .failure_policy import (
     has_retryable_verification_failure,
     has_retryable_verification_failure_dict,
 )
+from .phase_timing import build_timing_summary, record_run_status_transition
 from .proposal_store import (
     PROPOSAL_APPROVED,
     PROPOSAL_FAILED,
@@ -488,7 +489,12 @@ class COrchRuntime:
         except OSError:
             return
         if manifest.status != "FAILED":
-            manifest.status = "FAILED"
+            record_run_status_transition(
+                manifest,
+                "FAILED",
+                run_store.now_iso(),
+                metadata={"reason": "proposal_planning_failed"},
+            )
             manifest.planner.status = "FAILED"
             for worker in manifest.workers:
                 if worker.status == "PENDING":
@@ -1147,7 +1153,12 @@ def _approve_manifest_plan(run_store: RunStore, manifest: RunManifest) -> None:
     manifest.plan.approval_status = "approved"
     manifest.plan.approved_at = run_store.now_iso()
     manifest.plan.approved_by = "human"
-    manifest.status = RUN_PLAN_APPROVED
+    record_run_status_transition(
+        manifest,
+        RUN_PLAN_APPROVED,
+        run_store.now_iso(),
+        metadata={"approved_by": "human"},
+    )
     run_store.save(manifest)
 
 
@@ -1343,6 +1354,8 @@ def _summarize_manifest(
     updated_at = str(manifest.get("updated_at", ""))
     created_at = str(manifest.get("created_at", ""))
     waiting_for = _derive_manifest_waiting_for(manifest)
+    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    timing = build_timing_summary(manifest, events or [], now_iso=now_iso)
     return {
         "run_id": str(manifest.get("run_id", "")),
         "status": status,
@@ -1376,6 +1389,7 @@ def _summarize_manifest(
         "can_retry_review": has_retryable_review_failure_dict(manifest),
         "last_event": _event_summary(event_list[-1]) if event_list else None,
         "last_error_event": _last_error_event(event_list),
+        "timing": timing,
         "plan": {
             "approval_status": plan.get("approval_status"),
             "summary": plan.get("summary"),

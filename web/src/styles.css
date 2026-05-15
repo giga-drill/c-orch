@@ -395,6 +395,38 @@ input {
   gap: 8px;
 }
 
+.timingPanel {
+  display: grid;
+  gap: 8px;
+}
+
+.timingTotals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.timingList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.timingRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #e4eae0;
+  border-radius: 8px;
+  background: #fcfdfa;
+  padding: 7px 9px;
+}
+
 .proposalForm {
   margin-top: 10px;
 }

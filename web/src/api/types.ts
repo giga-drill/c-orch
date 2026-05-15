@@ -109,6 +109,40 @@ export interface AgentSummary {
   evidence_count?: number;
 }
 
+export interface RunTimingSegment {
+  id: string;
+  sequence: number;
+  phase: string;
+  label: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number;
+  status: string;
+  start_status?: string | null;
+  end_status?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RunTimingPhaseSummary {
+  phase: string;
+  label: string;
+  count: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number;
+  total_duration_seconds: number;
+  status: string;
+}
+
+export interface RunTimingSummary {
+  version: number;
+  source: string;
+  segments: RunTimingSegment[];
+  phases: RunTimingPhaseSummary[];
+  phase_aggregates: Record<string, RunTimingPhaseSummary>;
+  total: RunTimingPhaseSummary;
+}
+
 export interface RunListItem {
   run_id: string;
   status: string;
@@ -131,6 +165,7 @@ export interface RunListItem {
   last_event: RunEvent | null;
   last_error_event: RunEvent | null;
   can_retry_review: boolean;
+  timing: RunTimingSummary;
   plan: { approval_status?: string | null; summary?: string | null } | null;
   plan_revision_count: number;
   latest_plan_revision_id: string | null;
@@ -164,6 +199,7 @@ export interface ManifestRecord {
   status: string;
   created_at: string;
   updated_at: string;
+  timing: Record<string, unknown> | null;
   codex_binary_path: string | null;
   requires_restart: boolean;
   restart_reason: string | null;
