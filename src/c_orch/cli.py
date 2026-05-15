@@ -773,7 +773,7 @@ def run_queue_import(args: argparse.Namespace) -> int:
 
 def run_queue_status(args: argparse.Namespace) -> int:
     from .config import load_project_config
-    from .runtime import build_queue_payload
+    from .dashboard_payloads import build_queue_payload
     from .task_store import TaskStore
 
     cwd = Path(args.cwd).expanduser().resolve()

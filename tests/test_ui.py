@@ -9,12 +9,14 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest import mock
 
-from c_orch.runtime import (
+from c_orch.dashboard_payloads import (
     build_proposals_payload,
     build_queue_payload,
     build_run_payload,
     build_runs_payload,
     build_state_payload,
+)
+from c_orch.runtime import (
     proposal_action,
     queue_action,
     run_action,
