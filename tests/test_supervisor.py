@@ -92,6 +92,20 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("--config", command)
         self.assertEqual(command[-2:], ["--config", "custom.toml"])
 
+    def test_build_ui_command_can_target_api_only_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = build_ui_command(
+                cwd=root,
+                runs_dir=root / "runs",
+                queue_path=root / ".c-orch" / "tasks" / "queue.json",
+                host="127.0.0.1",
+                port=8765,
+                api_only=True,
+            )
+
+        self.assertIn("--api-only", command)
+
     def test_restart_gate_restarts_runtime_and_confirms_gate(self) -> None:
         started: list[FakeProcess] = []
 

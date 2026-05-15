@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 from .settings import (
     APPROVAL_POLICY_CHOICES,
     DEFAULT_APPROVAL_POLICY,
+    DEFAULT_DEV_UI_HOST,
+    DEFAULT_DEV_UI_PORT,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_PLANNER_MODELS,
     DEFAULT_RUNS_DIR,
@@ -48,6 +50,8 @@ class UiConfig:
     runs_dir: str = DEFAULT_RUNS_DIR
     host: str = DEFAULT_UI_HOST
     port: int = DEFAULT_UI_PORT
+    dev_host: str = DEFAULT_DEV_UI_HOST
+    dev_port: int = DEFAULT_DEV_UI_PORT
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,8 @@ def _ui_config(data: Mapping[str, Any]) -> UiConfig:
         runs_dir=_string(data.get("runs_dir"), "ui.runs_dir", DEFAULT_RUNS_DIR),
         host=_string(data.get("host"), "ui.host", DEFAULT_UI_HOST),
         port=_positive_int(data.get("port"), "ui.port", DEFAULT_UI_PORT),
+        dev_host=_string(data.get("dev_host"), "ui.dev_host", DEFAULT_DEV_UI_HOST),
+        dev_port=_positive_int(data.get("dev_port"), "ui.dev_port", DEFAULT_DEV_UI_PORT),
     )
 
 

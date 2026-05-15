@@ -229,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument(
         "--api-only",
         action="store_true",
-        help="Serve only local /api/* endpoints; use Vite on 5173 for the UI.",
+        help="Serve only local /api/* endpoints; use the dev UI entry for the browser UI.",
     )
 
     dev_ui = subparsers.add_parser(
@@ -242,8 +242,8 @@ def build_parser() -> argparse.ArgumentParser:
     dev_ui.add_argument("--host", default=None, help="API host interface to bind.")
     dev_ui.add_argument("--port", type=int, default=None, help="API port.")
     dev_ui.add_argument("--queue-file", default=None, help="Optional task queue file for dashboard queue view.")
-    dev_ui.add_argument("--vite-host", default="127.0.0.1", help="Vite dev server host.")
-    dev_ui.add_argument("--vite-port", type=int, default=5173, help="Vite dev server port.")
+    dev_ui.add_argument("--vite-host", default=None, help="Vite dev server host. Defaults to ui.dev_host.")
+    dev_ui.add_argument("--vite-port", type=int, default=None, help="Vite dev server port. Defaults to ui.dev_port.")
     dev_ui.add_argument(
         "--poll-interval",
         type=float,
@@ -976,7 +976,9 @@ def run_dev_ui(args: argparse.Namespace) -> int:
     api_port = args.port or project_config.ui.port
     api_client_host = "127.0.0.1" if api_host in {"0.0.0.0", "::"} else api_host
     api_url = f"http://{api_client_host}:{api_port}"
-    vite_url = f"http://{args.vite_host}:{args.vite_port}"
+    vite_host = args.vite_host or project_config.ui.dev_host
+    vite_port = args.vite_port or project_config.ui.dev_port
+    vite_url = f"http://{vite_host}:{vite_port}"
     api_command = build_api_command(
         cwd=cwd,
         config_path=args.config,
@@ -988,8 +990,8 @@ def run_dev_ui(args: argparse.Namespace) -> int:
     )
     vite_command = build_vite_command(
         cwd=cwd,
-        host=args.vite_host,
-        port=args.vite_port,
+        host=vite_host,
+        port=vite_port,
     )
     print(f"c-orch API: {api_url}", flush=True)
     print(f"c-orch dev UI: {vite_url}", flush=True)

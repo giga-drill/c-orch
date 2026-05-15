@@ -973,7 +973,7 @@ class UiTests(unittest.TestCase):
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)
         self.assertIn("pnpm --dir web run build", FALLBACK_INDEX_HTML)
         self.assertIn("/api/*", API_ONLY_INDEX_HTML)
-        self.assertIn("5173", API_ONLY_INDEX_HTML)
+        self.assertIn("dev-ui", API_ONLY_INDEX_HTML)
 
     def test_dashboard_server_serves_root_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1013,7 +1013,7 @@ class UiTests(unittest.TestCase):
                 thread.join(timeout=2)
 
             self.assertIn("c-orch API runtime", body)
-            self.assertIn("5173", body)
+            self.assertIn("dev-ui", body)
             self.assertIn("text/html", content_type)
 
     def test_dashboard_api_only_rejects_static_assets(self) -> None:

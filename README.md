@@ -87,8 +87,9 @@ PYTHONPATH=src python3.11 -m c_orch.cli ui \
 ```
 
 For frontend development, use Vite as the browser entry point. This keeps HMR
-on `5173`, proxies `/api/*` to the local API runtime on `8765`, and restarts the
-API child when backend Python sources change:
+enabled, proxies `/api/*` to the local API runtime, and restarts the API child
+when backend Python sources change. Host and port values come from `[ui]` config
+and can be overridden with CLI flags:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
@@ -97,8 +98,8 @@ PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
   --queue-file .c-orch/tasks/queue.json
 ```
 
-Then open `http://127.0.0.1:5173/`. The `8765` process is API-only in this mode;
-its root page only points back to the Vite dev UI.
+Then open the dev UI URL printed by the command. The API process is API-only in
+this mode; its root page only points back to the Vite dev UI.
 
 For self-modifying Cork runs, prefer the supervised dashboard. It starts the
 same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the
@@ -155,8 +156,11 @@ runs_dir = "runs"
 worktrees_dir = ".c-orch/worktrees"
 
 [ui]
-host = "127.0.0.1"
-port = 8765
+# Optional. Omit these to use built-in defaults.
+# host controls the API bind host.
+# port controls the API port.
+# dev_host controls the Vite bind host.
+# dev_port controls the Vite dev UI port.
 ```
 
 ## Codex Binary Selection

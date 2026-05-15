@@ -35,6 +35,8 @@ approval_policy = "on-request"
 [ui]
 host = "0.0.0.0"
 port = 9876
+dev_host = "localhost"
+dev_port = 6173
 """.strip(),
                 encoding="utf-8",
             )
@@ -54,6 +56,8 @@ port = 9876
             self.assertEqual(config.run.approval_policy, "on-request")
             self.assertEqual(config.ui.host, "0.0.0.0")
             self.assertEqual(config.ui.port, 9876)
+            self.assertEqual(config.ui.dev_host, "localhost")
+            self.assertEqual(config.ui.dev_port, 6173)
 
     def test_rejects_invalid_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

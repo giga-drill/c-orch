@@ -40,7 +40,7 @@ API_ONLY_INDEX_HTML = """<!doctype html>
 <body>
   <main style="font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 48px auto; padding: 0 20px;">
     <h1>c-orch API runtime</h1>
-    <p>这个进程只提供 <code>/api/*</code>。开发 UI 请访问 Vite dev server，例如 <code>http://127.0.0.1:5173/</code>。</p>
+    <p>这个进程只提供 <code>/api/*</code>。开发 UI 请访问 <code>dev-ui</code> 命令输出的 Vite 地址。</p>
   </main>
 </body>
 </html>

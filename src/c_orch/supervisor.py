@@ -216,6 +216,7 @@ def build_ui_command(
     host: str,
     port: int,
     config_path: Optional[str] = None,
+    api_only: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -233,6 +234,8 @@ def build_ui_command(
         "--port",
         str(port),
     ]
+    if api_only:
+        command.append("--api-only")
     if config_path:
         command.extend(["--config", config_path])
     return command

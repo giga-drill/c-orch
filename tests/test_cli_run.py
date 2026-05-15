@@ -677,6 +677,41 @@ approval_policy = "on-request"
             self.assertIn("--api-only", config.api_command)
             self.assertIn("c-orch dev UI: http://127.0.0.1:5174", stdout.getvalue())
 
+    def test_dev_ui_uses_configured_vite_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            (cwd / ".c-orch.toml").write_text(
+                """
+[ui]
+host = "127.0.0.1"
+port = 9876
+dev_host = "localhost"
+dev_port = 6173
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with mock.patch("c_orch.dev_ui.DevUiRunner") as runner_cls, redirect_stdout(StringIO()) as stdout:
+                runner_cls.return_value.run_forever.return_value = 0
+                exit_code = main(
+                    [
+                        "dev-ui",
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            config = runner_cls.call_args.args[0]
+            self.assertEqual(config.api_base_url, "http://127.0.0.1:9876")
+            self.assertIn("localhost", config.vite_command)
+            self.assertIn("6173", config.vite_command)
+            self.assertIn("c-orch dev UI: http://localhost:6173", stdout.getvalue())
+
 
 class FakeDriver:
     def __init__(self) -> None:

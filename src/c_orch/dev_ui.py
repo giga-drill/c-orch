@@ -7,8 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
-from urllib.error import URLError
-from urllib.request import urlopen
+
+from .supervisor import DashboardSupervisor, ProcessHandle, SupervisorConfig, build_ui_command
 
 
 @dataclass(frozen=True)
@@ -24,9 +24,18 @@ class DevUiConfig:
 
 
 class DevUiRunner:
-    def __init__(self, config: DevUiConfig) -> None:
+    def __init__(self, config: DevUiConfig, *, api_supervisor: Optional[DashboardSupervisor] = None) -> None:
         self.config = config
-        self.api_process: Optional[subprocess.Popen[bytes]] = None
+        self.api_supervisor = api_supervisor or DashboardSupervisor(
+            SupervisorConfig(
+                command=config.api_command,
+                cwd=config.cwd,
+                base_url=config.api_base_url,
+                poll_interval_seconds=config.poll_interval_seconds,
+                startup_timeout_seconds=config.startup_timeout_seconds,
+            ),
+            process_factory=_start_api_process,
+        )
         self.vite_process: Optional[subprocess.Popen[bytes]] = None
         self._snapshot = source_snapshot(config.watch_roots)
 
@@ -46,16 +55,7 @@ class DevUiRunner:
         self.start_vite()
 
     def start_api(self) -> None:
-        if self.api_process is not None and self.api_process.poll() is None:
-            return
-        print(f"dev-ui: starting API runtime: {' '.join(self.config.api_command)}", flush=True)
-        self.api_process = subprocess.Popen(
-            list(self.config.api_command),
-            cwd=self.config.cwd,
-            env=_source_env(self.config.cwd),
-            start_new_session=True,
-        )
-        self.wait_until_api_ready()
+        self.api_supervisor.start()
 
     def start_vite(self) -> None:
         if self.vite_process is not None and self.vite_process.poll() is None:
@@ -71,58 +71,30 @@ class DevUiRunner:
         )
 
     def stop(self) -> None:
-        for name, process in (("Vite", self.vite_process), ("API runtime", self.api_process)):
-            if process is None or process.poll() is not None:
-                continue
-            print(f"dev-ui: stopping {name}", flush=True)
+        process = self.vite_process
+        if process is not None and process.poll() is None:
+            print("dev-ui: stopping Vite", flush=True)
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
-        self.api_process = None
         self.vite_process = None
+        self.api_supervisor.stop()
 
     def restart_api(self) -> None:
-        if self.api_process is not None and self.api_process.poll() is None:
-            print("dev-ui: restarting API runtime after backend source change", flush=True)
-            self.api_process.terminate()
-            try:
-                self.api_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.api_process.kill()
-                self.api_process.wait(timeout=10)
-        self.api_process = None
-        self.start_api()
+        print("dev-ui: restarting API runtime after backend source change", flush=True)
+        self.api_supervisor.restart()
 
     def check_once(self) -> None:
-        if self.api_process is not None and self.api_process.poll() is not None:
-            print("dev-ui: API runtime exited; restarting", flush=True)
-            self.api_process = None
-            self.start_api()
+        self.api_supervisor.check_once()
         if self.vite_process is not None and self.vite_process.poll() is not None:
             raise RuntimeError("Vite dev server exited")
         snapshot = source_snapshot(self.config.watch_roots)
         if snapshot != self._snapshot:
             self._snapshot = snapshot
             self.restart_api()
-
-    def wait_until_api_ready(self) -> None:
-        deadline = time.time() + self.config.startup_timeout_seconds
-        last_error: Optional[BaseException] = None
-        while time.time() < deadline:
-            if self.api_process is not None:
-                returncode = self.api_process.poll()
-                if returncode is not None:
-                    raise RuntimeError(f"API runtime exited before becoming ready: {returncode}")
-            try:
-                with urlopen(f"{self.config.api_base_url.rstrip('/')}/api/state", timeout=2):
-                    return
-            except (OSError, URLError, TimeoutError, ValueError) as exc:
-                last_error = exc
-                time.sleep(0.25)
-        raise TimeoutError(f"API runtime did not become ready: {last_error}")
 
 
 def build_api_command(
@@ -135,25 +107,16 @@ def build_api_command(
     port: int,
     python_executable: str = sys.executable,
 ) -> Sequence[str]:
-    command = [
-        python_executable,
-        "-m",
-        "c_orch.cli",
-        "ui",
-        "--cwd",
-        str(cwd),
-        "--runs-dir",
-        str(runs_dir),
-        "--queue-file",
-        str(queue_path),
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--api-only",
-    ]
-    if config_path:
-        command.extend(["--config", config_path])
+    command = build_ui_command(
+        cwd=cwd,
+        runs_dir=runs_dir,
+        queue_path=queue_path,
+        host=host,
+        port=port,
+        config_path=config_path,
+        api_only=True,
+    )
+    command[0] = python_executable
     return command
 
 
@@ -194,3 +157,12 @@ def _source_env(cwd: Path) -> dict[str, str]:
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = str(src) if not existing else f"{src}{os.pathsep}{existing}"
     return env
+
+
+def _start_api_process(command: Sequence[str], cwd: Path) -> ProcessHandle:
+    return subprocess.Popen(
+        list(command),
+        cwd=str(cwd),
+        env=_source_env(cwd),
+        start_new_session=True,
+    )
