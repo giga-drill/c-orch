@@ -312,6 +312,13 @@ class UiTests(unittest.TestCase):
                 "Verification gate failed; refusing apply and commit.",
                 summary="1 of 4 verification command(s) failed.",
             )
+            run_store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=False,
+                summary="Failed: git apply --check rejected the patch.",
+            )
             queue_store.update_task(
                 queue,
                 "task-001",
@@ -330,11 +337,11 @@ class UiTests(unittest.TestCase):
             )
             self.assertEqual(
                 payload["tasks"][0]["failure_summary"],
-                "1 of 4 verification command(s) failed.",
+                "Failed: git apply --check rejected the patch.",
             )
             self.assertEqual(
                 payload["tasks"][0]["last_error_event"]["type"],
-                "verification_gate_failed",
+                "apply_completed",
             )
 
     def test_build_queue_payload_derives_planner_review_retry_without_saving(self) -> None:

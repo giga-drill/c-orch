@@ -1634,12 +1634,19 @@ def _event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
         "attempt": event.get("attempt"),
         "decision": event.get("decision"),
         "error": event.get("error"),
+        "applied": event.get("applied"),
     }
 
 
 def _last_error_event(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     for event in reversed(events):
-        if "error" in event or str(event.get("type", "")).endswith("_failed"):
+        summary = event.get("summary")
+        if (
+            "error" in event
+            or str(event.get("type", "")).endswith("_failed")
+            or event.get("applied") is False
+            or (isinstance(summary, str) and summary.startswith("Failed:"))
+        ):
             return _event_summary(event)
     return None
 
