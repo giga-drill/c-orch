@@ -14,6 +14,7 @@ import {
 import type { AllowedProposalAction, AllowedQueueAction, AllowedRunAction, AllowedTaskAction } from "./api/types";
 import type { ActionResponse } from "./api/types";
 import type { DashboardStatePayload } from "./api/types";
+import type { RunPayload } from "./api/types";
 
 export const queryKeys = {
   queue: ["queue"] as const,
@@ -69,20 +70,31 @@ export function useDashboardStateQuery() {
     refetchInterval: (query) => {
       const payload = query.state.data as DashboardStatePayload | undefined;
       const activeProposals = payload?.proposals.summary?.active ?? 0;
+      const runningTasks = payload?.queue.summary?.running_tasks ?? 0;
       const runtimeBusy = Boolean(
-        payload?.runtime.dispatch_running || payload?.runtime.proposal_dispatch_running,
+        payload?.runtime.dispatch_running ||
+          payload?.runtime.queue_dispatch_running ||
+          payload?.runtime.proposal_dispatch_running,
       );
-      return activeProposals > 0 || runtimeBusy ? 2000 : false;
+      return activeProposals > 0 || runningTasks > 0 || runtimeBusy ? 2000 : false;
     },
     refetchIntervalInBackground: true,
   });
 }
+
+const terminalRunStatuses = new Set(["APPROVED", "FAILED"]);
 
 export function useRunQuery(runId: string | null) {
   return useQuery({
     queryKey: runId ? queryKeys.run(runId) : ["run", "none"],
     queryFn: () => fetchRun(runId as string),
     enabled: Boolean(runId),
+    refetchInterval: (query) => {
+      const payload = query.state.data as RunPayload | undefined;
+      const status = payload?.run.status;
+      return status && !terminalRunStatuses.has(status) ? 2000 : false;
+    },
+    refetchIntervalInBackground: true,
   });
 }
 

@@ -11,6 +11,10 @@ import type {
   RunsPayload,
 } from "./types";
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     cache: "no-store",
@@ -21,9 +25,22 @@ async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
     },
   });
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
+  let payload: unknown = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      const preview = text.trim().slice(0, 200);
+      if (!response.ok) {
+        throw new Error(`请求失败: ${response.status}${preview ? ` ${preview}` : ""}`);
+      }
+      throw new Error(`响应不是有效 JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (!response.ok) {
-    const message = typeof payload.error === "string" ? payload.error : `请求失败: ${response.status}`;
+    const message = isObject(payload) && typeof payload.error === "string"
+      ? payload.error
+      : `请求失败: ${response.status}`;
     throw new Error(message);
   }
   return payload as T;

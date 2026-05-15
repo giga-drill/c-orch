@@ -78,11 +78,70 @@ const QUEUE_PREVIEW_LIMIT = 5;
 
 type ProposalAction = "approve-plan" | "revise-plan";
 
-type PendingProposalAction = {
-  proposalId: string;
-  action: ProposalAction;
-  observedUpdatedAt?: string | null;
+type PendingEntityAction<Action extends string> = {
+  entityId: string;
+  action: Action;
+  observedRevision: string;
 };
+
+type PendingProposalAction = PendingEntityAction<ProposalAction>;
+type PendingTaskAction = PendingEntityAction<AllowedTaskAction>;
+type PendingRunAction = PendingEntityAction<AllowedRunAction>;
+
+type PendingQueueAction = {
+  action: "confirm-runtime-restarted";
+  observedRevision: string;
+};
+
+function actionRevision(actions: readonly string[]): string {
+  return actions.slice().sort().join(",");
+}
+
+function proposalRevision(proposal: ProposalRecord): string {
+  return [
+    proposal.updated_at,
+    proposal.status,
+    proposal.waiting_for,
+    actionRevision(proposal.allowed_actions),
+    proposal.run_id ?? "",
+    proposal.task_id ?? "",
+    proposal.error ?? "",
+    proposal.reason ?? "",
+  ].join("|");
+}
+
+function queueRevision(payload?: QueuePayload): string {
+  return [
+    payload?.queue?.updated_at ?? "",
+    payload?.queue?.status ?? "",
+    payload?.summary?.current_waiting_point ?? "",
+  ].join("|");
+}
+
+function taskRevision(task: TaskSummary): string {
+  return [
+    task.updated_at,
+    task.status,
+    task.waiting_for,
+    actionRevision(task.allowed_actions),
+    task.active_run_id ?? "",
+    task.error ?? "",
+    task.reason ?? "",
+  ].join("|");
+}
+
+function runRevision(run: RunListItem): string {
+  return [
+    run.updated_at,
+    run.status,
+    run.waiting_for,
+    actionRevision(run.allowed_actions),
+    run.last_event?.timestamp ?? "",
+    run.last_event?.type ?? "",
+    run.last_error_event?.timestamp ?? "",
+    run.last_error_event?.type ?? "",
+  ].join("|");
+}
 
 function pickTaskRun(task: TaskSummary): string | null {
   if (task.active_run_id) return task.active_run_id;
@@ -263,15 +322,31 @@ function SystemStatus({
 }) {
   const queueActionMutation = useQueueActionMutation();
   const [queueActionError, setQueueActionError] = useState<string | null>(null);
+  const [pendingQueueAction, setPendingQueueAction] = useState<PendingQueueAction | null>(null);
   const queue = queuePayload?.queue;
   const restartRequired = queue?.status === "RESTART_REQUIRED";
+  const currentQueueRevision = queueRevision(queuePayload);
+
+  useEffect(() => {
+    if (pendingQueueAction && currentQueueRevision !== pendingQueueAction.observedRevision) {
+      setPendingQueueAction(null);
+    }
+  }, [currentQueueRevision, pendingQueueAction]);
 
   async function confirmRuntimeRestarted() {
     setQueueActionError(null);
+    setPendingQueueAction({
+      action: "confirm-runtime-restarted",
+      observedRevision: currentQueueRevision,
+    });
     try {
       await queueActionMutation.mutateAsync({ action: "confirm-runtime-restarted" });
     } catch (error) {
       setQueueActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingQueueAction((current) =>
+        current?.action === "confirm-runtime-restarted" ? null : current,
+      );
     }
   }
 
@@ -303,9 +378,9 @@ function SystemStatus({
           <button
             type="button"
             onClick={confirmRuntimeRestarted}
-            disabled={queueActionMutation.isPending}
+            disabled={Boolean(pendingQueueAction)}
           >
-            {queueActionMutation.isPending ? "确认中..." : "确认已重启并继续"}
+            {pendingQueueAction ? "确认中..." : "确认已重启并继续"}
           </button>
           {queueActionError ? <div className="error">{queueActionError}</div> : null}
         </>
@@ -335,11 +410,11 @@ function ProposalPanel({
   useEffect(() => {
     if (!pendingProposalAction) return;
     const proposal = payload?.proposals.find(
-      (item) => item.proposal_id === pendingProposalAction.proposalId,
+      (item) => item.proposal_id === pendingProposalAction.entityId,
     );
-    if (!proposal || proposal.updated_at !== pendingProposalAction.observedUpdatedAt) {
+    if (!proposal || proposalRevision(proposal) !== pendingProposalAction.observedRevision) {
       if (pendingProposalAction.action === "revise-plan") {
-        setFeedbackById((current) => ({ ...current, [pendingProposalAction.proposalId]: "" }));
+        setFeedbackById((current) => ({ ...current, [pendingProposalAction.entityId]: "" }));
       }
       setPendingProposalAction(null);
     }
@@ -365,9 +440,9 @@ function ProposalPanel({
     setError(null);
     const feedback = feedbackById[proposal.proposal_id] ?? "";
     setPendingProposalAction({
-      proposalId: proposal.proposal_id,
+      entityId: proposal.proposal_id,
       action,
-      observedUpdatedAt: proposal.updated_at,
+      observedRevision: proposalRevision(proposal),
     });
     try {
       await actionMutation.mutateAsync({
@@ -383,7 +458,7 @@ function ProposalPanel({
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setPendingProposalAction((current) =>
-        current?.proposalId === proposal.proposal_id && current.action === action ? null : current,
+        current?.entityId === proposal.proposal_id && current.action === action ? null : current,
       );
     }
   }
@@ -430,7 +505,7 @@ function ProposalPanel({
         {proposalsNewestFirst.map((proposal) => (
           <article key={proposal.proposal_id} className="taskItem">
             {(() => {
-              const proposalActionPending = pendingProposalAction?.proposalId === proposal.proposal_id;
+              const proposalActionPending = pendingProposalAction?.entityId === proposal.proposal_id;
               const pendingAction = proposalActionPending ? pendingProposalAction?.action : null;
               return (
                 <>
@@ -553,6 +628,7 @@ function QueuePanel({
   const taskMutation = useTaskActionMutation();
   const [taskError, setTaskError] = useState<string | null>(null);
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const [pendingTaskAction, setPendingTaskAction] = useState<PendingTaskAction | null>(null);
   const summary = payload?.summary;
   const queueTasks = payload?.tasks ?? [];
   const sortedTasks = sortQueueTasks(queueTasks, selectedRunId);
@@ -567,8 +643,21 @@ function QueuePanel({
     }
   }, [hasHiddenTasks, showAllTasks]);
 
+  useEffect(() => {
+    if (!pendingTaskAction) return;
+    const task = queueTasks.find((item) => item.task_id === pendingTaskAction.entityId);
+    if (!task || taskRevision(task) !== pendingTaskAction.observedRevision) {
+      setPendingTaskAction(null);
+    }
+  }, [queueTasks, pendingTaskAction]);
+
   async function runTaskAction(task: TaskSummary, action: AllowedTaskAction) {
     setTaskError(null);
+    setPendingTaskAction({
+      entityId: task.task_id,
+      action,
+      observedRevision: taskRevision(task),
+    });
     try {
       const result = await taskMutation.mutateAsync({ taskId: task.task_id, action });
       const latest = result.state?.queue.tasks.find((item) => item.task_id === task.task_id);
@@ -576,6 +665,10 @@ function QueuePanel({
       if (runId) onSelectRun(runId);
     } catch (error) {
       setTaskError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingTaskAction((current) =>
+        current?.entityId === task.task_id && current.action === action ? null : current,
+      );
     }
   }
 
@@ -609,6 +702,8 @@ function QueuePanel({
         {visibleTasks.map((task) => {
           const taskRunId = pickTaskRun(task);
           const selected = Boolean(taskRunId && taskRunId === selectedRunId);
+          const taskActionPending = pendingTaskAction?.entityId === task.task_id;
+          const pendingAction = taskActionPending ? pendingTaskAction?.action : null;
           const failureReason =
             task.failure_summary ??
             task.last_error_event?.summary ??
@@ -647,18 +742,18 @@ function QueuePanel({
                     <button
                       type="button"
                       onClick={() => runTaskAction(task, "retry-verification")}
-                      disabled={taskMutation.isPending}
+                      disabled={taskActionPending}
                     >
-                      {taskMutation.isPending ? "重跑 CI 中..." : "重新跑 CI"}
+                      {pendingAction === "retry-verification" ? "重跑 CI 中..." : "重新跑 CI"}
                     </button>
                   ) : null}
                   {task.allowed_actions.includes("retry-task") ? (
                     <button
                       type="button"
                       onClick={() => runTaskAction(task, "retry-task")}
-                      disabled={taskMutation.isPending}
+                      disabled={taskActionPending}
                     >
-                      {taskMutation.isPending ? "重新排队中..." : "重新排队执行"}
+                      {pendingAction === "retry-task" ? "重新排队中..." : "重新排队执行"}
                     </button>
                   ) : null}
                 </div>
@@ -721,6 +816,18 @@ function RunDetail({
 }) {
   const actionMutation = useRunActionMutation();
   const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingRunAction, setPendingRunAction] = useState<PendingRunAction | null>(null);
+  const currentRun = payload?.run;
+
+  useEffect(() => {
+    if (!pendingRunAction || !currentRun) return;
+    if (
+      pendingRunAction.entityId !== currentRun.run_id ||
+      runRevision(currentRun) !== pendingRunAction.observedRevision
+    ) {
+      setPendingRunAction(null);
+    }
+  }, [currentRun, pendingRunAction]);
 
   if (isLoading) {
     return <div className="empty">正在加载 run 详情: {displayValue(selectedRunId)}</div>;
@@ -734,10 +841,19 @@ function RunDetail({
 
   async function runAction(action: AllowedRunAction, extra: Record<string, unknown> = {}) {
     setActionError(null);
+    setPendingRunAction({
+      entityId: run.run_id,
+      action,
+      observedRevision: runRevision(run),
+    });
     try {
       await actionMutation.mutateAsync({ runId: run.run_id, action, payload: extra });
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingRunAction((current) =>
+        current?.entityId === run.run_id && current.action === action ? null : current,
+      );
     }
   }
 
@@ -768,7 +884,7 @@ function RunDetail({
 
       <ActionBar
         actions={run.allowed_actions}
-        isPending={actionMutation.isPending}
+        pendingAction={pendingRunAction?.entityId === run.run_id ? pendingRunAction.action : null}
         onAction={runAction}
       />
       {actionError ? <div className="error">{actionError}</div> : null}
@@ -884,24 +1000,24 @@ function FailurePanel({
 
 function ActionBar({
   actions,
-  isPending,
+  pendingAction,
   onAction,
 }: {
   actions: AllowedRunAction[];
-  isPending: boolean;
+  pendingAction: AllowedRunAction | null;
   onAction: (action: AllowedRunAction, extra?: Record<string, unknown>) => void;
 }) {
   if (!actions.length) return null;
   return (
     <section className="actionBar">
       {actions.includes("retry-review") ? (
-        <button type="button" onClick={() => onAction("retry-review")} disabled={isPending}>
-          {isPending ? "处理中..." : "重新让 Planner 复核"}
+        <button type="button" onClick={() => onAction("retry-review")} disabled={Boolean(pendingAction)}>
+          {pendingAction === "retry-review" ? "处理中..." : "重新让 Planner 复核"}
         </button>
       ) : null}
       {actions.includes("retry-verification") ? (
-        <button type="button" onClick={() => onAction("retry-verification")} disabled={isPending}>
-          {isPending ? "重跑 CI 中..." : "重新跑 CI"}
+        <button type="button" onClick={() => onAction("retry-verification")} disabled={Boolean(pendingAction)}>
+          {pendingAction === "retry-verification" ? "重跑 CI 中..." : "重新跑 CI"}
         </button>
       ) : null}
     </section>
