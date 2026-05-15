@@ -226,6 +226,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional task queue file for dashboard queue view.",
     )
+    ui.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Serve only local /api/* endpoints; use Vite on 5173 for the UI.",
+    )
+
+    dev_ui = subparsers.add_parser(
+        "dev-ui",
+        help="Run the API runtime plus Vite dev server for local dashboard development.",
+    )
+    dev_ui.add_argument("--cwd", default=".", help="Target repository path.")
+    dev_ui.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    dev_ui.add_argument("--runs-dir", default=None, help="Run manifest directory.")
+    dev_ui.add_argument("--host", default=None, help="API host interface to bind.")
+    dev_ui.add_argument("--port", type=int, default=None, help="API port.")
+    dev_ui.add_argument("--queue-file", default=None, help="Optional task queue file for dashboard queue view.")
+    dev_ui.add_argument("--vite-host", default="127.0.0.1", help="Vite dev server host.")
+    dev_ui.add_argument("--vite-port", type=int, default=5173, help="Vite dev server port.")
+    dev_ui.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between backend source-change checks.",
+    )
 
     supervise_ui = subparsers.add_parser(
         "supervise-ui",
@@ -918,7 +942,8 @@ def run_ui(args: argparse.Namespace) -> int:
                 sandbox=execution_config["sandbox"],
                 approval_policy=execution_config["approval_policy"],
             )
-    print(f"c-orch UI: http://{host}:{port}", flush=True)
+    label = "c-orch API" if args.api_only else "c-orch UI"
+    print(f"{label}: http://{host}:{port}", flush=True)
     print(f"runs_dir: {runs_dir}", flush=True)
     if args.queue_file is not None:
         print(f"queue_file: {queue_path}", flush=True)
@@ -930,8 +955,56 @@ def run_ui(args: argparse.Namespace) -> int:
         scheduler_config=scheduler_config,
         host=host,
         port=port,
+        api_only=args.api_only,
     )
     return 0
+
+
+def run_dev_ui(args: argparse.Namespace) -> int:
+    from .config import load_project_config
+    from .dev_ui import DevUiConfig, DevUiRunner, build_api_command, build_vite_command
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+    runs_dir = _resolve_under_cwd(cwd, args.runs_dir or project_config.ui.runs_dir)
+    queue_path = _resolve_queue_path(cwd, args.queue_file)
+    api_host = args.host or project_config.ui.host
+    api_port = args.port or project_config.ui.port
+    api_client_host = "127.0.0.1" if api_host in {"0.0.0.0", "::"} else api_host
+    api_url = f"http://{api_client_host}:{api_port}"
+    vite_url = f"http://{args.vite_host}:{args.vite_port}"
+    api_command = build_api_command(
+        cwd=cwd,
+        config_path=args.config,
+        runs_dir=runs_dir,
+        queue_path=queue_path,
+        host=api_host,
+        port=api_port,
+        python_executable=sys.executable,
+    )
+    vite_command = build_vite_command(
+        cwd=cwd,
+        host=args.vite_host,
+        port=args.vite_port,
+    )
+    print(f"c-orch API: {api_url}", flush=True)
+    print(f"c-orch dev UI: {vite_url}", flush=True)
+    print("dev mode: use Vite for frontend HMR; API restarts when src/c_orch/*.py changes.", flush=True)
+    return DevUiRunner(
+        DevUiConfig(
+            cwd=cwd,
+            api_command=api_command,
+            vite_command=vite_command,
+            api_base_url=api_url,
+            api_target=api_url,
+            poll_interval_seconds=args.poll_interval,
+            watch_roots=(cwd / "src" / "c_orch",),
+        )
+    ).run_forever()
 
 
 def run_supervise_ui(args: argparse.Namespace) -> int:
@@ -1076,6 +1149,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_resume(args)
     if args.command == "ui":
         return run_ui(args)
+    if args.command == "dev-ui":
+        return run_dev_ui(args)
     if args.command == "supervise-ui":
         return run_supervise_ui(args)
     if args.command == "queue":

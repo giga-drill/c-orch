@@ -78,13 +78,27 @@ PYTHONPATH=src python3.11 -m c_orch.cli run \
   "Implement feature X"
 ```
 
-Open the local run dashboard:
+Open the local run dashboard from the checked-in frontend build:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli ui \
   --cwd /path/to/target-repo \
   --runs-dir runs
 ```
+
+For frontend development, use Vite as the browser entry point. This keeps HMR
+on `5173`, proxies `/api/*` to the local API runtime on `8765`, and restarts the
+API child when backend Python sources change:
+
+```bash
+PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs \
+  --queue-file .c-orch/tasks/queue.json
+```
+
+Then open `http://127.0.0.1:5173/`. The `8765` process is API-only in this mode;
+its root page only points back to the Vite dev UI.
 
 For self-modifying Cork runs, prefer the supervised dashboard. It starts the
 same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the

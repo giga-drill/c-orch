@@ -98,6 +98,7 @@ class CliTests(unittest.TestCase):
                 "0.0.0.0",
                 "--port",
                 "7777",
+                "--api-only",
             ]
         )
         self.assertEqual(args.command, "ui")
@@ -106,6 +107,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.queue_file, ".c-orch/tasks/queue.json")
         self.assertEqual(args.host, "0.0.0.0")
         self.assertEqual(args.port, 7777)
+        self.assertTrue(args.api_only)
+
+    def test_dev_ui_command_parses(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "dev-ui",
+                "--cwd",
+                "repo",
+                "--runs-dir",
+                "runs",
+                "--queue-file",
+                ".c-orch/tasks/queue.json",
+                "--port",
+                "8766",
+                "--vite-port",
+                "5174",
+            ]
+        )
+        self.assertEqual(args.command, "dev-ui")
+        self.assertEqual(args.cwd, "repo")
+        self.assertEqual(args.runs_dir, "runs")
+        self.assertEqual(args.queue_file, ".c-orch/tasks/queue.json")
+        self.assertEqual(args.port, 8766)
+        self.assertEqual(args.vite_port, 5174)
 
     def test_queue_import_command_parses(self) -> None:
         args = build_parser().parse_args(

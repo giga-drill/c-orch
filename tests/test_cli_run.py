@@ -636,8 +636,46 @@ approval_policy = "on-request"
                 scheduler_config=None,
                 host="127.0.0.1",
                 port=9999,
+                api_only=False,
             )
             self.assertIn("http://127.0.0.1:9999", stdout.getvalue())
+
+    def test_dev_ui_starts_api_only_runtime_and_vite_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+
+            with mock.patch("c_orch.dev_ui.DevUiRunner") as runner_cls, redirect_stdout(StringIO()) as stdout:
+                runner_cls.return_value.run_forever.return_value = 0
+                exit_code = main(
+                    [
+                        "dev-ui",
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        "runs",
+                        "--queue-file",
+                        ".c-orch/tasks/queue.json",
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        "8766",
+                        "--vite-port",
+                        "5174",
+                        "--poll-interval",
+                        "0.5",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            config = runner_cls.call_args.args[0]
+            self.assertEqual(config.cwd, cwd.resolve())
+            self.assertEqual(config.api_base_url, "http://127.0.0.1:8766")
+            self.assertEqual(config.api_target, "http://127.0.0.1:8766")
+            self.assertEqual(config.poll_interval_seconds, 0.5)
+            self.assertIn("--api-only", config.api_command)
+            self.assertIn("c-orch dev UI: http://127.0.0.1:5174", stdout.getvalue())
 
 
 class FakeDriver:

@@ -30,6 +30,21 @@ FALLBACK_INDEX_HTML = """<!doctype html>
 </body>
 </html>
 """
+API_ONLY_INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>c-orch API</title>
+</head>
+<body>
+  <main style="font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 48px auto; padding: 0 20px;">
+    <h1>c-orch API runtime</h1>
+    <p>这个进程只提供 <code>/api/*</code>。开发 UI 请访问 Vite dev server，例如 <code>http://127.0.0.1:5173/</code>。</p>
+  </main>
+</body>
+</html>
+"""
 
 
 def serve_dashboard(
@@ -40,6 +55,7 @@ def serve_dashboard(
     scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
+    api_only: bool = False,
 ) -> None:
     server = build_server(
         runs_dir=runs_dir,
@@ -48,6 +64,7 @@ def serve_dashboard(
         scheduler_config=scheduler_config,
         host=host,
         port=port,
+        api_only=api_only,
     )
     try:
         server.serve_forever()
@@ -68,6 +85,7 @@ def build_server(
     scheduler_config: Optional[SchedulerConfig] = None,
     host: str = DEFAULT_UI_HOST,
     port: int = DEFAULT_UI_PORT,
+    api_only: bool = False,
 ) -> ThreadingHTTPServer:
     runs_path = Path(runs_dir).expanduser().resolve()
     queue_file = Path(queue_path).expanduser().resolve() if queue_path is not None else None
@@ -82,7 +100,7 @@ def build_server(
         proposals_path=proposals_file,
         scheduler_config=scheduler_config,
     )
-    handler = make_dashboard_handler(runtime)
+    handler = make_dashboard_handler(runtime, api_only=api_only)
     server = ThreadingHTTPServer((host, port), handler)
     setattr(server, "c_orch_runtime", runtime)
     runtime.dispatch_queue_async()
@@ -90,7 +108,7 @@ def build_server(
     return server
 
 
-def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler]:
+def make_dashboard_handler(runtime: COrchRuntime, *, api_only: bool = False) -> Type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
@@ -113,6 +131,12 @@ def make_dashboard_handler(runtime: COrchRuntime) -> Type[BaseHTTPRequestHandler
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
                     return
                 self._send_json(HTTPStatus.OK, payload)
+                return
+            if api_only:
+                if path in {"/", "/index.html"}:
+                    self._send_text(HTTPStatus.OK, API_ONLY_INDEX_HTML, "text/html; charset=utf-8")
+                    return
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "api-only runtime"})
                 return
             if self._send_static(path):
                 return

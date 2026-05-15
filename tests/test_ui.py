@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest import mock
 
@@ -22,7 +23,7 @@ from c_orch.runtime import (
 from c_orch.run_store import PlanRecord, PlanRevisionRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.proposal_store import ProposalStore
 from c_orch.task_store import TaskStore
-from c_orch.ui import FALLBACK_INDEX_HTML, build_server
+from c_orch.ui import API_ONLY_INDEX_HTML, FALLBACK_INDEX_HTML, build_server
 
 
 class UiTests(unittest.TestCase):
@@ -971,6 +972,8 @@ class UiTests(unittest.TestCase):
     def test_fallback_html_explains_missing_frontend_build(self) -> None:
         self.assertIn("c-orch 前端还没有构建", FALLBACK_INDEX_HTML)
         self.assertIn("pnpm --dir web run build", FALLBACK_INDEX_HTML)
+        self.assertIn("/api/*", API_ONLY_INDEX_HTML)
+        self.assertIn("5173", API_ONLY_INDEX_HTML)
 
     def test_dashboard_server_serves_root_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -991,6 +994,45 @@ class UiTests(unittest.TestCase):
 
             self.assertIn("c-orch", body)
             self.assertIn("text/html", content_type)
+
+    def test_dashboard_api_only_root_points_to_vite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = build_server(runs_dir=root / "runs", host="127.0.0.1", port=0, api_only=True)
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=2) as response:
+                    body = response.read().decode("utf-8")
+                    content_type = response.headers["Content-Type"]
+            finally:
+                runtime = getattr(server, "c_orch_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertIn("c-orch API runtime", body)
+            self.assertIn("5173", body)
+            self.assertIn("text/html", content_type)
+
+    def test_dashboard_api_only_rejects_static_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = build_server(runs_dir=root / "runs", host="127.0.0.1", port=0, api_only=True)
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"http://127.0.0.1:{server.server_port}/assets/app.js", timeout=2)
+            finally:
+                runtime = getattr(server, "c_orch_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(error.exception.code, 404)
 
     def test_run_action_revise_plan_passes_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
