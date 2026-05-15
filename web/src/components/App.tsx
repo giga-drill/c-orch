@@ -76,6 +76,14 @@ function newestFirst<T>(items?: T[] | null): T[] {
 
 const QUEUE_PREVIEW_LIMIT = 5;
 
+type ProposalAction = "approve-plan" | "revise-plan";
+
+type PendingProposalAction = {
+  proposalId: string;
+  action: ProposalAction;
+  observedUpdatedAt?: string | null;
+};
+
 function pickTaskRun(task: TaskSummary): string | null {
   if (task.active_run_id) return task.active_run_id;
   return task.run_ids.length ? task.run_ids[task.run_ids.length - 1] : null;
@@ -319,9 +327,23 @@ function ProposalPanel({
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
   const [feedbackById, setFeedbackById] = useState<Record<string, string>>({});
+  const [pendingProposalAction, setPendingProposalAction] = useState<PendingProposalAction | null>(null);
   const [error, setError] = useState<string | null>(null);
   const proposalsNewestFirst = newestFirst(payload?.proposals ?? []);
   const summary = payload?.summary;
+
+  useEffect(() => {
+    if (!pendingProposalAction) return;
+    const proposal = payload?.proposals.find(
+      (item) => item.proposal_id === pendingProposalAction.proposalId,
+    );
+    if (!proposal || proposal.updated_at !== pendingProposalAction.observedUpdatedAt) {
+      if (pendingProposalAction.action === "revise-plan") {
+        setFeedbackById((current) => ({ ...current, [pendingProposalAction.proposalId]: "" }));
+      }
+      setPendingProposalAction(null);
+    }
+  }, [payload?.proposals, pendingProposalAction]);
 
   async function createProposal() {
     setError(null);
@@ -339,9 +361,14 @@ function ProposalPanel({
     }
   }
 
-  async function proposalAction(proposal: ProposalRecord, action: "approve-plan" | "revise-plan") {
+  async function proposalAction(proposal: ProposalRecord, action: ProposalAction) {
     setError(null);
     const feedback = feedbackById[proposal.proposal_id] ?? "";
+    setPendingProposalAction({
+      proposalId: proposal.proposal_id,
+      action,
+      observedUpdatedAt: proposal.updated_at,
+    });
     try {
       await actionMutation.mutateAsync({
         proposalId: proposal.proposal_id,
@@ -354,6 +381,10 @@ function ProposalPanel({
       if (proposal.run_id) onSelectRun(proposal.run_id);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPendingProposalAction((current) =>
+        current?.proposalId === proposal.proposal_id && current.action === action ? null : current,
+      );
     }
   }
 
@@ -398,6 +429,11 @@ function ProposalPanel({
       <div className="taskList">
         {proposalsNewestFirst.map((proposal) => (
           <article key={proposal.proposal_id} className="taskItem">
+            {(() => {
+              const proposalActionPending = pendingProposalAction?.proposalId === proposal.proposal_id;
+              const pendingAction = proposalActionPending ? pendingProposalAction?.action : null;
+              return (
+                <>
             <button
               type="button"
               className="taskButton"
@@ -425,9 +461,9 @@ function ProposalPanel({
                 <button
                   type="button"
                   onClick={() => proposalAction(proposal, "approve-plan")}
-                  disabled={actionMutation.isPending}
+                  disabled={proposalActionPending}
                 >
-                  {actionMutation.isPending ? "处理中..." : "通过并加入执行队列"}
+                  {pendingAction === "approve-plan" ? "处理中..." : "通过并加入执行队列"}
                 </button>
                 <textarea
                   value={feedbackById[proposal.proposal_id] ?? ""}
@@ -442,12 +478,15 @@ function ProposalPanel({
                 <button
                   type="button"
                   onClick={() => proposalAction(proposal, "revise-plan")}
-                  disabled={actionMutation.isPending || !(feedbackById[proposal.proposal_id] ?? "").trim()}
+                  disabled={proposalActionPending || !(feedbackById[proposal.proposal_id] ?? "").trim()}
                 >
-                  让 Planner 修改方案
+                  {pendingAction === "revise-plan" ? "处理中..." : "让 Planner 修改方案"}
                 </button>
               </div>
             ) : null}
+                </>
+              );
+            })()}
           </article>
         ))}
         {payload && payload.proposals.length === 0 ? <div className="empty">暂无待审核计划。</div> : null}
