@@ -65,7 +65,7 @@ class VerificationTests(unittest.TestCase):
             pnpm = bin_dir / "pnpm"
             pnpm.write_text(
                 "#!/bin/sh\n"
-                "printf '%s\\n' \"$*\" > pnpm-called.txt\n"
+                "printf '%s|%s\\n' \"$CI\" \"$*\" > pnpm-called.txt\n"
                 "exit 0\n",
                 encoding="utf-8",
             )
@@ -80,9 +80,9 @@ class VerificationTests(unittest.TestCase):
 
             self.assertEqual(report.summary, "All 1 verification command(s) passed.")
             self.assertEqual(report.results[0].command, "cd web && npm run typecheck")
-            self.assertEqual((root / "pnpm-called.txt").read_text(encoding="utf-8").strip(), "--dir web install --frozen-lockfile")
+            self.assertEqual((root / "pnpm-called.txt").read_text(encoding="utf-8").strip(), "true|--dir web install --frozen-lockfile")
             output = report.output_path.read_text(encoding="utf-8")
-            self.assertIn("$ pnpm --dir web install --frozen-lockfile", output)
+            self.assertIn("$ CI=true pnpm --dir web install --frozen-lockfile", output)
             self.assertIn("$ cd web && npm run typecheck", output)
             self.assertIn("typeok", output)
 
@@ -115,11 +115,39 @@ class VerificationTests(unittest.TestCase):
                 )
 
             self.assertEqual(report.summary, "Frontend dependency setup failed.")
-            self.assertEqual(report.results[0].command, "pnpm --dir web install --frozen-lockfile")
+            self.assertEqual(report.results[0].command, "CI=true pnpm --dir web install --frozen-lockfile")
             self.assertEqual(report.results[0].returncode, 42)
             output = report.output_path.read_text(encoding="utf-8")
             self.assertIn("setup failed", output)
             self.assertNotIn("should-not-run", output)
+
+    def test_pnpm_install_verification_command_runs_with_ci(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            web = root / "web"
+            web.mkdir()
+            (web / "package.json").write_text("{}\n", encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            pnpm = bin_dir / "pnpm"
+            pnpm.write_text(
+                "#!/bin/sh\n"
+                "printf '%s|%s\\n' \"$CI\" \"$*\" > pnpm-install-called.txt\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            pnpm.chmod(0o755)
+
+            with patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+                report = run_verification_commands(
+                    ["pnpm --dir web install --frozen-lockfile"],
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                )
+
+            self.assertEqual(report.summary, "All 1 verification command(s) passed.")
+            self.assertEqual(report.results[0].command, "CI=true pnpm --dir web install --frozen-lockfile")
+            self.assertEqual((root / "pnpm-install-called.txt").read_text(encoding="utf-8").strip(), "true|--dir web install --frozen-lockfile")
 
 
 if __name__ == "__main__":

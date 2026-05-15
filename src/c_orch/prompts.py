@@ -11,9 +11,11 @@ docs/mcp-orchestrator-design.md, and docs/architecture-principles.md first.
 Keep architecture, state semantics, failure handling, and agent
 responsibilities aligned with those docs.
 
-Choose verification commands from the target workspace's lockfiles. If a web
-frontend has pnpm-lock.yaml, use pnpm commands such as
-`pnpm --dir web run typecheck` and `pnpm --dir web run build` instead of npm."""
+Choose verification commands from the target workspace's lockfiles. c-orch owns
+dependency setup before verification. If a web frontend has pnpm-lock.yaml, use
+pnpm commands such as `pnpm --dir web run typecheck` and
+`pnpm --dir web run build` instead of npm; do not include a separate pnpm
+install command unless the task explicitly requires testing dependency setup."""
 
 
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:

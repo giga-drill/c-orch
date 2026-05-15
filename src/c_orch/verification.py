@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Union
 
 
 Pathish = Union[str, Path]
+PNPM_FRONTEND_INSTALL_COMMAND = "CI=true pnpm --dir web install --frozen-lockfile"
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,11 @@ def run_verification_commands(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "verification-output.txt"
 
-    command_list = [command.strip() for command in commands if command.strip()]
+    command_list = [
+        _normalize_verification_command(command.strip())
+        for command in commands
+        if command.strip()
+    ]
     results: List[CommandVerification] = []
     log_sections: List[str] = []
 
@@ -109,7 +114,7 @@ def _run_frontend_dependency_setup(
     if not _needs_frontend_dependency_setup(worktree=worktree, commands=commands):
         return None
     return _run_one_command(
-        "pnpm --dir web install --frozen-lockfile",
+        PNPM_FRONTEND_INSTALL_COMMAND,
         cwd=worktree,
         timeout_seconds=timeout_seconds,
     )
@@ -135,6 +140,27 @@ def _looks_like_web_package_command(command: str) -> bool:
         "pnpm -C web run ",
     )
     return any(marker in normalized for marker in markers)
+
+
+def _normalize_verification_command(command: str) -> str:
+    if _looks_like_pnpm_frontend_install(command) and not _has_ci_assignment(command):
+        return f"CI=true {command}"
+    return command
+
+
+def _looks_like_pnpm_frontend_install(command: str) -> bool:
+    normalized = " ".join(command.split())
+    markers = (
+        "pnpm --dir web install",
+        "pnpm --dir=web install",
+        "pnpm -C web install",
+    )
+    return any(normalized.startswith(marker) for marker in markers)
+
+
+def _has_ci_assignment(command: str) -> bool:
+    normalized = " ".join(command.split())
+    return normalized.startswith("CI=") or " CI=" in normalized
 
 
 def _run_one_command(
