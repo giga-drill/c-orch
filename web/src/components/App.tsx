@@ -15,6 +15,8 @@ import type {
   RunEvent,
   RunListItem,
   RunPayload,
+  RunTimingPhaseSummary,
+  RunTimingSegment,
   TaskSummary,
   WorkerActivity,
 } from "../api/types";
@@ -48,6 +50,20 @@ const statusText: Record<string, string> = {
   WORK_DONE: "Worker 已完成",
   REVIEWING: "Planner 复核中",
   REVISION_REQUESTED: "Worker 返工中",
+  active: "进行中",
+  completed: "已完成",
+  missing: "未发生",
+  partial: "数据不完整",
+};
+
+const phaseText: Record<string, string> = {
+  planning: "生成方案",
+  human_plan_review_wait: "等待审核方案",
+  plan_revision: "修改方案",
+  worker_execution: "Worker 执行",
+  work_done_wait: "等待复核",
+  planner_review: "Planner 复核",
+  revision_wait: "等待返工",
 };
 
 function formatStatus(value?: string | null): string {
@@ -71,6 +87,40 @@ function formatDurationSeconds(value: unknown): string {
   if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
+}
+
+function numericDurationSeconds(value: unknown): number {
+  const duration = Number(value);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0%";
+  if (value < 1) return "<1%";
+  return `${Math.round(value)}%`;
+}
+
+function phaseDisplayLabel(phase: RunTimingPhaseSummary | RunTimingSegment): string {
+  return phaseText[phase.phase] ?? displayValue(phase.label || phase.phase);
+}
+
+function phaseDurationShare(phase: RunTimingPhaseSummary, totalSeconds: number): string {
+  if (totalSeconds <= 0 || phase.status === "missing") return "0%";
+  const duration = numericDurationSeconds(phase.total_duration_seconds ?? phase.duration_seconds);
+  return formatPercent((duration / totalSeconds) * 100);
+}
+
+function timingSourceLabel(source?: string | null): string {
+  if (source === "legacy_fallback") return "由事件推断";
+  if (source === "manifest") return "Manifest 记录";
+  return displayValue(source);
+}
+
+function segmentsByPhase(segments: RunTimingSegment[]): Record<string, RunTimingSegment[]> {
+  return segments.reduce<Record<string, RunTimingSegment[]>>((groups, segment) => {
+    groups[segment.phase] = [...(groups[segment.phase] ?? []), segment];
+    return groups;
+  }, {});
 }
 
 function newestFirst<T>(items?: T[] | null): T[] {
@@ -1185,25 +1235,101 @@ function Timeline({ events }: { events: RunEvent[] }) {
 function PhaseTimingPanel({ run }: { run: RunListItem }) {
   const timing = run.timing;
   const phases = timing?.phases ?? [];
-  if (!timing) return <p className="meta">暂无阶段耗时。</p>;
+  if (!timing || !phases.length) return <p className="meta">暂无阶段耗时数据。</p>;
+  const totalSeconds = numericDurationSeconds(timing.total?.duration_seconds);
+  const groupedSegments = segmentsByPhase(timing.segments ?? []);
+  const activePhase = phases.find((phase) => phase.status === "active");
+  const isInferred = timing.source === "legacy_fallback";
+
   return (
     <div className="timingPanel">
-      <div className="timingTotals">
-        <span>来源: {displayValue(timing.source)}</span>
-        <span>总耗时: {formatDurationSeconds(timing.total?.duration_seconds)}</span>
-        <span>状态: {displayValue(timing.total?.status)}</span>
+      <div className={isInferred ? "timingSummary inferred" : "timingSummary"}>
+        <div>
+          <span className="label">总耗时</span>
+          <strong>{formatDurationSeconds(timing.total?.duration_seconds)}</strong>
+        </div>
+        <div>
+          <span className="label">当前阶段</span>
+          <strong>{activePhase ? phaseDisplayLabel(activePhase) : "-"}</strong>
+        </div>
+        <div>
+          <span className="label">状态</span>
+          <strong>{formatStatus(timing.total?.status)}</strong>
+        </div>
+        <div>
+          <span className="label">来源</span>
+          <strong>{timingSourceLabel(timing.source)}</strong>
+        </div>
       </div>
-      <ul className="timingList">
+
+      <div className="timingTable" role="table" aria-label="阶段耗时诊断表">
+        <div className="timingHeader" role="row">
+          <span>阶段</span>
+          <span>状态</span>
+          <span>耗时</span>
+          <span>占比</span>
+          <span>次数</span>
+          <span>开始时间</span>
+          <span>结束时间</span>
+        </div>
         {phases.map((phase) => (
-          <li key={phase.phase} className="timingRow">
-            <span>{phase.label}</span>
-            <span>count {phase.count}</span>
-            <span>{formatDurationSeconds(phase.total_duration_seconds)}</span>
-            <StatusBadge status={phase.status} />
-          </li>
+          <PhaseTimingRow
+            key={phase.phase}
+            phase={phase}
+            segments={groupedSegments[phase.phase] ?? []}
+            totalSeconds={totalSeconds}
+          />
         ))}
-      </ul>
+      </div>
     </div>
+  );
+}
+
+function PhaseTimingRow({
+  phase,
+  segments,
+  totalSeconds,
+}: {
+  phase: RunTimingPhaseSummary;
+  segments: RunTimingSegment[];
+  totalSeconds: number;
+}) {
+  const defaultOpen = phase.status === "active" || phase.count > 1;
+  const rowClassName = `timingPhaseRow ${phase.status}`;
+  const duration = formatDurationSeconds(phase.total_duration_seconds);
+  return (
+    <details className={rowClassName} open={defaultOpen}>
+      <summary className="timingPhaseSummary">
+        <span className="timingPhaseName">{phaseDisplayLabel(phase)}</span>
+        <span>
+          <StatusBadge status={phase.status} />
+        </span>
+        <span>{duration}</span>
+        <span>{phaseDurationShare(phase, totalSeconds)}</span>
+        <span>{phase.count}</span>
+        <span className="mono">{displayValue(phase.started_at)}</span>
+        <span className="mono">{displayValue(phase.completed_at)}</span>
+      </summary>
+      <div className="timingSegments">
+        {segments.length ? (
+          segments.map((segment) => (
+            <div className="timingSegmentRow" key={segment.id || `${segment.phase}-${segment.sequence}`}>
+              <span className="mono">#{displayValue(segment.sequence || segment.id)}</span>
+              <span>{phaseDisplayLabel(segment)}</span>
+              <span className="mono">
+                {displayValue(segment.start_status)} → {displayValue(segment.end_status)}
+              </span>
+              <span className="mono">{displayValue(segment.started_at)}</span>
+              <span className="mono">{displayValue(segment.completed_at)}</span>
+              <span>{formatDurationSeconds(segment.duration_seconds)}</span>
+              <StatusBadge status={segment.status} />
+            </div>
+          ))
+        ) : (
+          <p className="meta">暂无 segment 明细。</p>
+        )}
+      </div>
+    </details>
   );
 }
 

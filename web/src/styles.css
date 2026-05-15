@@ -397,34 +397,113 @@ input {
 
 .timingPanel {
   display: grid;
+  gap: 10px;
+}
+
+.timingSummary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
-.timingTotals {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12px;
+.timingSummary > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid #e4eae0;
+  border-radius: 8px;
+  background: #fcfdfa;
+  padding: 8px 10px;
 }
 
-.timingList {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+.timingSummary.inferred > div {
+  border-color: #e1d6a8;
+  background: #fffbea;
+}
+
+.timingTable {
   display: grid;
   gap: 6px;
 }
 
-.timingRow {
+.timingHeader,
+.timingPhaseSummary {
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) auto auto auto;
+  grid-template-columns:
+    minmax(120px, 1.35fr)
+    minmax(90px, 0.8fr)
+    minmax(74px, 0.7fr)
+    minmax(54px, 0.5fr)
+    minmax(48px, 0.45fr)
+    minmax(140px, 1.1fr)
+    minmax(140px, 1.1fr);
   gap: 8px;
   align-items: center;
+}
+
+.timingHeader {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.timingPhaseRow {
   border: 1px solid #e4eae0;
   border-radius: 8px;
   background: #fcfdfa;
-  padding: 7px 9px;
+  overflow: hidden;
+}
+
+.timingPhaseRow.active {
+  border-color: #80a878;
+  background: #f3faef;
+}
+
+.timingPhaseRow.missing {
+  opacity: 0.62;
+}
+
+.timingPhaseRow.partial {
+  border-color: #e1d6a8;
+  background: #fffbea;
+}
+
+.timingPhaseSummary {
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.timingPhaseSummary::-webkit-details-marker {
+  display: none;
+}
+
+.timingPhaseName {
+  font-weight: 700;
+}
+
+.timingSegments {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid #e4eae0;
+  background: rgba(255, 255, 255, 0.58);
+  padding: 8px 10px;
+}
+
+.timingSegmentRow {
+  display: grid;
+  grid-template-columns:
+    minmax(48px, 0.4fr)
+    minmax(110px, 1fr)
+    minmax(150px, 1fr)
+    minmax(140px, 1fr)
+    minmax(140px, 1fr)
+    minmax(70px, 0.5fr)
+    minmax(90px, 0.7fr);
+  gap: 8px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .proposalForm {
@@ -531,5 +610,25 @@ details > div {
   .stateStrip,
   .systemStatus {
     grid-template-columns: 1fr;
+  }
+
+  .timingSummary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .timingHeader {
+    display: none;
+  }
+
+  .timingPhaseSummary,
+  .timingSegmentRow {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .timingPhaseSummary > span,
+  .timingSegmentRow > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }
