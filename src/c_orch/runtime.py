@@ -6,7 +6,8 @@ from http import HTTPStatus
 import os
 from pathlib import Path
 import threading
-from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple, Union
+import time
+from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import dashboard_payloads
 from .drivers import CodexDriver
@@ -22,6 +23,7 @@ from .proposal_store import (
     PROPOSAL_PLAN_REVISING,
     PROPOSAL_PLANNING,
     PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_WORKSPACE,
     ProposalRecord,
     ProposalStore,
 )
@@ -36,15 +38,26 @@ from .task_lifecycle import (
     mark_task_handled_skipped,
     mark_task_for_retry,
     reconcile_queue,
+    reconcile_task_with_active_run,
 )
-from .task_store import TASK_FAILED, TASK_PENDING, TaskRecord, TaskQueue, TaskStore
+from .task_store import (
+    TASK_APPROVED,
+    TASK_BLOCKED,
+    TASK_FAILED,
+    TASK_PENDING,
+    TASK_RUNNING,
+    TASK_SKIPPED,
+    TaskRecord,
+    TaskQueue,
+    TaskStore,
+)
 from .worktrees import create_worker_worktree
+from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 Pathish = Union[str, Path]
 RunActionResponse = Optional[Tuple[HTTPStatus, Dict[str, Any]]]
 DriverFactory = Callable[[str], ContextManager[CodexDriver]]
-PROPOSAL_PLANNING_CONCURRENCY = 1
 
 
 class _UnusedCodexDriver:
@@ -85,9 +98,13 @@ class COrchRuntime:
         self._worktree_factory = worktree_factory
         self._orchestrator_factory = orchestrator_factory
         self._action_lock = threading.RLock()
+        self._queue_lock = threading.RLock()
+        self._proposal_lock = threading.RLock()
         self._driver_lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
         self._proposal_dispatch_lock = threading.RLock()
+        self._queue_lane_threads: Dict[str, threading.Thread] = {}
+        self._queue_lane_threads_lock = threading.RLock()
         self._drivers: Dict[str, Any] = {}
         self._dispatch_thread: Optional[threading.Thread] = None
         self._proposal_dispatch_thread: Optional[threading.Thread] = None
@@ -113,6 +130,7 @@ class COrchRuntime:
 
     def build_state_payload(self, selected_run_id: Optional[str] = None) -> Dict[str, Any]:
         queue_dispatch_running = self._dispatch_thread is not None and self._dispatch_thread.is_alive()
+        queue_dispatch_running = queue_dispatch_running or self._active_queue_lane_count() > 0
         proposal_dispatch_running = (
             self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive()
         )
@@ -128,6 +146,13 @@ class COrchRuntime:
             last_proposal_dispatch_error=self._last_proposal_dispatch_error,
             selected_run_id=selected_run_id,
         )
+
+    def _active_queue_lane_count(self) -> int:
+        with self._queue_lane_threads_lock:
+            self._queue_lane_threads = {
+                lane: thread for lane, thread in self._queue_lane_threads.items() if thread.is_alive()
+            }
+            return len(self._queue_lane_threads)
 
     def run_action(
         self,
@@ -149,7 +174,7 @@ class COrchRuntime:
             return self._attach_state(result, selected_run_id=run_id)
 
     def task_action(self, task_id: str, action: Any) -> RunActionResponse:
-        with self._action_lock:
+        with self._action_lock, self._queue_lock:
             if self.queue_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
             result = task_action(
@@ -163,7 +188,7 @@ class COrchRuntime:
             return self._attach_state(result)
 
     def queue_action(self, action: Any, *, confirmed_by: str = "dashboard") -> RunActionResponse:
-        with self._action_lock:
+        with self._action_lock, self._queue_lock:
             if self.queue_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
             result = queue_action(
@@ -177,7 +202,7 @@ class COrchRuntime:
             return self._attach_state(result)
 
     def create_proposal(self, title: Any, prompt: Any, cwd: Any = None) -> RunActionResponse:
-        with self._action_lock:
+        with self._action_lock, self._proposal_lock, self._queue_lock:
             if self.proposals_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
             if self._scheduler_config is None:
@@ -188,6 +213,7 @@ class COrchRuntime:
                 prompt,
                 cwd,
                 runs_dir=self.runs_dir,
+                queue_path=self.queue_path,
                 config=self._scheduler_config,
                 worktree_factory=self._worktree_factory,
             )
@@ -201,7 +227,7 @@ class COrchRuntime:
         action: Any,
         feedback: Any = None,
     ) -> RunActionResponse:
-        with self._action_lock:
+        with self._action_lock, self._proposal_lock, self._queue_lock:
             if self.proposals_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
             if self.queue_path is None:
@@ -239,12 +265,38 @@ class COrchRuntime:
 
     def wait_for_dispatch(self, timeout: Optional[float] = None) -> bool:
         """Wait for the current background scheduler pass; mainly used by tests."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
         with self._dispatch_lock:
             thread = self._dispatch_thread
-        if thread is None:
-            return True
-        thread.join(timeout=timeout)
-        return not thread.is_alive()
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
+        while True:
+            with self._dispatch_lock:
+                dispatch_thread = self._dispatch_thread
+            if dispatch_thread is not None and dispatch_thread.is_alive():
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                dispatch_thread.join(timeout=remaining)
+                if deadline is not None and time.monotonic() >= deadline and dispatch_thread.is_alive():
+                    return False
+                continue
+            with self._queue_lane_threads_lock:
+                threads = [thread for thread in self._queue_lane_threads.values() if thread.is_alive()]
+            if not threads:
+                time.sleep(0.05)
+                with self._dispatch_lock:
+                    dispatch_thread = self._dispatch_thread
+                with self._queue_lane_threads_lock:
+                    threads = [thread for thread in self._queue_lane_threads.values() if thread.is_alive()]
+                if (dispatch_thread is None or not dispatch_thread.is_alive()) and not threads:
+                    return True
+                continue
+            for lane_thread in threads:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                lane_thread.join(timeout=remaining)
+                if deadline is not None and time.monotonic() >= deadline and lane_thread.is_alive():
+                    return False
 
     def dispatch_proposals_async(self) -> bool:
         """Start one background proposal planning dispatcher pass."""
@@ -311,8 +363,7 @@ class COrchRuntime:
 
     def _dispatch_queue_worker(self) -> None:
         try:
-            with self._action_lock:
-                self._run_queue_once()
+            self._start_available_queue_lanes()
         except Exception as exc:
             self._last_dispatch_error = str(exc)
 
@@ -337,15 +388,333 @@ class COrchRuntime:
             )
             scheduler.run()
 
+    def _start_available_queue_lanes(self) -> None:
+        if self.queue_path is None or self._scheduler_config is None:
+            return
+        max_parallel = max(1, self._scheduler_config.max_parallel_workspaces)
+        active_count = self._active_queue_lane_count()
+        if active_count >= max_parallel:
+            return
+        with self._queue_lock:
+            task_store = TaskStore(self.queue_path)
+            run_store = RunStore(self.runs_dir)
+            try:
+                queue = task_store.load()
+            except (OSError, ValueError):
+                return
+            reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+            candidates = self._queue_lane_candidates(queue, run_store=run_store)
+            started = 0
+            for lane_id, task in candidates:
+                if active_count + started >= max_parallel:
+                    break
+                with self._queue_lane_threads_lock:
+                    existing = self._queue_lane_threads.get(lane_id)
+                    if existing is not None and existing.is_alive():
+                        continue
+                    self._queue_lane_threads.pop(lane_id, None)
+                    thread = threading.Thread(
+                        target=self._run_queue_lane_worker,
+                        name=f"c-orch-queue-lane-{task.task_id}",
+                        kwargs={"lane_id": lane_id, "task_id": task.task_id},
+                        daemon=True,
+                    )
+                    self._queue_lane_threads[lane_id] = thread
+                if task.status == TASK_PENDING:
+                    task_store.update_task(queue, task.task_id, status=TASK_RUNNING, error=None, reason="worker")
+                started += 1
+                task_store.save(queue)
+                thread.start()
+            if not started:
+                task_store.save(queue)
+
+    def _queue_lane_candidates(self, queue: TaskQueue, *, run_store: RunStore) -> List[Tuple[str, TaskRecord]]:
+        blocked_lanes: set[str] = set()
+        candidates: List[Tuple[str, TaskRecord]] = []
+        seen_lanes: set[str] = set()
+        for task in queue.tasks:
+            lane_id = self._task_workspace_id(task, run_store=run_store)
+            if lane_id in seen_lanes:
+                continue
+            if task.status in {TASK_APPROVED, TASK_SKIPPED}:
+                continue
+            seen_lanes.add(lane_id)
+            if lane_id in blocked_lanes:
+                continue
+            if task.status in {TASK_FAILED, TASK_BLOCKED}:
+                blocked_lanes.add(lane_id)
+                continue
+            active = self._load_task_active_run(task, run_store=run_store)
+            if active is not None:
+                if active.status == RUN_PLAN_APPROVED or has_retryable_review_failure(active):
+                    candidates.append((lane_id, task))
+                continue
+            if task.status in {TASK_PENDING, TASK_RUNNING}:
+                candidates.append((lane_id, task))
+        return candidates
+
+    def _task_workspace_id(self, task: TaskRecord, *, run_store: RunStore) -> str:
+        task_cwd = task.cwd
+        if not task_cwd and task.active_run_id:
+            try:
+                task_cwd = run_store.load(task.active_run_id).cwd
+            except OSError:
+                task_cwd = None
+        if not task_cwd and self._scheduler_config is not None:
+            task_cwd = str(self._scheduler_config.cwd)
+        if task_cwd:
+            try:
+                return str(canonical_git_root(task_cwd))
+            except WorkspaceResolutionError:
+                return str(Path(task_cwd).expanduser().resolve())
+        return "__default__"
+
+    def _load_task_active_run(self, task: TaskRecord, *, run_store: RunStore) -> Optional[RunManifest]:
+        if not task.active_run_id:
+            return None
+        try:
+            return run_store.load(task.active_run_id)
+        except OSError:
+            return None
+
+    def _run_queue_lane_worker(self, *, lane_id: str, task_id: str) -> None:
+        try:
+            self._execute_queue_lane_task(task_id=task_id)
+        except Exception as exc:
+            self._last_dispatch_error = str(exc)
+        finally:
+            with self._queue_lane_threads_lock:
+                self._queue_lane_threads.pop(lane_id, None)
+            self.dispatch_queue_async()
+            self.dispatch_proposals_async()
+
+    @contextmanager
+    def _fresh_driver_context(self, codex_path: str):
+        if self._external_driver_factory is not None:
+            with self._external_driver_factory(codex_path) as driver:
+                yield driver
+            return
+        from .mcp_driver import McpCodexDriver
+
+        with McpCodexDriver(codex_bin=codex_path) as driver:
+            yield driver
+
+    def _execute_queue_lane_task(self, *, task_id: str) -> None:
+        if self.queue_path is None or self._scheduler_config is None:
+            return
+        task_store = TaskStore(self.queue_path)
+        run_store = RunStore(self.runs_dir)
+        manifest: Optional[RunManifest] = None
+        action = "run"
+        with self._queue_lock:
+            queue = task_store.load()
+            task = _find_task_record(queue, task_id)
+            if task.active_run_id:
+                manifest = run_store.load(task.active_run_id)
+                if has_retryable_review_failure(manifest):
+                    action = "retry_review"
+                elif manifest.status == RUN_PLAN_APPROVED:
+                    action = "run"
+                else:
+                    reconcile_task_with_active_run(
+                        task,
+                        active_run=manifest,
+                        completed_at=run_store.now_iso(),
+                    )
+                    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                    task_store.save(queue)
+                    return
+                task_store.update_task(queue, task.task_id, status=TASK_RUNNING, error=None, reason="worker")
+                task_store.save(queue)
+            else:
+                try:
+                    task_cwd = self._scheduler_config.resolve_task_cwd(task.cwd)
+                    worktrees_dir = self._scheduler_config.resolve_worktrees_dir(task_cwd)
+                    manifest = run_store.create_run(
+                        cwd=task_cwd,
+                        user_task=task.prompt,
+                        planner_model=self._scheduler_config.planner_model,
+                        worker_model=self._scheduler_config.worker_model,
+                        codex_binary_path=self._scheduler_config.codex_binary_path,
+                        planner_reasoning_effort=self._scheduler_config.planner_reasoning_effort,
+                        worker_reasoning_effort=self._scheduler_config.worker_reasoning_effort,
+                        planner_service_tier=self._scheduler_config.planner_service_tier,
+                        worker_service_tier=self._scheduler_config.worker_service_tier,
+                    )
+                    worker = manifest.workers[0]
+                    worker.worktree_path = str(
+                        self._worktree_factory(
+                            repo_path=task_cwd,
+                            worktrees_dir=worktrees_dir,
+                            run_id=manifest.run_id,
+                            worker_id=worker.id,
+                        )
+                        if self._worktree_factory is not None
+                        else create_worker_worktree(
+                            repo_path=task_cwd,
+                            worktrees_dir=worktrees_dir,
+                            run_id=manifest.run_id,
+                            worker_id=worker.id,
+                        )
+                    )
+                    run_store.save(manifest)
+                    run_ids = list(task.run_ids)
+                    run_ids.append(manifest.run_id)
+                    task_store.update_task(
+                        queue,
+                        task.task_id,
+                        cwd=str(task_cwd),
+                        active_run_id=manifest.run_id,
+                        run_ids=run_ids,
+                        status=TASK_RUNNING,
+                        error=None,
+                        reason=None,
+                    )
+                    task_store.save(queue)
+                except Exception as exc:
+                    task_store.update_task(
+                        queue,
+                        task.task_id,
+                        status=TASK_FAILED,
+                        error=str(exc),
+                        reason="run_prepare_failed",
+                    )
+                    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                    task_store.save(queue)
+                    return
+        if manifest is None:
+            return
+        try:
+            with self._fresh_driver_context(self._scheduler_config.codex_binary_path) as driver:
+                orchestrator = self._build_queue_orchestrator(run_store=run_store, driver=driver)
+                if action == "retry_review":
+                    manifest = orchestrator.retry_review(manifest)
+                else:
+                    manifest = orchestrator.run(manifest)
+        except Exception as exc:
+            with self._queue_lock:
+                queue = task_store.load()
+                task = _find_task_record(queue, task_id)
+                task_store.update_task(
+                    queue,
+                    task.task_id,
+                    status=TASK_FAILED,
+                    error=str(exc),
+                    reason="orchestrator_exception",
+                )
+                reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                task_store.save(queue)
+            return
+        with self._queue_lock:
+            queue = task_store.load()
+            task = _find_task_record(queue, task_id)
+            reconcile_task_with_active_run(
+                task,
+                active_run=manifest,
+                completed_at=run_store.now_iso(),
+            )
+            reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+            task_store.save(queue)
+
+    def _build_queue_orchestrator(self, *, run_store: RunStore, driver: CodexDriver) -> OrchestratorLike:
+        if self._orchestrator_factory is not None:
+            return self._orchestrator_factory()
+        from .orchestrator import OrchestratorConfig, RunOrchestrator
+
+        if self._scheduler_config is None:
+            raise RuntimeError("missing scheduler config")
+        return RunOrchestrator(
+            store=run_store,
+            driver=driver,
+            config=OrchestratorConfig(
+                sandbox=self._scheduler_config.sandbox,
+                approval_policy=self._scheduler_config.approval_policy,
+                max_attempts=self._scheduler_config.max_attempts,
+                require_plan_approval=True,
+                approve_plan=True,
+                controller_repo_path=str(self._scheduler_config.cwd),
+            ),
+        )
+
     def _run_proposal_dispatch_loop(self) -> None:
         if self.proposals_path is None or self._scheduler_config is None:
             return
         while True:
-            claimed = self._claim_planning_proposals(limit=PROPOSAL_PLANNING_CONCURRENCY)
+            limit = max(1, self._scheduler_config.max_parallel_workspaces)
+            self._promote_waiting_workspace_proposals(limit=limit)
+            claimed = self._claim_planning_proposals(limit=limit)
             if not claimed:
                 return
             for proposal_id, run_id in claimed:
                 self._process_proposal_planning_job(proposal_id=proposal_id, run_id=run_id)
+
+    def _promote_waiting_workspace_proposals(self, *, limit: int) -> int:
+        if self.proposals_path is None or self._scheduler_config is None:
+            return 0
+        promoted = 0
+        with self._action_lock:
+            proposal_store = ProposalStore(self.proposals_path)
+            try:
+                pool = proposal_store.load()
+            except (OSError, ValueError):
+                return 0
+            run_store = RunStore(self.runs_dir)
+            for proposal in pool.proposals:
+                if promoted >= limit:
+                    break
+                if proposal.status != PROPOSAL_WAITING_WORKSPACE:
+                    continue
+                try:
+                    proposal_cwd = _resolve_task_cwd(proposal.cwd, default_cwd=self._scheduler_config.cwd)
+                    workspace_root = canonical_git_root(proposal_cwd)
+                except (ValueError, WorkspaceResolutionError) as exc:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal.proposal_id,
+                        status=PROPOSAL_FAILED,
+                        error=str(exc),
+                        reason="workspace_resolution_failed",
+                    )
+                    promoted += 1
+                    continue
+                if _workspace_lane_is_locked(
+                    workspace_root=workspace_root,
+                    proposals=pool.proposals,
+                    queue_path=self.queue_path,
+                    run_store=run_store,
+                    ignore_proposal_id=proposal.proposal_id,
+                ):
+                    continue
+                try:
+                    manifest = _create_preflight_run(
+                        run_store=run_store,
+                        config=self._scheduler_config,
+                        user_task=proposal.prompt,
+                        task_cwd=proposal_cwd,
+                        worktree_factory=self._worktree_factory,
+                    )
+                except Exception as exc:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal.proposal_id,
+                        status=PROPOSAL_FAILED,
+                        error=str(exc),
+                        reason="proposal_preflight_failed",
+                    )
+                    promoted += 1
+                    continue
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    run_id=manifest.run_id,
+                    status=PROPOSAL_PLANNING,
+                    error=None,
+                    reason="planner",
+                )
+                promoted += 1
+            if promoted:
+                proposal_store.save(pool)
+        return promoted
 
     def _claim_planning_proposals(self, *, limit: int) -> List[Tuple[str, str]]:
         if self.proposals_path is None:
@@ -416,6 +785,7 @@ class COrchRuntime:
                 max_attempts=self._scheduler_config.max_attempts,
                 require_plan_approval=True,
                 approve_plan=False,
+                controller_repo_path=str(self._scheduler_config.cwd),
             ),
         )
 
@@ -746,6 +1116,7 @@ def create_proposal(
     cwd: Any = None,
     *,
     runs_dir: Pathish,
+    queue_path: Optional[Pathish] = None,
     config: SchedulerConfig,
     worktree_factory: Optional[Callable[..., Path]] = None,
 ) -> RunActionResponse:
@@ -755,18 +1126,39 @@ def create_proposal(
         return HTTPStatus.BAD_REQUEST, {"error": "prompt is required"}
     try:
         proposal_cwd = _resolve_task_cwd(cwd, default_cwd=config.cwd)
-    except ValueError as exc:
+        workspace_root = canonical_git_root(proposal_cwd)
+    except (ValueError, WorkspaceResolutionError) as exc:
         return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
 
     proposals_file = Path(proposals_path).expanduser().resolve()
     proposal_store = ProposalStore(proposals_file)
     pool = proposal_store.load_or_create()
+    lane_busy = _workspace_lane_is_locked(
+        workspace_root=workspace_root,
+        proposals=pool.proposals,
+        queue_path=queue_path,
+        run_store=RunStore(Path(runs_dir).expanduser().resolve()),
+    )
     proposal = proposal_store.add_proposal(
         pool,
         title=title.strip(),
         prompt=prompt.strip(),
         cwd=str(proposal_cwd),
     )
+    if lane_busy:
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=PROPOSAL_WAITING_WORKSPACE,
+            reason="workspace_lane",
+        )
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_created_waiting_workspace",
+            "proposal_id": proposal.proposal_id,
+        }
+        return HTTPStatus.OK, payload
     proposal_store.save(pool)
 
     run_store = RunStore(Path(runs_dir).expanduser().resolve())
@@ -925,6 +1317,62 @@ def prune_queued_proposals(proposals_path: Pathish) -> int:
         pool.proposals = kept
         store.save(pool)
     return removed
+
+
+_LOCKING_PROPOSAL_STATUSES = {
+    PROPOSAL_PLANNING,
+    PROPOSAL_PLAN_REVIEW_REQUIRED,
+    PROPOSAL_PLAN_REVISING,
+    PROPOSAL_FAILED,
+}
+
+
+def _workspace_lane_is_locked(
+    *,
+    workspace_root: Path,
+    proposals: Sequence[ProposalRecord],
+    queue_path: Optional[Pathish],
+    run_store: RunStore,
+    ignore_proposal_id: Optional[str] = None,
+) -> bool:
+    for proposal in proposals:
+        if proposal.proposal_id == ignore_proposal_id:
+            continue
+        if proposal.status not in _LOCKING_PROPOSAL_STATUSES:
+            continue
+        proposal_cwd = proposal.cwd
+        if not proposal_cwd and proposal.run_id:
+            try:
+                proposal_cwd = run_store.load(proposal.run_id).cwd
+            except OSError:
+                proposal_cwd = None
+        if proposal_cwd and _same_workspace(proposal_cwd, workspace_root):
+            return True
+    if queue_path is None:
+        return False
+    try:
+        queue = TaskStore(Path(queue_path).expanduser().resolve()).load()
+    except (OSError, ValueError):
+        return False
+    for task in queue.tasks:
+        if task.status in {TASK_APPROVED, TASK_SKIPPED}:
+            continue
+        task_cwd = task.cwd
+        if not task_cwd and task.active_run_id:
+            try:
+                task_cwd = run_store.load(task.active_run_id).cwd
+            except OSError:
+                task_cwd = None
+        if task_cwd and _same_workspace(task_cwd, workspace_root):
+            return True
+    return False
+
+
+def _same_workspace(path: Pathish, workspace_root: Path) -> bool:
+    try:
+        return canonical_git_root(path) == workspace_root
+    except WorkspaceResolutionError:
+        return False
 
 
 

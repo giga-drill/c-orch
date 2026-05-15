@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from c_orch.task_store import (
     TASK_WAITING,
     TaskStore,
 )
+from c_orch.workspace_lanes import workspace_slug
 
 
 class _FakeOrchestrator:
@@ -260,8 +262,8 @@ class SchedulerTests(unittest.TestCase):
             root = Path(tmp)
             repo_one = root / "repo-one"
             repo_two = root / "repo-two"
-            repo_one.mkdir()
-            repo_two.mkdir()
+            _init_git_repo(repo_one)
+            _init_git_repo(repo_two)
             task_store = TaskStore(root / "queue.json")
             task_store.import_tasks(
                 [
@@ -311,9 +313,9 @@ class SchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runtime_cwd = root / "runtime-repo"
-            runtime_cwd.mkdir()
+            _init_git_repo(runtime_cwd)
             repo_one = root / "repo-one"
-            repo_one.mkdir()
+            _init_git_repo(repo_one)
             task_store = TaskStore(root / "queue.json")
             task_store.import_tasks(
                 [
@@ -359,14 +361,14 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(queue.status, QUEUE_APPROVED)
             self.assertEqual(
                 [path.resolve() for path in seen_worktrees_dirs],
-                [(repo_one / ".c-orch" / "worktrees").resolve()],
+                [(runtime_cwd / ".c-orch" / "worktrees" / workspace_slug(repo_one)).resolve()],
             )
 
     def test_retry_preserves_task_cwd_for_new_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo_target = root / "target-repo"
-            repo_target.mkdir()
+            _init_git_repo(repo_target)
             task_store = TaskStore(root / "queue.json")
             queue = task_store.import_tasks(
                 [
@@ -450,7 +452,7 @@ class SchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo_bound = root / "repo-bound"
-            repo_bound.mkdir()
+            _init_git_repo(repo_bound)
             task_store = TaskStore(root / "queue.json")
             queue = task_store.import_tasks(
                 [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
@@ -741,6 +743,7 @@ class SchedulerTests(unittest.TestCase):
 
 
 def _config(root: Path) -> SchedulerConfig:
+    _init_git_repo(root / "repo")
     return SchedulerConfig(
         cwd=root / "repo",
         runs_dir=root / "runs",
@@ -759,6 +762,11 @@ def _fake_worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str,
     worktree = worktrees_dir / run_id / worker_id
     worktree.mkdir(parents=True, exist_ok=True)
     return worktree
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _mark_retryable_review_failure(manifest) -> None:  # type: ignore[no-untyped-def]

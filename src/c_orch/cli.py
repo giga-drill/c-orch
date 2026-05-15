@@ -20,6 +20,7 @@ from .settings import (
 from .failure_policy import has_retryable_review_failure
 from .phase_timing import record_run_status_transition
 from .states import RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED, TERMINAL_RUN_STATUSES
+from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 def _json_default(value: Any) -> Any:
@@ -502,6 +503,7 @@ def _resolve_execution_config(
             DEFAULT_WORKER_SERVICE_TIER,
         ),
         "max_attempts": getattr(args, "max_attempts", None) or project_config.run.max_attempts,
+        "max_parallel_workspaces": project_config.run.max_parallel_workspaces,
         "sandbox": getattr(args, "sandbox", None) or project_config.run.sandbox,
         "approval_policy": getattr(args, "approval_policy", None) or project_config.run.approval_policy,
     }
@@ -881,6 +883,7 @@ def run_queue_run(args: argparse.Namespace) -> int:
         planner_service_tier=config["planner_service_tier"],
         worker_service_tier=config["worker_service_tier"],
         max_attempts=config["max_attempts"],
+        max_parallel_workspaces=config["max_parallel_workspaces"],
         sandbox=config["sandbox"],
         approval_policy=config["approval_policy"],
         max_tasks=args.max_tasks,
@@ -939,6 +942,7 @@ def run_ui(args: argparse.Namespace) -> int:
                 planner_service_tier=execution_config["planner_service_tier"],
                 worker_service_tier=execution_config["worker_service_tier"],
                 max_attempts=execution_config["max_attempts"],
+                max_parallel_workspaces=execution_config["max_parallel_workspaces"],
                 sandbox=execution_config["sandbox"],
                 approval_policy=execution_config["approval_policy"],
             )
@@ -1062,7 +1066,12 @@ def _resolve_import_task_cwd(raw_cwd: Any, *, index: int, base_cwd: Path) -> Opt
     text = raw_cwd.strip()
     if not text:
         raise ValueError(f"tasks[{index}].cwd cannot be empty")
-    return str(_resolve_under_cwd(base_cwd, text).resolve())
+    resolved = _resolve_under_cwd(base_cwd, text).resolve()
+    try:
+        canonical_git_root(resolved)
+    except WorkspaceResolutionError as exc:
+        raise ValueError(f"tasks[{index}].cwd {exc}") from exc
+    return str(resolved)
 
 
 def _is_terminal_manifest_status(status: str) -> bool:

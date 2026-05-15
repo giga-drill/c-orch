@@ -59,6 +59,7 @@ from .worktrees import (
     commit_applied_changes,
     collect_diff_evidence,
 )
+from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 Pathish = Union[str, Path]
@@ -137,6 +138,7 @@ class OrchestratorConfig:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     require_plan_approval: bool = False
     approve_plan: bool = False
+    controller_repo_path: Optional[str] = None
 
 
 class RunOrchestrator:
@@ -999,7 +1001,7 @@ class RunOrchestrator:
             )
         restart_paths: List[str] = []
         if apply_report.applied:
-            restart_paths = self._restart_trigger_paths(evidence.changed_paths)
+            restart_paths = self._restart_trigger_paths(manifest=manifest, changed_paths=evidence.changed_paths)
             if restart_paths:
                 manifest.requires_restart = True
                 manifest.restart_reason = (
@@ -1149,7 +1151,9 @@ class RunOrchestrator:
             )
         return commit_report
 
-    def _restart_trigger_paths(self, changed_paths: List[str]) -> List[str]:
+    def _restart_trigger_paths(self, *, manifest: RunManifest, changed_paths: List[str]) -> List[str]:
+        if not self._is_controller_repo(manifest.cwd):
+            return []
         matched: List[str] = []
         seen = set()
         for raw_path in changed_paths:
@@ -1162,6 +1166,14 @@ class RunOrchestrator:
                     matched.append(raw_path)
                     seen.add(raw_path)
         return matched
+
+    def _is_controller_repo(self, repo_path: str) -> bool:
+        if not self.config.controller_repo_path:
+            return False
+        try:
+            return canonical_git_root(repo_path) == canonical_git_root(self.config.controller_repo_path)
+        except WorkspaceResolutionError:
+            return Path(repo_path).expanduser().resolve() == Path(self.config.controller_repo_path).expanduser().resolve()
 
 
 def run_single_worker(

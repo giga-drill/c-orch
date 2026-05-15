@@ -21,6 +21,7 @@ from .proposal_store import (
     PROPOSAL_PLAN_REVISING,
     PROPOSAL_PLANNING,
     PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_WORKSPACE,
     ProposalRecord,
     ProposalStore,
 )
@@ -33,6 +34,7 @@ from .states import (
 )
 from .task_lifecycle import derive_run_waiting_for, derive_task_progress, reconcile_queue
 from .task_store import TASK_SKIPPED, TaskStore
+from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 Pathish = Union[str, Path]
@@ -151,6 +153,10 @@ def build_state_payload(
             "last_dispatch_error": last_dispatch_error,
             "last_proposal_dispatch_error": last_proposal_dispatch_error,
         },
+        "workspace_lanes": _workspace_lane_summary(
+            proposals_payload=proposals_payload,
+            queue_payload=queue_payload,
+        ),
         "proposals": proposals_payload,
         "queue": queue_payload,
         "runs": runs_payload,
@@ -186,7 +192,7 @@ def build_queue_payload(
     run_store = RunStore(Path(runs_dir).expanduser().resolve()) if runs_dir is not None else None
     if run_store is not None:
         reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
-    tasks = [_summarize_task(task, run_store=run_store) for task in queue.tasks]
+    tasks = _annotate_task_lane_waits([_summarize_task(task, run_store=run_store) for task in queue.tasks])
     return {
         "queue_file": str(queue_file),
         "generated_at": generated_at,
@@ -272,6 +278,90 @@ def _state_version(
     except OSError:
         pass
     return max(mtimes, default=0)
+
+
+def _workspace_lane_summary(
+    *,
+    proposals_payload: Dict[str, Any],
+    queue_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    lanes: Dict[str, Dict[str, Any]] = {}
+    for proposal in _list_value(proposals_payload.get("proposals")):
+        if not isinstance(proposal, dict):
+            continue
+        workspace_id = proposal.get("workspace_id")
+        if not workspace_id:
+            continue
+        lane = lanes.setdefault(str(workspace_id), _new_lane(str(workspace_id), proposal.get("cwd")))
+        lane["proposals"] += 1
+        status = str(proposal.get("status") or "")
+        waiting_for = proposal.get("waiting_for")
+        if status == PROPOSAL_FAILED:
+            lane["failed"] += 1
+            lane["status"] = "failed"
+            lane["blocked_by"] = {"type": "proposal", "id": proposal.get("proposal_id")}
+        elif waiting_for == "human_plan_review":
+            lane["status"] = "waiting_review"
+            lane["active_item"] = {"type": "proposal", "id": proposal.get("proposal_id"), "title": proposal.get("title")}
+        elif status in {PROPOSAL_PLANNING, PROPOSAL_PLAN_REVISING}:
+            lane["status"] = "active"
+            lane["active_item"] = {"type": "proposal", "id": proposal.get("proposal_id"), "title": proposal.get("title")}
+        elif status == PROPOSAL_WAITING_WORKSPACE:
+            lane["queued"] += 1
+    for task in _list_value(queue_payload.get("tasks")):
+        if not isinstance(task, dict):
+            continue
+        workspace_id = task.get("workspace_id")
+        if not workspace_id:
+            continue
+        lane = lanes.setdefault(str(workspace_id), _new_lane(str(workspace_id), task.get("cwd")))
+        status = str(task.get("status") or "")
+        if status == "FAILED":
+            lane["failed"] += 1
+            lane["status"] = "failed"
+            lane["blocked_by"] = {"type": "task", "id": task.get("task_id")}
+        elif status in {"RUNNING", "WAITING"}:
+            if lane["status"] not in {"failed"}:
+                lane["status"] = "active"
+                lane["active_item"] = {"type": "task", "id": task.get("task_id"), "title": task.get("title")}
+        elif status == "PENDING":
+            lane["queued"] += 1
+    lane_list = sorted(lanes.values(), key=lambda item: str(item["workspace_id"]))
+    return {
+        "lanes": lane_list,
+        "total_lanes": len(lane_list),
+        "active_lanes": sum(1 for lane in lane_list if lane["status"] == "active"),
+        "failed_lanes": sum(1 for lane in lane_list if lane["status"] == "failed"),
+        "waiting_review_lanes": sum(1 for lane in lane_list if lane["status"] == "waiting_review"),
+        "pending_lanes": sum(1 for lane in lane_list if lane["queued"] and lane["status"] == "idle"),
+    }
+
+
+def _new_lane(workspace_id: str, cwd: Any) -> Dict[str, Any]:
+    root = str(cwd or workspace_id)
+    return {
+        "workspace_id": workspace_id,
+        "workspace_root": root,
+        "workspace_name": Path(root).name,
+        "status": "idle",
+        "active_item": None,
+        "blocked_by": None,
+        "queued": 0,
+        "failed": 0,
+        "proposals": 0,
+    }
+
+
+def _workspace_id(cwd: Any) -> Optional[str]:
+    if not cwd:
+        return None
+    try:
+        return str(canonical_git_root(str(cwd)))
+    except (WorkspaceResolutionError, OSError):
+        try:
+            return str(Path(str(cwd)).expanduser().resolve())
+        except OSError:
+            return str(cwd)
 
 
 def _load_manifests(runs_dir: Path) -> List[Dict[str, Any]]:
@@ -389,6 +479,7 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "task_id": task.task_id,
         "title": task.title,
         "cwd": task_cwd,
+        "workspace_id": _workspace_id(task_cwd),
         "status": task.status,
         "active_run_id": task.active_run_id,
         "run_ids": list(task.run_ids),
@@ -400,6 +491,7 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "last_error_event": last_error_event,
         "waiting_for": progress.waiting_for,
         "next_action": progress.waiting_for,
+        "blocked_by": None,
         "allowed_actions": _allowed_task_actions(task, active_run=active_run, events=active_run_events),
     }
 
@@ -438,6 +530,7 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
         "title": proposal.title,
         "prompt": proposal.prompt,
         "cwd": proposal_cwd,
+        "workspace_id": _workspace_id(proposal_cwd),
         "status": status,
         "run_id": proposal.run_id,
         "task_id": proposal.task_id,
@@ -462,16 +555,20 @@ def _proposal_summary(proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
         for proposal in proposals
         if proposal.get("status") in {PROPOSAL_PLANNING, PROPOSAL_PLAN_REVISING}
     )
+    waiting_workspace = sum(1 for proposal in proposals if proposal.get("status") == PROPOSAL_WAITING_WORKSPACE)
     return {
         "total_proposals": total,
         "review_required": review_required,
         "queued": queued,
         "failed": failed,
         "active": active,
+        "waiting_workspace": waiting_workspace,
     }
 
 
 def _proposal_waiting_for(status: str) -> str:
+    if status == PROPOSAL_WAITING_WORKSPACE:
+        return "workspace_lane"
     if status == PROPOSAL_PLAN_REVIEW_REQUIRED:
         return "human_plan_review"
     if status == PROPOSAL_PLAN_REVISING:
@@ -511,6 +608,37 @@ def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "running_tasks": running,
         "current_waiting_point": current.get("waiting_for") if current else "done",
     }
+
+
+def _annotate_task_lane_waits(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    lane_blockers: Dict[str, Dict[str, Any]] = {}
+    seen_active: set[str] = set()
+    for task in tasks:
+        workspace_id = task.get("workspace_id")
+        if not workspace_id:
+            continue
+        lane_key = str(workspace_id)
+        if task.get("status") in {"APPROVED", TASK_SKIPPED}:
+            continue
+        blocker = lane_blockers.get(lane_key)
+        if blocker is not None and task.get("status") == "PENDING":
+            task["waiting_for"] = "failed_workspace" if blocker.get("status") == "FAILED" else "workspace_lane"
+            task["next_action"] = task["waiting_for"]
+            task["blocked_by"] = {
+                "type": "task",
+                "id": blocker.get("task_id"),
+                "title": blocker.get("title"),
+                "status": blocker.get("status"),
+            }
+            continue
+        if lane_key in seen_active and task.get("status") == "PENDING":
+            task["waiting_for"] = "workspace_lane"
+            task["next_action"] = "workspace_lane"
+            continue
+        seen_active.add(lane_key)
+        if task.get("status") in {"FAILED", "BLOCKED", "RUNNING", "WAITING"}:
+            lane_blockers[lane_key] = task
+    return tasks
 
 
 def _allowed_run_actions(manifest: Dict[str, Any], events: List[Dict[str, Any]]) -> List[str]:

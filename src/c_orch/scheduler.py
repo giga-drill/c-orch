@@ -14,7 +14,8 @@ from .task_lifecycle import (
     reconcile_queue,
     reconcile_task_with_active_run,
 )
-from .settings import DEFAULT_WORKTREES_DIR
+from .settings import DEFAULT_MAX_PARALLEL_WORKSPACES, DEFAULT_WORKTREES_DIR
+from .workspace_lanes import canonical_git_root, workspace_worktrees_dir
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -60,6 +61,7 @@ class SchedulerConfig:
     planner_service_tier: Optional[str] = None
     worker_service_tier: Optional[str] = None
     max_tasks: Optional[int] = None
+    max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
 
     def resolve_task_cwd(self, task_cwd: Optional[str]) -> Path:
         if task_cwd is None or not task_cwd.strip():
@@ -67,13 +69,20 @@ class SchedulerConfig:
         return Path(task_cwd).expanduser().resolve()
 
     def resolve_worktrees_dir(self, task_cwd: Path) -> Path:
+        workspace_root = canonical_git_root(task_cwd)
         worktrees_dir = self.worktrees_dir.expanduser()
         default_under_runtime = (self.cwd.expanduser().resolve() / DEFAULT_WORKTREES_DIR).resolve()
         if worktrees_dir.is_absolute() and worktrees_dir.resolve() == default_under_runtime:
-            return (task_cwd / DEFAULT_WORKTREES_DIR).resolve()
-        if worktrees_dir.is_absolute():
-            return worktrees_dir.resolve()
-        return (task_cwd / worktrees_dir).resolve()
+            return workspace_worktrees_dir(
+                controller_cwd=self.cwd,
+                configured_worktrees_dir=DEFAULT_WORKTREES_DIR,
+                workspace_root=workspace_root,
+            )
+        return workspace_worktrees_dir(
+            controller_cwd=self.cwd,
+            configured_worktrees_dir=worktrees_dir,
+            workspace_root=workspace_root,
+        )
 
 
 class TaskScheduler:
@@ -297,6 +306,7 @@ class TaskScheduler:
                 max_attempts=self.config.max_attempts,
                 require_plan_approval=True,
                 approve_plan=True,
+                controller_repo_path=str(self.config.cwd),
             ),
         )
 

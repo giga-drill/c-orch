@@ -11,6 +11,7 @@ from .settings import (
     DEFAULT_DEV_UI_HOST,
     DEFAULT_DEV_UI_PORT,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_PARALLEL_WORKSPACES,
     DEFAULT_PLANNER_MODELS,
     DEFAULT_RUNS_DIR,
     DEFAULT_SANDBOX,
@@ -41,6 +42,7 @@ class RunConfig:
     runs_dir: str = DEFAULT_RUNS_DIR
     worktrees_dir: str = DEFAULT_WORKTREES_DIR
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL_POLICY
 
@@ -138,6 +140,11 @@ def _run_config(data: Mapping[str, Any]) -> RunConfig:
         runs_dir=_string(data.get("runs_dir"), "run.runs_dir", DEFAULT_RUNS_DIR),
         worktrees_dir=_string(data.get("worktrees_dir"), "run.worktrees_dir", DEFAULT_WORKTREES_DIR),
         max_attempts=_positive_int(data.get("max_attempts"), "run.max_attempts", DEFAULT_MAX_ATTEMPTS),
+        max_parallel_workspaces=_positive_int(
+            data.get("max_parallel_workspaces"),
+            "run.max_parallel_workspaces",
+            DEFAULT_MAX_PARALLEL_WORKSPACES,
+        ),
         sandbox=_choice(data.get("sandbox"), "run.sandbox", SANDBOX_CHOICES, DEFAULT_SANDBOX),
         approval_policy=_choice(
             data.get("approval_policy"),

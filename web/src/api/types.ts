@@ -25,6 +25,7 @@ export interface TaskSummary {
   task_id: string;
   title: string;
   cwd: string | null;
+  workspace_id?: string | null;
   status: string;
   active_run_id: string | null;
   run_ids: string[];
@@ -36,6 +37,7 @@ export interface TaskSummary {
   last_error_event: RunEvent | null;
   waiting_for: string;
   next_action: string;
+  blocked_by?: { type?: string; id?: string; title?: string; status?: string } | null;
   allowed_actions: AllowedTaskAction[];
 }
 
@@ -54,6 +56,7 @@ export interface ProposalSummary {
   queued: number;
   failed: number;
   active: number;
+  waiting_workspace?: number;
 }
 
 export interface ProposalPoolRecord {
@@ -76,6 +79,7 @@ export interface ProposalRecord {
   title: string;
   prompt: string;
   cwd: string | null;
+  workspace_id?: string | null;
   status: string;
   run_id: string | null;
   task_id: string | null;
@@ -87,6 +91,27 @@ export interface ProposalRecord {
   allowed_actions: AllowedProposalAction[];
   run: RunListItem | null;
   plan_detail: ProposalPlanDetail | null;
+}
+
+export interface WorkspaceLaneSummary {
+  workspace_id: string;
+  workspace_root: string;
+  workspace_name: string;
+  status: string;
+  active_item: { type?: string; id?: string; title?: string } | null;
+  blocked_by: { type?: string; id?: string; title?: string; status?: string } | null;
+  queued: number;
+  failed: number;
+  proposals: number;
+}
+
+export interface WorkspaceLanesPayload {
+  lanes: WorkspaceLaneSummary[];
+  total_lanes: number;
+  active_lanes: number;
+  failed_lanes: number;
+  waiting_review_lanes: number;
+  pending_lanes: number;
 }
 
 export interface ProposalsPayload {
@@ -274,6 +299,7 @@ export interface DashboardStatePayload {
   runtime: RuntimeState;
   proposals: ProposalsPayload;
   queue: QueuePayload;
+  workspace_lanes?: WorkspaceLanesPayload;
   runs: RunsPayload;
   focused_run_id: string | null;
   selected_run: RunPayload | null;

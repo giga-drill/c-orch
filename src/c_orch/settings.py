@@ -19,6 +19,7 @@ REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
 SERVICE_TIER_CHOICES = ("flex", "fast")
 
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_PARALLEL_WORKSPACES = 2
 DEFAULT_SANDBOX = "workspace-write"
 SANDBOX_CHOICES = ("read-only", "workspace-write", "danger-full-access")
 DEFAULT_APPROVAL_POLICY = "never"

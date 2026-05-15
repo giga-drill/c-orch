@@ -554,6 +554,7 @@ class OrchestratorTests(unittest.TestCase):
                 evidence_collector=evidence,
                 diff_applier=applier,
                 verification_runner=verification,
+                config=OrchestratorConfig(controller_repo_path=manifest.cwd),
             ).run(manifest)
 
             self.assertEqual(result.status, "APPROVED")
@@ -1117,6 +1118,7 @@ class OrchestratorTests(unittest.TestCase):
                 evidence_collector=evidence,
                 diff_applier=applier,
                 verification_runner=verification,
+                config=OrchestratorConfig(controller_repo_path=manifest.cwd),
             ).run(manifest)
 
             self.assertEqual(result.status, "FAILED")
@@ -1327,6 +1329,7 @@ class OrchestratorTests(unittest.TestCase):
                 evidence_collector=evidence,
                 diff_applier=applier,
                 verification_runner=verification,
+                config=OrchestratorConfig(controller_repo_path=manifest.cwd),
             ).run(manifest)
 
             self.assertEqual(result.status, "APPROVED")
@@ -1344,6 +1347,34 @@ class OrchestratorTests(unittest.TestCase):
                 restart_event["restart_paths"],
                 ["src/c_orch/orchestrator.py"],
             )
+
+    def test_non_controller_repo_self_like_paths_do_not_mark_restart_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            evidence = FakeEvidenceCollector(changed_paths=["src/c_orch/orchestrator.py"])
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                verification_runner=verification,
+                config=OrchestratorConfig(controller_repo_path=str(root / "controller")),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertFalse(result.requires_restart)
+            self.assertNotIn("restart_required", [event["type"] for event in store.load_events(manifest.run_id)])
 
     def test_apply_failure_does_not_mark_restart_even_for_self_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

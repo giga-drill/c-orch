@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import subprocess
 import threading
 import time
 import tempfile
@@ -33,6 +34,39 @@ class _FakeOrchestrator:
         self.run_store.save(manifest)
         self.run_ids.append(manifest.run_id)
         return manifest
+
+
+class _BlockingQueueOrchestrator:
+    def __init__(
+        self,
+        run_store: RunStore,
+        *,
+        release: threading.Event,
+        statuses: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.run_store = run_store
+        self.release = release
+        self.statuses = statuses or {}
+        self.lock = threading.Lock()
+        self.started = threading.Event()
+        self.two_started = threading.Event()
+        self.run_ids: List[str] = []
+        self.user_tasks: List[str] = []
+
+    def run(self, manifest):  # type: ignore[no-untyped-def]
+        with self.lock:
+            self.run_ids.append(manifest.run_id)
+            self.user_tasks.append(manifest.user_task)
+            self.started.set()
+            if len(self.run_ids) >= 2:
+                self.two_started.set()
+        self.release.wait(timeout=5)
+        manifest.status = self.statuses.get(manifest.user_task, "APPROVED")
+        self.run_store.save(manifest)
+        return manifest
+
+    def retry_review(self, manifest):  # type: ignore[no-untyped-def]
+        return self.run(manifest)
 
 
 class _FakeProposalPlanner:
@@ -124,7 +158,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             task_store = TaskStore(root / "queue.json")
             queue = task_store.import_tasks(
                 [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
@@ -153,13 +187,129 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
 
+    def test_queue_dispatch_runs_different_git_workspaces_in_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            _init_git_repo(repo_a)
+            _init_git_repo(repo_b)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {"task_id": "task-a", "title": "Task A", "prompt": "Do A", "cwd": str(repo_a)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo_b)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            release = threading.Event()
+            fake = _BlockingQueueOrchestrator(run_store, release=release)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), max_parallel_workspaces=2),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(fake.two_started.wait(timeout=2))
+            loaded = task_store.load()
+            self.assertEqual([task.status for task in loaded.tasks], ["RUNNING", "RUNNING"])
+
+            release.set()
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+            loaded = task_store.load()
+            self.assertEqual(loaded.status, "APPROVED")
+            self.assertEqual([task.status for task in loaded.tasks], ["APPROVED", "APPROVED"])
+            self.assertEqual(set(fake.user_tasks), {"Do A", "Do B"})
+
+    def test_queue_dispatch_keeps_same_git_workspace_serial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo-a"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {"task_id": "task-a", "title": "Task A", "prompt": "Do A", "cwd": str(repo)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            release = threading.Event()
+            fake = _BlockingQueueOrchestrator(run_store, release=release)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), max_parallel_workspaces=2),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(fake.started.wait(timeout=2))
+            time.sleep(0.1)
+            self.assertEqual(fake.user_tasks, ["Do A"])
+            queue_payload = runtime.build_queue_payload()
+            self.assertEqual(queue_payload["tasks"][1]["waiting_for"], "workspace_lane")
+
+            release.set()
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+            loaded = task_store.load()
+            self.assertEqual(loaded.status, "APPROVED")
+            self.assertEqual([task.status for task in loaded.tasks], ["APPROVED", "APPROVED"])
+            self.assertEqual(fake.user_tasks, ["Do A", "Do B"])
+
+    def test_queue_dispatch_failed_lane_does_not_block_other_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            _init_git_repo(repo_a)
+            _init_git_repo(repo_b)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {"task_id": "task-a", "title": "Task A", "prompt": "Do A", "cwd": str(repo_a)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo_b)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            release = threading.Event()
+            fake = _BlockingQueueOrchestrator(
+                run_store,
+                release=release,
+                statuses={"Do A": "FAILED", "Do B": "APPROVED"},
+            )
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), max_parallel_workspaces=2),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(fake.two_started.wait(timeout=2))
+            release.set()
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+            loaded = task_store.load()
+
+            self.assertEqual(loaded.status, "FAILED")
+            self.assertEqual([task.status for task in loaded.tasks], ["FAILED", "APPROVED"])
+            self.assertEqual(set(fake.user_tasks), {"Do A", "Do B"})
+
     def test_proposal_approve_dispatches_existing_approved_run_to_worker(self) -> None:
         from c_orch.run_store import RunStore
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             run_store = RunStore(root / "runs")
             manifest = run_store.create_run(
                 cwd=repo,
@@ -268,7 +418,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             block_event = threading.Event()
             run_store = RunStore(root / "runs")
             fake_planner = _FakeProposalPlanner(
@@ -304,7 +454,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             run_store = RunStore(root / "runs")
             fake_planner = _FakeProposalPlanner(run_store)
             runtime = COrchRuntime(
@@ -335,7 +485,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             block_event = threading.Event()
             run_store = RunStore(root / "runs")
             fake_planner = _FakeProposalPlanner(
@@ -377,7 +527,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
-            repo.mkdir()
+            _init_git_repo(repo)
             block_event = threading.Event()
             run_store = RunStore(root / "runs")
             fake_planner = _FakeProposalPlanner(
@@ -400,25 +550,28 @@ class RuntimeTests(unittest.TestCase):
             runtime.create_proposal("Task 3", "Do task 3")
             pool = ProposalStore(root / "proposals.json").load()
             self.assertEqual(len(pool.proposals), 3)
-            self.assertEqual({proposal.status for proposal in pool.proposals}, {"PLANNING"})
+            self.assertEqual([proposal.status for proposal in pool.proposals], ["PLANNING", "WAITING_WORKSPACE", "WAITING_WORKSPACE"])
             run_ids_before = [proposal.run_id for proposal in pool.proposals]
-            self.assertTrue(all(run_ids_before))
-            self.assertEqual(len(set(run_ids_before)), 3)
+            self.assertIsNotNone(run_ids_before[0])
+            self.assertEqual(run_ids_before[1:], [None, None])
 
             block_event.set()
             self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=4))
             proposals = runtime.build_proposals_payload()["proposals"]
             self.assertEqual(len(proposals), 3)
-            self.assertTrue(all(proposal["status"] == "PLAN_REVIEW_REQUIRED" for proposal in proposals))
-            self.assertEqual(len({proposal["run_id"] for proposal in proposals}), 3)
+            self.assertEqual(
+                [proposal["status"] for proposal in proposals],
+                ["PLAN_REVIEW_REQUIRED", "WAITING_WORKSPACE", "WAITING_WORKSPACE"],
+            )
+            self.assertEqual(proposals[1]["waiting_for"], "workspace_lane")
 
     def test_create_proposal_with_task_cwd_uses_target_repo_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             dashboard_repo = root / "dashboard-repo"
-            dashboard_repo.mkdir()
+            _init_git_repo(dashboard_repo)
             target_repo = root / "target-repo"
-            target_repo.mkdir()
+            _init_git_repo(target_repo)
             worktree_repo_paths: List[Path] = []
             run_store = RunStore(root / "runs")
             fake_planner = _FakeProposalPlanner(run_store)
@@ -453,7 +606,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             dashboard_repo = root / "dashboard-repo"
-            dashboard_repo.mkdir()
+            _init_git_repo(dashboard_repo)
             runtime = COrchRuntime(
                 runs_dir=root / "runs",
                 proposals_path=root / "proposals.json",
@@ -470,6 +623,7 @@ class RuntimeTests(unittest.TestCase):
 
 
 def _scheduler_config(root: Path) -> SchedulerConfig:
+    _init_git_repo(root / "repo")
     return SchedulerConfig(
         cwd=root / "repo",
         runs_dir=root / "runs",
@@ -493,6 +647,11 @@ def _fake_worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str,
     worktree = worktrees_dir / run_id / worker_id
     worktree.mkdir(parents=True, exist_ok=True)
     return worktree
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

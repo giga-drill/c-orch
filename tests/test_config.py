@@ -29,6 +29,7 @@ reasoning_effort = "medium"
 runs_dir = "custom-runs"
 worktrees_dir = ".custom/worktrees"
 max_attempts = 2
+max_parallel_workspaces = 3
 sandbox = "read-only"
 approval_policy = "on-request"
 
@@ -52,6 +53,7 @@ dev_port = 6173
             self.assertEqual(config.run.runs_dir, "custom-runs")
             self.assertEqual(config.run.worktrees_dir, ".custom/worktrees")
             self.assertEqual(config.run.max_attempts, 2)
+            self.assertEqual(config.run.max_parallel_workspaces, 3)
             self.assertEqual(config.run.sandbox, "read-only")
             self.assertEqual(config.run.approval_policy, "on-request")
             self.assertEqual(config.ui.host, "0.0.0.0")

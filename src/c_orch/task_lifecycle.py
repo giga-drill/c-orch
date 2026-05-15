@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .failure_policy import has_retryable_review_failure
@@ -209,17 +210,34 @@ def mark_task_handled_skipped(
 
 
 def derive_queue_status(queue: TaskQueue, *, restart_required: bool = False) -> str:
-    if any(task.status == TASK_FAILED for task in queue.tasks):
-        return QUEUE_FAILED
-    if any(task.status == TASK_BLOCKED for task in queue.tasks):
-        return QUEUE_BLOCKED
     if restart_required:
         return QUEUE_RESTART_REQUIRED
     if queue.tasks and all(task.status in {TASK_APPROVED, TASK_SKIPPED} for task in queue.tasks):
         return QUEUE_APPROVED
     if any(task.status in {TASK_RUNNING, TASK_WAITING} for task in queue.tasks):
         return QUEUE_RUNNING
+    failed_lanes = {_task_lane_key(task) for task in queue.tasks if task.status == TASK_FAILED}
+    blocked_lanes = {_task_lane_key(task) for task in queue.tasks if task.status == TASK_BLOCKED}
+    unavailable_lanes = failed_lanes | blocked_lanes
+    if any(
+        task.status == TASK_PENDING and _task_lane_key(task) not in unavailable_lanes
+        for task in queue.tasks
+    ):
+        return QUEUE_PENDING
+    if failed_lanes:
+        return QUEUE_FAILED
+    if blocked_lanes:
+        return QUEUE_BLOCKED
     return QUEUE_PENDING
+
+
+def _task_lane_key(task: TaskRecord) -> str:
+    if not task.cwd:
+        return "__default__"
+    try:
+        return str(Path(task.cwd).expanduser().resolve())
+    except OSError:
+        return str(task.cwd)
 
 
 def _find_task(queue: TaskQueue, task_id: str) -> TaskRecord:

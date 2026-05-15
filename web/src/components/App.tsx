@@ -18,6 +18,7 @@ import type {
   RunTimingPhaseSummary,
   RunTimingSegment,
   TaskSummary,
+  WorkspaceLanesPayload,
   WorkerActivity,
 } from "../api/types";
 import {
@@ -45,6 +46,7 @@ const statusText: Record<string, string> = {
   PLAN_READY: "计划已生成",
   PLAN_REVIEW_REQUIRED: "等待人工审核计划",
   PLAN_REVISING: "Planner 修改计划中",
+  WAITING_WORKSPACE: "等待 workspace",
   PLAN_APPROVED: "计划已通过",
   WORKING: "Worker 工作中",
   WORK_DONE: "Worker 已完成",
@@ -54,6 +56,9 @@ const statusText: Record<string, string> = {
   completed: "已完成",
   missing: "未发生",
   partial: "数据不完整",
+  failed: "失败",
+  waiting_review: "等待审核",
+  idle: "空闲",
 };
 
 const phaseText: Record<string, string> = {
@@ -356,6 +361,7 @@ export function App() {
           runtimeGeneration={stateQuery.data?.runtime.generation}
           stateVersion={stateQuery.data?.version}
         />
+        <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
           payload={proposalsPayload}
           onSelectRun={selectRun}
@@ -456,6 +462,48 @@ function SystemStatus({
           {queueActionError ? <div className="error">{queueActionError}</div> : null}
         </>
       ) : null}
+    </section>
+  );
+}
+
+function WorkspaceLanePanel({ payload }: { payload?: WorkspaceLanesPayload }) {
+  if (!payload || payload.total_lanes === 0) return null;
+  return (
+    <section className="panel">
+      <div className="sectionTitle">
+        <h2>Workspace lanes</h2>
+        <span className="meta">总数 {payload.total_lanes}</span>
+      </div>
+      <div className="queueStats" aria-label="workspace lane 统计">
+        <span>进行中 {payload.active_lanes}</span>
+        <span>失败 {payload.failed_lanes}</span>
+        <span>待审 {payload.waiting_review_lanes}</span>
+        <span>待执行 {payload.pending_lanes}</span>
+      </div>
+      <div className="laneList">
+        {payload.lanes.map((lane) => (
+          <div key={lane.workspace_id} className="laneItem">
+            <div className="itemTop">
+              <strong>{displayValue(lane.workspace_name)}</strong>
+              <StatusBadge status={lane.status} />
+            </div>
+            <span className="meta">root: {displayValue(lane.workspace_root)}</span>
+            {lane.active_item ? (
+              <span className="meta">
+                active: {displayValue(lane.active_item.type)} {displayValue(lane.active_item.title ?? lane.active_item.id)}
+              </span>
+            ) : null}
+            {lane.blocked_by ? (
+              <span className="meta">
+                blocked_by: {displayValue(lane.blocked_by.type)} {displayValue(lane.blocked_by.title ?? lane.blocked_by.id)}
+              </span>
+            ) : null}
+            <span className="meta">
+              queued {lane.queued} · failed {lane.failed} · proposals {lane.proposals}
+            </span>
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
@@ -592,6 +640,7 @@ function ProposalPanel({
                 <StatusBadge status={proposal.status} />
               </span>
               <span>{proposal.title}</span>
+              <span className="meta">workspace: {displayValue(proposal.workspace_id)}</span>
               <span className="meta">cwd: {displayValue(proposal.cwd)}</span>
               <span className="meta">waiting_for: {displayValue(proposal.waiting_for)}</span>
               <span className="meta">run_id: {displayValue(proposal.run_id)}</span>
@@ -797,8 +846,12 @@ function QueuePanel({
                   <StatusBadge status={task.status} />
                 </span>
                 <span>{task.title}</span>
+                <span className="meta">workspace: {displayValue(task.workspace_id)}</span>
                 <span className="meta">cwd: {displayValue(task.cwd)}</span>
                 <span className="meta">waiting_for: {displayValue(task.waiting_for)}</span>
+                {task.blocked_by ? (
+                  <span className="meta">blocked_by: {displayValue(task.blocked_by.title ?? task.blocked_by.id)}</span>
+                ) : null}
                 <span className="meta">active_run_id: {displayValue(task.active_run_id)}</span>
               </button>
               {task.status === "FAILED" && failureReason ? (

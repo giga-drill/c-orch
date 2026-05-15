@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,7 +20,7 @@ class CliQueueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cwd = root / "repo"
-            cwd.mkdir()
+            _init_git_repo(cwd)
             tasks_path = cwd / "tasks.json"
             tasks_path.write_text(
                 json.dumps(
@@ -36,7 +37,7 @@ class CliQueueTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (cwd / "target-repo").mkdir()
+            _init_git_repo(cwd / "target-repo")
 
             with redirect_stdout(StringIO()) as import_stdout:
                 exit_code = main(
@@ -181,3 +182,8 @@ class _FakeDriver:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
