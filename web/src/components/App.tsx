@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type {
   AllowedRunAction,
   AllowedTaskAction,
@@ -18,6 +19,8 @@ import type {
   WorkerActivity,
 } from "../api/types";
 import {
+  queryKeys,
+  refreshDashboardQueries,
   useCreateProposalMutation,
   useDashboardStateQuery,
   useProposalActionMutation,
@@ -133,6 +136,7 @@ function sortQueueTasks(tasks: TaskSummary[], selectedRunId: string | null): Tas
 }
 
 export function App() {
+  const queryClient = useQueryClient();
   const stateQuery = useDashboardStateQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [manualSelection, setManualSelection] = useState(false);
@@ -169,9 +173,10 @@ export function App() {
   const runQuery = useRunQuery(selectedRunId);
   const stateSelectedRun = stateQuery.data?.selected_run;
   const runPayload =
-    stateSelectedRun && stateSelectedRun.run.run_id === selectedRunId
+    runQuery.data ??
+    (stateSelectedRun && stateSelectedRun.run.run_id === selectedRunId
       ? stateSelectedRun
-      : runQuery.data;
+      : undefined);
   const isRunLoading =
     Boolean(selectedRunId) &&
     !runPayload &&
@@ -186,9 +191,15 @@ export function App() {
   }
 
   async function refreshAll() {
+    await refreshDashboardQueries(queryClient, selectedRunId);
     await Promise.all([
-      stateQuery.refetch(),
-      runQuery.refetch(),
+      queryClient.refetchQueries({ queryKey: queryKeys.state }),
+      queryClient.refetchQueries({ queryKey: queryKeys.proposals }),
+      queryClient.refetchQueries({ queryKey: queryKeys.queue }),
+      queryClient.refetchQueries({ queryKey: queryKeys.runs }),
+      selectedRunId
+        ? queryClient.refetchQueries({ queryKey: queryKeys.run(selectedRunId) })
+        : Promise.resolve(),
     ]);
   }
 

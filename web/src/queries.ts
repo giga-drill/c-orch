@@ -23,14 +23,16 @@ export const queryKeys = {
   run: (runId: string) => ["run", runId] as const,
 };
 
-function refreshDashboardQueries(queryClient: QueryClient, runId?: string | null) {
-  void queryClient.invalidateQueries({ queryKey: queryKeys.state });
-  void queryClient.invalidateQueries({ queryKey: queryKeys.proposals });
-  void queryClient.invalidateQueries({ queryKey: queryKeys.queue });
-  void queryClient.invalidateQueries({ queryKey: queryKeys.runs });
-  void queryClient.invalidateQueries({ queryKey: ["run"] });
+export async function refreshDashboardQueries(queryClient: QueryClient, runId?: string | null) {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: queryKeys.state }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.proposals }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.queue }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
+    queryClient.invalidateQueries({ queryKey: ["run"] }),
+  ]);
   if (runId) {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.run(runId) });
+    await queryClient.invalidateQueries({ queryKey: queryKeys.run(runId) });
   }
 }
 
