@@ -27,6 +27,7 @@ from .task_store import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
+    TASK_SKIPPED,
     TASK_WAITING,
     TaskRecord,
     TaskQueue,
@@ -282,7 +283,7 @@ class TaskScheduler:
 
     def _first_incomplete_task(self, queue: TaskQueue):
         for task in queue.tasks:
-            if task.status != TASK_APPROVED:
+            if task.status not in {TASK_APPROVED, TASK_SKIPPED}:
                 return task
         return None
 

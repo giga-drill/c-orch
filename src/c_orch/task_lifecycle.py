@@ -31,6 +31,7 @@ from .task_store import (
     TASK_FAILED,
     TASK_PENDING,
     TASK_RUNNING,
+    TASK_SKIPPED,
     TASK_WAITING,
     TaskQueue,
     TaskRecord,
@@ -48,7 +49,9 @@ WAITING_RETRY_TASK = "retry_task"
 WAITING_RESTART = "restart"
 WAITING_DONE = "done"
 WAITING_FAILED = "failed"
+WAITING_SKIPPED = "skipped"
 REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL = "plan_review_outside_proposal_pool"
+REASON_HANDLED_SKIPPED = "handled_skipped"
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,8 @@ def derive_task_progress(
     *,
     active_run: Optional[RunManifest] = None,
 ) -> TaskProgress:
+    if task.status == TASK_SKIPPED:
+        return TaskProgress(status=TASK_SKIPPED, waiting_for=WAITING_SKIPPED, reason=task.reason)
     if active_run is not None:
         waiting_for = derive_run_waiting_for(active_run)
         if active_run.status == RUN_APPROVED:
@@ -109,6 +114,8 @@ def derive_task_progress(
         return TaskProgress(status=TASK_APPROVED, waiting_for=WAITING_DONE)
     if task.status == TASK_FAILED:
         return TaskProgress(status=TASK_FAILED, waiting_for=WAITING_RETRY_TASK, reason=task.reason)
+    if task.status == TASK_SKIPPED:
+        return TaskProgress(status=TASK_SKIPPED, waiting_for=WAITING_SKIPPED, reason=task.reason)
     if task.status == TASK_BLOCKED:
         return TaskProgress(status=TASK_BLOCKED, waiting_for=WAITING_FAILED, reason=task.reason)
     if task.status == TASK_WAITING:
@@ -136,10 +143,10 @@ def reconcile_task_with_active_run(
     if task.status in {TASK_RUNNING, TASK_WAITING, TASK_PENDING} and task.error is not None:
         task.error = None
         changed = True
-    if task.status == TASK_APPROVED and task.completed_at is None:
+    if task.status in {TASK_APPROVED, TASK_SKIPPED} and task.completed_at is None:
         task.completed_at = completed_at
         changed = True
-    if task.status != TASK_APPROVED and task.completed_at is not None:
+    if task.status not in {TASK_APPROVED, TASK_SKIPPED} and task.completed_at is not None:
         task.completed_at = None
         changed = True
     return changed
@@ -184,6 +191,23 @@ def mark_task_for_retry(queue: TaskQueue, *, task_id: str) -> TaskRecord:
     return task
 
 
+def mark_task_handled_skipped(
+    queue: TaskQueue,
+    *,
+    task_id: str,
+    completed_at: Optional[str],
+) -> TaskRecord:
+    task = _find_task(queue, task_id)
+    if task.status != TASK_FAILED:
+        raise ValueError(f"task is not failed: {task_id}")
+    task.status = TASK_SKIPPED
+    task.reason = REASON_HANDLED_SKIPPED
+    task.error = None
+    task.completed_at = completed_at
+    queue.status = derive_queue_status(queue)
+    return task
+
+
 def derive_queue_status(queue: TaskQueue, *, restart_required: bool = False) -> str:
     if any(task.status == TASK_FAILED for task in queue.tasks):
         return QUEUE_FAILED
@@ -191,7 +215,7 @@ def derive_queue_status(queue: TaskQueue, *, restart_required: bool = False) -> 
         return QUEUE_BLOCKED
     if restart_required:
         return QUEUE_RESTART_REQUIRED
-    if queue.tasks and all(task.status == TASK_APPROVED for task in queue.tasks):
+    if queue.tasks and all(task.status in {TASK_APPROVED, TASK_SKIPPED} for task in queue.tasks):
         return QUEUE_APPROVED
     if any(task.status in {TASK_RUNNING, TASK_WAITING} for task in queue.tasks):
         return QUEUE_RUNNING

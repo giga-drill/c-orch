@@ -36,6 +36,7 @@ const statusText: Record<string, string> = {
   APPROVED: "已完成",
   FAILED: "失败",
   BLOCKED: "阻塞",
+  SKIPPED: "已跳过",
   RESTART_REQUIRED: "需要重启",
   NEW: "新建",
   PLANNING: "Planner 方案生成中",
@@ -704,6 +705,7 @@ function QueuePanel({
         <div className="queueStats" aria-label="任务队列统计">
           <span>总数 {summary.total_tasks}</span>
           <span>完成 {summary.completed_tasks}</span>
+          <span>跳过 {summary.skipped_tasks}</span>
           <span>待执行 {summary.pending_tasks}</span>
           <span>失败 {summary.failed_tasks}</span>
         </div>
@@ -776,6 +778,15 @@ function QueuePanel({
                       disabled={taskActionPending}
                     >
                       {pendingAction === "retry-task" ? "重新排队中..." : "重新排队执行"}
+                    </button>
+                  ) : null}
+                  {task.allowed_actions.includes("mark-handled-skipped") ? (
+                    <button
+                      type="button"
+                      onClick={() => runTaskAction(task, "mark-handled-skipped")}
+                      disabled={taskActionPending}
+                    >
+                      {pendingAction === "mark-handled-skipped" ? "标记中..." : "标记为已处理并跳过"}
                     </button>
                   ) : null}
                 </div>

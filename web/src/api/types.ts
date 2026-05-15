@@ -1,5 +1,5 @@
 export type AllowedRunAction = "retry-review" | "retry-verification";
-export type AllowedTaskAction = "retry-task" | "retry-verification";
+export type AllowedTaskAction = "retry-task" | "retry-verification" | "mark-handled-skipped";
 export type AllowedQueueAction = "confirm-runtime-restarted";
 export type AllowedProposalAction = "approve-plan" | "revise-plan";
 
@@ -7,6 +7,7 @@ export interface QueueSummary {
   total_tasks: number;
   approved_tasks: number;
   completed_tasks: number;
+  skipped_tasks: number;
   pending_tasks: number;
   failed_tasks: number;
   running_tasks: number;

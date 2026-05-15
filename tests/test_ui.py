@@ -280,11 +280,12 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["status"], "FAILED")
             self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_task")
             self.assertEqual(payload["tasks"][0]["next_action"], "retry_task")
-            self.assertEqual(payload["tasks"][0]["allowed_actions"], ["retry-task"])
+            self.assertEqual(payload["tasks"][0]["allowed_actions"], ["retry-task", "mark-handled-skipped"])
             self.assertEqual(payload["tasks"][0]["failure_summary"], "Worker crashed before review.")
             self.assertEqual(payload["tasks"][0]["last_error_event"]["type"], "worker_failed")
             self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
             self.assertEqual(payload["summary"]["completed_tasks"], 0)
+            self.assertEqual(payload["summary"]["skipped_tasks"], 0)
             self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(loaded.status, "PENDING")
             self.assertEqual(loaded.tasks[0].status, "RUNNING")
@@ -333,7 +334,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["status"], "FAILED")
             self.assertEqual(
                 payload["tasks"][0]["allowed_actions"],
-                ["retry-verification", "retry-task"],
+                ["retry-verification", "retry-task", "mark-handled-skipped"],
             )
             self.assertEqual(
                 payload["tasks"][0]["failure_summary"],
@@ -593,6 +594,40 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["run_ids"], ["run-1"])
             self.assertEqual(loaded.tasks[0].status, "PENDING")
             self.assertIsNone(loaded.tasks[0].active_run_id)
+
+    def test_task_action_mark_handled_skipped_unblocks_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="FAILED",
+                active_run_id="run-1",
+                run_ids=["run-1"],
+                reason="active_run_failed",
+            )
+            queue_store.save(queue)
+
+            status, payload = task_action(root / "queue.json", "task-001", "mark-handled-skipped")
+            loaded = queue_store.load()
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "task_marked_handled_skipped")
+            self.assertEqual(payload["tasks"][0]["status"], "SKIPPED")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "skipped")
+            self.assertEqual(payload["summary"]["skipped_tasks"], 1)
+            self.assertEqual(payload["summary"]["failed_tasks"], 0)
+            self.assertEqual(payload["summary"]["current_waiting_point"], "planner")
+            self.assertEqual(loaded.status, "PENDING")
+            self.assertEqual(loaded.tasks[0].status, "SKIPPED")
+            self.assertEqual(loaded.tasks[0].run_ids, ["run-1"])
 
     def test_queue_action_confirm_runtime_restarted_clears_restart_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -877,6 +912,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("完整 Planner 方案", app_source)
         self.assertIn("FailurePanel", app_source)
         self.assertIn("失败原因", app_source)
+        self.assertIn("标记为已处理并跳过", app_source)
+        self.assertIn("mark-handled-skipped", app_source)
         self.assertIn("verification-output.txt", app_source)
         self.assertIn("confirm-runtime-restarted", app_source)
         self.assertIn("确认已重启并继续", app_source)

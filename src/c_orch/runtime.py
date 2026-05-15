@@ -39,10 +39,11 @@ from .states import (
 from .task_lifecycle import (
     derive_run_waiting_for,
     derive_task_progress,
+    mark_task_handled_skipped,
     mark_task_for_retry,
     reconcile_queue,
 )
-from .task_store import TASK_FAILED, TASK_PENDING, TaskRecord, TaskQueue, TaskStore
+from .task_store import TASK_FAILED, TASK_PENDING, TASK_SKIPPED, TaskRecord, TaskQueue, TaskStore
 from .worktrees import create_worker_worktree
 
 
@@ -622,7 +623,7 @@ def task_action(
     *,
     runs_dir: Optional[Pathish] = None,
 ) -> RunActionResponse:
-    if action not in {"retry-task", "retry-verification"}:
+    if action not in {"retry-task", "retry-verification", "mark-handled-skipped"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
     queue_file = Path(queue_path).expanduser().resolve()
     store = TaskStore(queue_file)
@@ -660,6 +661,22 @@ def task_action(
             "run_id": task.active_run_id,
         }
         return HTTPStatus.OK, queue_payload
+    if action == "mark-handled-skipped":
+        try:
+            mark_task_handled_skipped(
+                queue,
+                task_id=task_id,
+                completed_at=run_store.now_iso() if runs_dir is not None else None,
+            )
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        store.save(queue)
+        payload = build_queue_payload(queue_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "task_marked_handled_skipped",
+            "task_id": task_id,
+        }
+        return HTTPStatus.OK, payload
     try:
         mark_task_for_retry(queue, task_id=task_id)
     except ValueError as exc:
@@ -1539,14 +1556,16 @@ def _allowed_proposal_actions(status: str, run_summary: Optional[Dict[str, Any]]
 def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(tasks)
     approved = sum(1 for task in tasks if task.get("status") == "APPROVED")
+    skipped = sum(1 for task in tasks if task.get("status") == TASK_SKIPPED)
     pending = sum(1 for task in tasks if task.get("status") == "PENDING")
     failed = sum(1 for task in tasks if task.get("status") == "FAILED")
     running = sum(1 for task in tasks if task.get("status") in {"RUNNING", "WAITING"})
-    current = next((task for task in tasks if task.get("status") != "APPROVED"), None)
+    current = next((task for task in tasks if task.get("status") not in {"APPROVED", TASK_SKIPPED}), None)
     return {
         "total_tasks": total,
         "approved_tasks": approved,
-        "completed_tasks": approved,
+        "completed_tasks": approved + skipped,
+        "skipped_tasks": skipped,
         "pending_tasks": pending,
         "failed_tasks": failed,
         "running_tasks": running,
@@ -1574,6 +1593,7 @@ def _allowed_task_actions(
         if active_run is not None and has_retryable_verification_failure(active_run, events or []):
             actions.append("retry-verification")
         actions.append("retry-task")
+        actions.append("mark-handled-skipped")
         return actions
     return []
 

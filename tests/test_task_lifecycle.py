@@ -9,7 +9,9 @@ from c_orch.task_lifecycle import (
     REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
     WAITING_RESTART,
     WAITING_RETRY_TASK,
+    WAITING_SKIPPED,
     derive_run_waiting_for,
+    mark_task_handled_skipped,
     mark_task_for_retry,
     reconcile_queue,
 )
@@ -18,6 +20,7 @@ from c_orch.task_store import (
     QUEUE_RESTART_REQUIRED,
     TASK_FAILED,
     TASK_PENDING,
+    TASK_SKIPPED,
     TaskStore,
 )
 
@@ -157,6 +160,39 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertEqual(task.run_ids, ["run-1"])
             self.assertIsNone(task.reason)
             self.assertIsNone(task.error)
+
+    def test_mark_task_handled_skipped_stops_blocking_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_FAILED,
+                active_run_id="run-1",
+                run_ids=["run-1"],
+                reason="active_run_failed",
+                error="apply failed",
+            )
+
+            task = mark_task_handled_skipped(queue, task_id="task-001", completed_at="now")
+
+            self.assertEqual(task.status, TASK_SKIPPED)
+            self.assertEqual(task.completed_at, "now")
+            self.assertEqual(task.run_ids, ["run-1"])
+            self.assertEqual(queue.status, "PENDING")
+
+            changed = reconcile_queue(queue, run_loader=lambda _run_id: None, now_iso=lambda: "later")
+
+            self.assertFalse(changed)
+            self.assertEqual(queue.tasks[0].status, TASK_SKIPPED)
+            self.assertEqual(WAITING_SKIPPED, "skipped")
 
 
 if __name__ == "__main__":
