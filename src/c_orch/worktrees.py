@@ -8,6 +8,7 @@ from typing import Iterable, List, Optional, Sequence, Union
 
 
 Pathish = Union[str, Path]
+GENERATED_UNTRACKED_PREFIXES = (".pnpm-store/",)
 
 
 @dataclass(frozen=True)
@@ -101,8 +102,12 @@ def collect_diff_evidence(worktree_path: Pathish, evidence_dir: Pathish) -> Diff
     output_dir = Path(evidence_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    status = _git(["status", "--short"], cwd=worktree)
-    untracked = _git_z(["ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree)
+    status = _filter_generated_status(
+        _git(["status", "--short"], cwd=worktree)
+    )
+    untracked = _filter_generated_paths(
+        _git_z(["ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree)
+    )
     added_intent = False
     try:
         if untracked:
@@ -187,7 +192,7 @@ def apply_diff_evidence_to_repo(
 def collect_repo_changed_paths(repo_path: Pathish) -> List[str]:
     repo = Path(repo_path).expanduser().resolve()
     tracked = _git_z(["diff", "--name-only", "-z", "HEAD", "--"], cwd=repo)
-    untracked = _git_z(["ls-files", "--others", "--exclude-standard", "-z"], cwd=repo)
+    untracked = _filter_generated_paths(_git_z(["ls-files", "--others", "--exclude-standard", "-z"], cwd=repo))
     return sorted(_normalize_path_set([*tracked, *untracked]))
 
 
@@ -488,6 +493,31 @@ def _format_summary(status: str, diff_stat: str) -> str:
             "```",
             "",
         ]
+    )
+
+
+def _filter_generated_paths(paths: Sequence[str]) -> List[str]:
+    return [
+        path
+        for path in paths
+        if not _is_generated_untracked_path(path)
+    ]
+
+
+def _filter_generated_status(status: str) -> str:
+    lines = [
+        line
+        for line in status.splitlines()
+        if not _is_generated_untracked_path(line[3:] if len(line) > 3 else line)
+    ]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _is_generated_untracked_path(path: str) -> bool:
+    normalized = _normalize_repo_path(path)
+    return any(
+        normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+        for prefix in GENERATED_UNTRACKED_PREFIXES
     )
 
 

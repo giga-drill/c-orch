@@ -214,6 +214,12 @@ class UiTests(unittest.TestCase):
             )
             manifest.status = "FAILED"
             run_store.save(manifest)
+            run_store.append_event(
+                manifest.run_id,
+                "worker_failed",
+                "Worker failed",
+                summary="Worker crashed before review.",
+            )
             queue_store.update_task(
                 queue,
                 "task-001",
@@ -231,11 +237,61 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_task")
             self.assertEqual(payload["tasks"][0]["next_action"], "retry_task")
             self.assertEqual(payload["tasks"][0]["allowed_actions"], ["retry-task"])
+            self.assertEqual(payload["tasks"][0]["failure_summary"], "Worker crashed before review.")
+            self.assertEqual(payload["tasks"][0]["last_error_event"]["type"], "worker_failed")
             self.assertEqual(payload["summary"]["current_waiting_point"], "retry_task")
             self.assertEqual(payload["summary"]["completed_tasks"], 0)
             self.assertEqual(payload["summary"]["running_tasks"], 0)
             self.assertEqual(loaded.status, "PENDING")
             self.assertEqual(loaded.tasks[0].status, "RUNNING")
+
+    def test_build_queue_payload_exposes_retry_ci_for_verification_gate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "FAILED"
+            manifest.review = ReviewRecord(decision="accepted", reason="looks good")
+            run_store.save(manifest)
+            run_store.append_event(
+                manifest.run_id,
+                "verification_gate_failed",
+                "Verification gate failed; refusing apply and commit.",
+                summary="1 of 4 verification command(s) failed.",
+            )
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["tasks"][0]["status"], "FAILED")
+            self.assertEqual(
+                payload["tasks"][0]["allowed_actions"],
+                ["retry-verification", "retry-task"],
+            )
+            self.assertEqual(
+                payload["tasks"][0]["failure_summary"],
+                "1 of 4 verification command(s) failed.",
+            )
+            self.assertEqual(
+                payload["tasks"][0]["last_error_event"]["type"],
+                "verification_gate_failed",
+            )
 
     def test_build_queue_payload_derives_planner_review_retry_without_saving(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

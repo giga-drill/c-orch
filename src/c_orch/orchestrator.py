@@ -7,7 +7,11 @@ from typing import Any, Iterable, List, Optional, Protocol, Union
 
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver, SessionResult
-from .failure_policy import has_retryable_review_failure, should_start_replacement_agent
+from .failure_policy import (
+    has_retryable_review_failure,
+    has_retryable_verification_failure,
+    should_start_replacement_agent,
+)
 from .prompts import (
     planner_initial_prompt,
     planner_review_fallback_prompt,
@@ -312,6 +316,37 @@ class RunOrchestrator:
         self._record_terminal_status(manifest, reason="unexpected_review_decision")
         self._save(manifest)
         return manifest
+
+    def retry_verification(self, manifest: RunManifest) -> RunManifest:
+        worker = _single_worker(manifest)
+        if not has_retryable_verification_failure(manifest, self.store.load_events(manifest.run_id)):
+            raise OrchestratorError("run is not waiting for a retryable verification failure")
+        if not manifest.review or manifest.review.decision != "accepted":
+            raise OrchestratorError("cannot retry verification without an accepted Planner review")
+        worktree_path = _required_worktree_path(worker)
+        self._record_event(
+            manifest,
+            "verification_retry_started",
+            "Verification retry started",
+            worker_id=worker.id,
+            attempt=worker.attempt,
+        )
+        evidence = self._collect_evidence(
+            manifest=manifest,
+            worker=worker,
+            worktree_path=worktree_path,
+        )
+        verification = self._run_verification(
+            manifest=manifest,
+            worker=worker,
+            worktree_path=worktree_path,
+        )
+        return self._complete_after_accepted_review(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+            verification=verification,
+        )
 
     def revise_plan(self, manifest: RunManifest, feedback: str) -> RunManifest:
         normalized_feedback = feedback.strip()

@@ -1,5 +1,5 @@
-export type AllowedRunAction = "retry-review";
-export type AllowedTaskAction = "retry-task";
+export type AllowedRunAction = "retry-review" | "retry-verification";
+export type AllowedTaskAction = "retry-task" | "retry-verification";
 export type AllowedQueueAction = "confirm-runtime-restarted";
 export type AllowedProposalAction = "approve-plan" | "revise-plan";
 
@@ -31,6 +31,8 @@ export interface TaskSummary {
   completed_at: string | null;
   reason: string | null;
   error: string | null;
+  failure_summary: string | null;
+  last_error_event: RunEvent | null;
   waiting_for: string;
   next_action: string;
   allowed_actions: AllowedTaskAction[];

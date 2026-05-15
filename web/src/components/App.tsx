@@ -558,6 +558,12 @@ function QueuePanel({
         {visibleTasks.map((task) => {
           const taskRunId = pickTaskRun(task);
           const selected = Boolean(taskRunId && taskRunId === selectedRunId);
+          const failureReason =
+            task.failure_summary ??
+            task.last_error_event?.summary ??
+            task.last_error_event?.message ??
+            task.error ??
+            task.reason;
           return (
             <article key={task.task_id} className={selected ? "taskItem selected" : "taskItem"}>
               <button
@@ -575,14 +581,36 @@ function QueuePanel({
                 <span className="meta">waiting_for: {displayValue(task.waiting_for)}</span>
                 <span className="meta">active_run_id: {displayValue(task.active_run_id)}</span>
               </button>
-              {task.allowed_actions.includes("retry-task") ? (
-                <button
-                  type="button"
-                  onClick={() => runTaskAction(task, "retry-task")}
-                  disabled={taskMutation.isPending}
-                >
-                  {taskMutation.isPending ? "重新排队中..." : "重新排队执行"}
-                </button>
+              {task.status === "FAILED" && failureReason ? (
+                <div className="taskFailure">
+                  <span className="label">失败原因</span>
+                  <span>{displayValue(failureReason)}</span>
+                  {task.last_error_event?.type ? (
+                    <span className="meta">event: {displayValue(task.last_error_event.type)}</span>
+                  ) : null}
+                </div>
+              ) : null}
+              {task.allowed_actions.length ? (
+                <div className="taskActions">
+                  {task.allowed_actions.includes("retry-verification") ? (
+                    <button
+                      type="button"
+                      onClick={() => runTaskAction(task, "retry-verification")}
+                      disabled={taskMutation.isPending}
+                    >
+                      {taskMutation.isPending ? "重跑 CI 中..." : "重新跑 CI"}
+                    </button>
+                  ) : null}
+                  {task.allowed_actions.includes("retry-task") ? (
+                    <button
+                      type="button"
+                      onClick={() => runTaskAction(task, "retry-task")}
+                      disabled={taskMutation.isPending}
+                    >
+                      {taskMutation.isPending ? "重新排队中..." : "重新排队执行"}
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
             </article>
           );
@@ -814,6 +842,11 @@ function ActionBar({
       {actions.includes("retry-review") ? (
         <button type="button" onClick={() => onAction("retry-review")} disabled={isPending}>
           {isPending ? "处理中..." : "重新让 Planner 复核"}
+        </button>
+      ) : null}
+      {actions.includes("retry-verification") ? (
+        <button type="button" onClick={() => onAction("retry-verification")} disabled={isPending}>
+          {isPending ? "重跑 CI 中..." : "重新跑 CI"}
         </button>
       ) : null}
     </section>

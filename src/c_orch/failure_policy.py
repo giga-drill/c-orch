@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .states import REVIEW_ATTEMPT_FAILED_RETRYABLE, RUN_WORK_DONE
+from .states import REVIEW_ATTEMPT_FAILED_RETRYABLE, RUN_FAILED, RUN_WORK_DONE
 
 
 RECOVERY_RETRY_LATER = "retry_later"
@@ -68,6 +68,32 @@ def has_retryable_review_failure_dict(run: dict[str, Any]) -> bool:
         and isinstance(review, dict)
         and isinstance(last_attempt, dict)
         and last_attempt.get("status") == REVIEW_ATTEMPT_FAILED_RETRYABLE
+    )
+
+
+def has_retryable_verification_failure(manifest: Any, events: list[Any]) -> bool:
+    review = getattr(manifest, "review", None)
+    return (
+        getattr(manifest, "status", None) == RUN_FAILED
+        and getattr(review, "decision", None) == "accepted"
+        and _has_verification_gate_failed_event(events)
+    )
+
+
+def has_retryable_verification_failure_dict(run: dict[str, Any], events: list[Any]) -> bool:
+    review = run.get("review")
+    return (
+        run.get("status") == RUN_FAILED
+        and isinstance(review, dict)
+        and review.get("decision") == "accepted"
+        and _has_verification_gate_failed_event(events)
+    )
+
+
+def _has_verification_gate_failed_event(events: list[Any]) -> bool:
+    return any(
+        isinstance(event, dict) and event.get("type") == "verification_gate_failed"
+        for event in events
     )
 
 

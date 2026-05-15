@@ -11,7 +11,12 @@ from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence
 
 from .codex_session_logs import CodexSessionLogStore
 from .drivers import CodexDriver
-from .failure_policy import has_retryable_review_failure, has_retryable_review_failure_dict
+from .failure_policy import (
+    has_retryable_review_failure,
+    has_retryable_review_failure_dict,
+    has_retryable_verification_failure,
+    has_retryable_verification_failure_dict,
+)
 from .proposal_store import (
     PROPOSAL_APPROVED,
     PROPOSAL_FAILED,
@@ -36,7 +41,7 @@ from .task_lifecycle import (
     mark_task_for_retry,
     reconcile_queue,
 )
-from .task_store import TASK_PENDING, TaskRecord, TaskQueue, TaskStore
+from .task_store import TASK_FAILED, TASK_PENDING, TaskRecord, TaskQueue, TaskStore
 from .worktrees import create_worker_worktree
 
 
@@ -44,6 +49,14 @@ Pathish = Union[str, Path]
 RunActionResponse = Optional[Tuple[HTTPStatus, Dict[str, Any]]]
 DriverFactory = Callable[[str], ContextManager[CodexDriver]]
 PROPOSAL_PLANNING_CONCURRENCY = 1
+
+
+class _UnusedCodexDriver:
+    def start_session(self, **_: Any) -> Any:
+        raise RuntimeError("retry-verification does not start Codex sessions")
+
+    def reply(self, **_: Any) -> Any:
+        raise RuntimeError("retry-verification does not call Codex sessions")
 
 
 class COrchRuntime:
@@ -531,9 +544,10 @@ def run_action(
         manifest = store.load(run_id)
     except OSError:
         return None
-    if action not in {"approve-plan", "revise-plan", "retry-review"}:
+    events = store.load_events(run_id)
+    if action not in {"approve-plan", "revise-plan", "retry-review", "retry-verification"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
-    action_error = _validate_run_action(manifest, action)
+    action_error = _validate_run_action(manifest, action, events=events)
     if action_error:
         return HTTPStatus.CONFLICT, {"error": action_error, "status": manifest.status}
     if action == "revise-plan":
@@ -542,30 +556,39 @@ def run_action(
 
     from .orchestrator import OrchestratorConfig, RunOrchestrator
 
-    codex_path = (
-        manifest.codex_binary_path
-        or manifest.planner.codex_binary_path
-    )
-    if not codex_path:
-        return HTTPStatus.BAD_REQUEST, {"error": "missing codex binary path"}
-
     try:
-        factory = driver_factory or _default_driver_factory
-        with factory(codex_path) as driver:
+        if action == "retry-verification":
             orchestrator = RunOrchestrator(
                 store=store,
-                driver=driver,
+                driver=_UnusedCodexDriver(),
                 config=OrchestratorConfig(
                     require_plan_approval=True,
-                    approve_plan=action == "approve-plan",
                 ),
             )
-            if action == "revise-plan":
-                manifest = orchestrator.revise_plan(manifest, feedback.strip())
-            elif action == "retry-review":
-                manifest = orchestrator.retry_review(manifest)
-            else:
-                manifest = orchestrator.run(manifest)
+            manifest = orchestrator.retry_verification(manifest)
+        else:
+            codex_path = (
+                manifest.codex_binary_path
+                or manifest.planner.codex_binary_path
+            )
+            if not codex_path:
+                return HTTPStatus.BAD_REQUEST, {"error": "missing codex binary path"}
+            factory = driver_factory or _default_driver_factory
+            with factory(codex_path) as driver:
+                orchestrator = RunOrchestrator(
+                    store=store,
+                    driver=driver,
+                    config=OrchestratorConfig(
+                        require_plan_approval=True,
+                        approve_plan=action == "approve-plan",
+                    ),
+                )
+                if action == "revise-plan":
+                    manifest = orchestrator.revise_plan(manifest, feedback.strip())
+                elif action == "retry-review":
+                    manifest = orchestrator.retry_review(manifest)
+                else:
+                    manifest = orchestrator.run(manifest)
     except Exception as exc:
         store.append_event(
             run_id,
@@ -593,7 +616,7 @@ def task_action(
     *,
     runs_dir: Optional[Pathish] = None,
 ) -> RunActionResponse:
-    if action != "retry-task":
+    if action not in {"retry-task", "retry-verification"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
     queue_file = Path(queue_path).expanduser().resolve()
     store = TaskStore(queue_file)
@@ -604,6 +627,33 @@ def task_action(
     if runs_dir is not None:
         run_store = RunStore(Path(runs_dir).expanduser().resolve())
         reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    if action == "retry-verification":
+        if runs_dir is None:
+            return HTTPStatus.BAD_REQUEST, {"error": "missing runs_dir"}
+        try:
+            task = _find_task_record(queue, task_id)
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        if task.status != TASK_FAILED:
+            return HTTPStatus.CONFLICT, {"error": f"task is not failed: {task_id}"}
+        if not task.active_run_id:
+            return HTTPStatus.CONFLICT, {"error": f"task has no active run: {task_id}"}
+        result = run_action(runs_dir, task.active_run_id, "retry-verification")
+        if result is None:
+            return None
+        status, payload = result
+        if int(status) >= 400:
+            return status, payload
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+        store.save(queue)
+        queue_payload = build_queue_payload(queue_file, runs_dir=runs_dir)
+        queue_payload["transition"] = {
+            "type": "task_verification_retried",
+            "task_id": task_id,
+            "run_id": task.active_run_id,
+        }
+        return HTTPStatus.OK, queue_payload
     try:
         mark_task_for_retry(queue, task_id=task_id)
     except ValueError as exc:
@@ -1221,7 +1271,12 @@ def _state_version(
     return max(mtimes, default=0)
 
 
-def _validate_run_action(manifest: Any, action: Any) -> Optional[str]:
+def _validate_run_action(
+    manifest: Any,
+    action: Any,
+    *,
+    events: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
     if action in {"approve-plan", "revise-plan"}:
         if manifest.status != RUN_PLAN_REVIEW_REQUIRED:
             return f"{action} requires PLAN_REVIEW_REQUIRED, current status is {manifest.status}"
@@ -1231,6 +1286,11 @@ def _validate_run_action(manifest: Any, action: Any) -> Optional[str]:
             return "Planner plan is already approved"
     if action == "retry-review" and not has_retryable_review_failure(manifest):
         return f"retry-review requires saved failed review evidence, current status is {manifest.status}"
+    if action == "retry-verification" and not has_retryable_verification_failure(manifest, events or []):
+        return (
+            "retry-verification requires an accepted Planner review with a failed "
+            f"verification gate, current status is {manifest.status}"
+        )
     return None
 
 
@@ -1268,7 +1328,8 @@ def _summarize_manifest(
     plan_revisions = [_dict_value(revision) for revision in _list_value(manifest.get("plan_revisions"))]
     latest_plan_revision = plan_revisions[-1] if plan_revisions else {}
     status = str(manifest.get("status", "UNKNOWN"))
-    allowed_actions = _allowed_run_actions(manifest)
+    event_list = events or []
+    allowed_actions = _allowed_run_actions(manifest, event_list)
     evidence_files = _unique_strings(
         _flatten(
             [
@@ -1313,8 +1374,8 @@ def _summarize_manifest(
         "review_attempt_count": len(review_attempts),
         "last_review_attempt": _review_attempt_summary(review_attempts[-1]) if review_attempts else None,
         "can_retry_review": has_retryable_review_failure_dict(manifest),
-        "last_event": _event_summary(events[-1]) if events else None,
-        "last_error_event": _last_error_event(events or []),
+        "last_event": _event_summary(event_list[-1]) if event_list else None,
+        "last_error_event": _last_error_event(event_list),
         "plan": {
             "approval_status": plan.get("approval_status"),
             "summary": plan.get("summary"),
@@ -1343,13 +1404,16 @@ def reconcile_queue_file(*, queue_path: Pathish, runs_dir: Pathish) -> bool:
 
 def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, Any]:
     active_run = None
+    active_run_events: List[Dict[str, Any]] = []
     if run_store is not None and task.active_run_id:
         try:
             active_run = run_store.load(task.active_run_id)
+            active_run_events = run_store.load_events(task.active_run_id)
         except OSError:
             active_run = None
     task_cwd = task.cwd or (active_run.cwd if active_run is not None else None)
     progress = derive_task_progress(task, active_run=active_run)
+    last_error_event = _last_error_event(active_run_events)
     return {
         "task_id": task.task_id,
         "title": task.title,
@@ -1361,9 +1425,11 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "completed_at": task.completed_at,
         "reason": task.reason,
         "error": task.error,
+        "failure_summary": _task_failure_summary(task, last_error_event),
+        "last_error_event": last_error_event,
         "waiting_for": progress.waiting_for,
         "next_action": progress.waiting_for,
-        "allowed_actions": _allowed_task_actions(task),
+        "allowed_actions": _allowed_task_actions(task, active_run=active_run, events=active_run_events),
     }
 
 
@@ -1474,17 +1540,47 @@ def _queue_summary(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _allowed_run_actions(manifest: Dict[str, Any]) -> List[str]:
+def _allowed_run_actions(manifest: Dict[str, Any], events: List[Dict[str, Any]]) -> List[str]:
     actions: List[str] = []
     if has_retryable_review_failure_dict(manifest):
         actions.append("retry-review")
+    if has_retryable_verification_failure_dict(manifest, events):
+        actions.append("retry-verification")
     return actions
 
 
-def _allowed_task_actions(task: Any) -> List[str]:
+def _allowed_task_actions(
+    task: Any,
+    *,
+    active_run: Optional[RunManifest] = None,
+    events: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
     if getattr(task, "status", None) == "FAILED":
-        return ["retry-task"]
+        actions: List[str] = []
+        if active_run is not None and has_retryable_verification_failure(active_run, events or []):
+            actions.append("retry-verification")
+        actions.append("retry-task")
+        return actions
     return []
+
+
+def _task_failure_summary(task: Any, last_error_event: Optional[Dict[str, Any]]) -> Optional[str]:
+    if last_error_event:
+        for key in ("summary", "message", "reason", "error"):
+            value = last_error_event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for value in (getattr(task, "error", None), getattr(task, "reason", None)):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _find_task_record(queue: TaskQueue, task_id: str) -> TaskRecord:
+    for task in queue.tasks:
+        if task.task_id == task_id:
+            return task
+    raise ValueError(f"task not found: {task_id}")
 
 
 def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:

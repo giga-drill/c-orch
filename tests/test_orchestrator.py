@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from c_orch.drivers import SessionResult
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
-from c_orch.run_store import RunStore
+from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.verification import CommandVerification, VerificationReport
 from c_orch.worktrees import ApplyReport, DiffEvidence, GitCommitReport, create_worker_worktree
 
@@ -1167,6 +1167,61 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("verification_gate_failed", [event["type"] for event in events])
             self.assertEqual(events[-1]["type"], "run_terminal_status")
             self.assertEqual(events[-1]["reason"], "verification_failed")
+
+    def test_retry_verification_after_accepted_review_applies_without_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            manifest.status = "FAILED"
+            manifest.planner.status = "FAILED"
+            manifest.plan = PlanRecord(
+                summary="Plan it",
+                worker_prompt="Build the feature",
+                approval_status="approved",
+            )
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[],
+            )
+            manifest.workers[0].status = "FAILED"
+            manifest.workers[0].result = json.loads(_worker_result())
+            manifest.verification_commands = ["python -m unittest"]
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "verification_gate_failed",
+                "Verification gate failed",
+                summary="1 of 1 verification command(s) failed.",
+            )
+            driver = FakeDriver(start_results=[], reply_results=[])
+            evidence = FakeEvidenceCollector()
+            verification = FakeVerificationRunner()
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=evidence,
+                diff_applier=applier,
+                git_committer=committer,
+                verification_runner=verification,
+            ).retry_verification(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(result.planner.status, "APPROVED")
+            self.assertEqual(result.workers[0].status, "APPROVED")
+            self.assertEqual(len(driver.start_calls), 0)
+            self.assertEqual(len(driver.reply_calls), 0)
+            self.assertEqual(len(evidence.calls), 1)
+            self.assertEqual(len(verification.calls), 1)
+            self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(len(committer.calls), 1)
+            events = store.load_events(manifest.run_id)
+            self.assertIn("verification_retry_started", [event["type"] for event in events])
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "APPROVED")
 
     def test_commit_failure_after_apply_marks_run_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
