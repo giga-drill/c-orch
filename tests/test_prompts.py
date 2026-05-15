@@ -75,6 +75,13 @@ class PromptTests(unittest.TestCase):
             self.assertIn("handled by c-orch", value)
             self.assertIn("docs/architecture-principles.md", value)
             self.assertIn("Review target workspace:", value)
+            self.assertIn("Review depth requirements:", value)
+            self.assertIn("decide from the diff alone", value)
+            self.assertIn("Trace affected call sites", value)
+            self.assertIn("original business expectations", value)
+            self.assertIn("every acceptance criterion", value)
+            self.assertIn("regressions outside the edited lines", value)
+            self.assertIn("reason` field must briefly state what you inspected", value)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,23 @@ pnpm commands such as `pnpm --dir web run typecheck` and
 install command unless the task explicitly requires testing dependency setup."""
 
 
+PLANNER_REVIEW_INSTRUCTIONS = """Review depth requirements:
+- Use the review target workspace as the source of truth. Inspect the changed
+  files, surrounding code, and relevant docs/tests in that workspace; do not
+  decide from the diff alone.
+- Trace affected call sites, UI/API flows, state transitions, and persistence
+  paths when the change touches them. Check whether the new behavior preserves
+  the original business expectations that still matter.
+- Compare the result against the original user task, the approved plan, and
+  every acceptance criterion. Verification output is supporting evidence, not a
+  substitute for code and behavior review.
+- Look for regressions outside the edited lines: stale state, broken retries,
+  missing error handling, concurrency/order issues, data compatibility, and
+  mismatches with project architecture.
+- The `reason` field must briefly state what you inspected and why the work is
+  accepted or what concrete gap requires revision."""
+
+
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:
     return f"""You are the Planner for c-orch.
 
@@ -108,6 +125,8 @@ Full git diff file: {diff_path}
 Verification summary:
 {test_summary}{test_path_line}
 
+{PLANNER_REVIEW_INSTRUCTIONS}
+
 Review the Worker result against the task workspace and the evidence above. Do
 not judge by reading another checkout of the same repository. Decide whether the
 Worker satisfies the acceptance criteria. There are only two business outcomes:
@@ -196,6 +215,8 @@ Full git diff file: {diff_path}
 
 Verification summary:
 {test_summary}{test_path_line}
+
+{PLANNER_REVIEW_INSTRUCTIONS}
 
 Review the Worker result against the task workspace and the evidence above. Do
 not judge by reading another checkout of the same repository. Decide whether the
