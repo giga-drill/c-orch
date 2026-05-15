@@ -78,6 +78,13 @@ function newestFirst<T>(items?: T[] | null): T[] {
 }
 
 const QUEUE_PREVIEW_LIMIT = 5;
+const MANUAL_REFRESH_TIMEOUT_MS = 5000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
 
 function pickTaskRun(task: TaskSummary): string | null {
   if (task.active_run_id) return task.active_run_id;
@@ -140,6 +147,7 @@ export function App() {
   const stateQuery = useDashboardStateQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [manualSelection, setManualSelection] = useState(false);
+  const [isManualRefresh, setIsManualRefresh] = useState(false);
   const detailRef = useRef<HTMLElement | null>(null);
   const runtimeGenerationRef = useRef<string | null>(null);
   const queuePayload = stateQuery.data?.queue;
@@ -191,16 +199,27 @@ export function App() {
   }
 
   async function refreshAll() {
-    await refreshDashboardQueries(queryClient, selectedRunId);
-    await Promise.all([
-      queryClient.refetchQueries({ queryKey: queryKeys.state }),
-      queryClient.refetchQueries({ queryKey: queryKeys.proposals }),
-      queryClient.refetchQueries({ queryKey: queryKeys.queue }),
-      queryClient.refetchQueries({ queryKey: queryKeys.runs }),
-      selectedRunId
-        ? queryClient.refetchQueries({ queryKey: queryKeys.run(selectedRunId) })
-        : Promise.resolve(),
-    ]);
+    if (isManualRefresh) return;
+    setIsManualRefresh(true);
+    try {
+      await Promise.race([
+        (async () => {
+          await refreshDashboardQueries(queryClient, selectedRunId);
+          await Promise.all([
+            queryClient.refetchQueries({ queryKey: queryKeys.state }),
+            queryClient.refetchQueries({ queryKey: queryKeys.proposals }),
+            queryClient.refetchQueries({ queryKey: queryKeys.queue }),
+            queryClient.refetchQueries({ queryKey: queryKeys.runs }),
+            selectedRunId
+              ? queryClient.refetchQueries({ queryKey: queryKeys.run(selectedRunId) })
+              : Promise.resolve(),
+          ]);
+        })(),
+        delay(MANUAL_REFRESH_TIMEOUT_MS),
+      ]);
+    } finally {
+      setIsManualRefresh(false);
+    }
   }
 
   const isLoading = stateQuery.isLoading;
@@ -217,9 +236,9 @@ export function App() {
           <button
             type="button"
             onClick={refreshAll}
-            disabled={stateQuery.isFetching}
+            disabled={isManualRefresh}
           >
-            刷新
+            {isManualRefresh ? "刷新中..." : "刷新"}
           </button>
         </header>
         {error ? <div className="error">{error.message}</div> : null}
