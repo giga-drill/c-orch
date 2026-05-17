@@ -1190,10 +1190,16 @@ class OrchestratorTests(unittest.TestCase):
                 worker_prompt="Build the feature",
                 approval_status="approved",
             )
+            evidence_dir = root / "runs" / manifest.run_id / "evidence"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = evidence_dir / "git-diff-summary.md"
+            patch_path = evidence_dir / "git-diff.patch"
+            summary_path.write_text("reviewed diff summary\n", encoding="utf-8")
+            patch_path.write_text("diff --git a/reviewed.py b/reviewed.py\n", encoding="utf-8")
             manifest.review = ReviewRecord(
                 decision="accepted",
                 reason="looks good",
-                evidence_files=[],
+                evidence_files=[str(summary_path), str(patch_path)],
             )
             manifest.workers[0].status = "FAILED"
             manifest.workers[0].result = json.loads(_worker_result())
@@ -1225,9 +1231,10 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.workers[0].status, "APPROVED")
             self.assertEqual(len(driver.start_calls), 0)
             self.assertEqual(len(driver.reply_calls), 0)
-            self.assertEqual(len(evidence.calls), 1)
+            self.assertEqual(len(evidence.calls), 0)
             self.assertEqual(len(verification.calls), 1)
             self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(applier.calls[0]["diff"].patch, "diff --git a/reviewed.py b/reviewed.py\n")
             self.assertEqual(len(committer.calls), 1)
             events = store.load_events(manifest.run_id)
             self.assertIn("verification_retry_started", [event["type"] for event in events])

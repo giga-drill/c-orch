@@ -84,13 +84,19 @@ class _FakeProposalPlanner:
         self.fail_by_run_id = fail_by_run_id or {}
         self.run_calls = 0
         self.run_ids: List[str] = []
+        self.lock = threading.Lock()
         self.started = threading.Event()
+        self.two_started = threading.Event()
 
     def run(self, manifest):  # type: ignore[no-untyped-def]
-        self.run_calls += 1
-        self.run_ids.append(manifest.run_id)
-        self.started.set()
-        should_block = self.block_event is not None and (not self.block_first_call or self.run_calls == 1)
+        with self.lock:
+            self.run_calls += 1
+            run_calls = self.run_calls
+            self.run_ids.append(manifest.run_id)
+            self.started.set()
+            if len(self.run_ids) >= 2:
+                self.two_started.set()
+        should_block = self.block_event is not None and (not self.block_first_call or run_calls == 1)
         if should_block:
             self.block_event.wait(timeout=5)
         failure_message = self.fail_by_run_id.get(manifest.run_id)
@@ -564,6 +570,47 @@ class RuntimeTests(unittest.TestCase):
                 ["PLAN_REVIEW_REQUIRED", "WAITING_WORKSPACE", "WAITING_WORKSPACE"],
             )
             self.assertEqual(proposals[1]["waiting_for"], "workspace_lane")
+
+    def test_proposal_planning_runs_different_workspaces_in_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            _init_git_repo(repo_a)
+            _init_git_repo(repo_b)
+            block_event = threading.Event()
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store, block_event=block_event)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(
+                    _scheduler_config(root),
+                    cwd=repo_a,
+                    max_parallel_workspaces=2,
+                ),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status_a, _payload_a = runtime.create_proposal("Task A", "Do task A", str(repo_a))
+            self.assertEqual(int(status_a), 200)
+            self.assertTrue(fake_planner.started.wait(timeout=1.0))
+            status_b, _payload_b = runtime.create_proposal("Task B", "Do task B", str(repo_b))
+            self.assertEqual(int(status_b), 200)
+
+            self.assertTrue(fake_planner.two_started.wait(timeout=2.0))
+            self.assertEqual(fake_planner.run_calls, 2)
+            self.assertEqual(runtime._active_proposal_lane_count(), 2)
+
+            block_event.set()
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(
+                [proposal["status"] for proposal in proposals],
+                ["PLAN_REVIEW_REQUIRED", "PLAN_REVIEW_REQUIRED"],
+            )
 
     def test_create_proposal_with_task_cwd_uses_target_repo_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

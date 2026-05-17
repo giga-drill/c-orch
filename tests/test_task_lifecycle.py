@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from c_orch.task_lifecycle import (
 )
 from c_orch.task_store import (
     QUEUE_FAILED,
+    QUEUE_PENDING,
     QUEUE_RESTART_REQUIRED,
     TASK_FAILED,
     TASK_PENDING,
@@ -193,6 +195,55 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertFalse(changed)
             self.assertEqual(queue.tasks[0].status, TASK_SKIPPED)
             self.assertEqual(WAITING_SKIPPED, "skipped")
+
+    def test_failed_task_blocks_pending_task_in_same_git_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            subdir = repo / "web"
+            subdir.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            (repo / "README.md").write_text("repo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(subdir)},
+                ]
+            )
+            task_store.update_task(queue, "task-001", status=TASK_FAILED, reason="active_run_failed")
+            reconcile_queue(queue, run_loader=lambda _run_id: None, now_iso=lambda: "now")
+
+            self.assertEqual(queue.status, QUEUE_FAILED)
+
+    def test_failed_task_does_not_block_pending_task_in_different_git_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            for repo in (repo_a, repo_b):
+                repo.mkdir()
+                subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+                subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+                (repo / "README.md").write_text("repo\n", encoding="utf-8")
+                subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo_a)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(repo_b)},
+                ]
+            )
+            task_store.update_task(queue, "task-001", status=TASK_FAILED, reason="active_run_failed")
+            reconcile_queue(queue, run_loader=lambda _run_id: None, now_iso=lambda: "now")
+
+            self.assertEqual(queue.status, QUEUE_PENDING)
 
 
 if __name__ == "__main__":

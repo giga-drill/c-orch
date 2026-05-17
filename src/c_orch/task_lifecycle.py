@@ -37,6 +37,7 @@ from .task_store import (
     TaskQueue,
     TaskRecord,
 )
+from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 WAITING_PLANNER = "planner"
@@ -234,6 +235,10 @@ def derive_queue_status(queue: TaskQueue, *, restart_required: bool = False) -> 
 def _task_lane_key(task: TaskRecord) -> str:
     if not task.cwd:
         return "__default__"
+    try:
+        return str(canonical_git_root(task.cwd))
+    except WorkspaceResolutionError:
+        pass
     try:
         return str(Path(task.cwd).expanduser().resolve())
     except OSError:

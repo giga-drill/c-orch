@@ -15,7 +15,14 @@ Choose verification commands from the target workspace's lockfiles. c-orch owns
 dependency setup before verification. If a web frontend has pnpm-lock.yaml, use
 pnpm commands such as `pnpm --dir web run typecheck` and
 `pnpm --dir web run build` instead of npm; do not include a separate pnpm
-install command unless the task explicitly requires testing dependency setup."""
+install command unless the task explicitly requires testing dependency setup.
+
+`verification_commands` are hard gates: c-orch will run each command after
+Worker completion, and any non-zero exit blocks apply/commit and fails the run.
+Only include commands whose failure should block the task for this specific
+workspace and request. Put optional diagnostics, package-build checks, or
+environment/tooling probes in the worker_prompt or risk_notes instead of
+`verification_commands`."""
 
 
 PLANNER_REVIEW_INSTRUCTIONS = """Review depth requirements:

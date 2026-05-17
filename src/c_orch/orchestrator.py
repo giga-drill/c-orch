@@ -333,11 +333,9 @@ class RunOrchestrator:
             worker_id=worker.id,
             attempt=worker.attempt,
         )
-        evidence = self._collect_evidence(
-            manifest=manifest,
-            worker=worker,
-            worktree_path=worktree_path,
-        )
+        evidence = _evidence_from_review_record(manifest.review)
+        worker.evidence_files = _append_unique(worker.evidence_files, evidence.evidence_files)
+        self._save(manifest)
         verification = self._run_verification(
             manifest=manifest,
             worker=worker,
@@ -1282,8 +1280,8 @@ def _worker_status_from_result(result: WorkerResult) -> str:
 
 
 def _evidence_from_review_record(review: ReviewRecord) -> DiffEvidence:
-    summary_path = _first_existing_path(review.evidence_files, "git-diff-summary.md")
-    patch_path = _first_existing_path(review.evidence_files, "git-diff.patch")
+    summary_path = _required_evidence_path(review.evidence_files, "git-diff-summary.md")
+    patch_path = _required_evidence_path(review.evidence_files, "git-diff.patch")
     summary = _read_text(summary_path)
     patch = _read_text(patch_path)
     return DiffEvidence(
@@ -1302,6 +1300,13 @@ def _verification_from_review_record(review: ReviewRecord) -> VerificationReport
         output_path=output_path,
         results=[],
     )
+
+
+def _required_evidence_path(paths: List[str], name: str) -> Path:
+    path = _first_existing_path(paths, name)
+    if path.name != name or not path.exists():
+        raise OrchestratorError(f"accepted Planner review is missing required evidence file: {name}")
+    return path
 
 
 def _first_existing_path(paths: List[str], name: str) -> Path:

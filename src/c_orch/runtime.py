@@ -105,6 +105,8 @@ class COrchRuntime:
         self._proposal_dispatch_lock = threading.RLock()
         self._queue_lane_threads: Dict[str, threading.Thread] = {}
         self._queue_lane_threads_lock = threading.RLock()
+        self._proposal_lane_threads: Dict[str, threading.Thread] = {}
+        self._proposal_lane_threads_lock = threading.RLock()
         self._drivers: Dict[str, Any] = {}
         self._dispatch_thread: Optional[threading.Thread] = None
         self._proposal_dispatch_thread: Optional[threading.Thread] = None
@@ -134,6 +136,7 @@ class COrchRuntime:
         proposal_dispatch_running = (
             self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive()
         )
+        proposal_dispatch_running = proposal_dispatch_running or self._active_proposal_lane_count() > 0
         return dashboard_payloads.build_state_payload(
             runs_dir=self.runs_dir,
             queue_path=self.queue_path,
@@ -153,6 +156,13 @@ class COrchRuntime:
                 lane: thread for lane, thread in self._queue_lane_threads.items() if thread.is_alive()
             }
             return len(self._queue_lane_threads)
+
+    def _active_proposal_lane_count(self) -> int:
+        with self._proposal_lane_threads_lock:
+            self._proposal_lane_threads = {
+                lane: thread for lane, thread in self._proposal_lane_threads.items() if thread.is_alive()
+            }
+            return len(self._proposal_lane_threads)
 
     def run_action(
         self,
@@ -317,12 +327,38 @@ class COrchRuntime:
 
     def wait_for_proposal_dispatch(self, timeout: Optional[float] = None) -> bool:
         """Wait for the current background proposal dispatcher pass; mainly used by tests."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
         with self._proposal_dispatch_lock:
             thread = self._proposal_dispatch_thread
-        if thread is None:
-            return True
-        thread.join(timeout=timeout)
-        return not thread.is_alive()
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
+        while True:
+            with self._proposal_dispatch_lock:
+                dispatch_thread = self._proposal_dispatch_thread
+            if dispatch_thread is not None and dispatch_thread.is_alive():
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                dispatch_thread.join(timeout=remaining)
+                if deadline is not None and time.monotonic() >= deadline and dispatch_thread.is_alive():
+                    return False
+                continue
+            with self._proposal_lane_threads_lock:
+                threads = [thread for thread in self._proposal_lane_threads.values() if thread.is_alive()]
+            if not threads:
+                time.sleep(0.05)
+                with self._proposal_dispatch_lock:
+                    dispatch_thread = self._proposal_dispatch_thread
+                with self._proposal_lane_threads_lock:
+                    threads = [thread for thread in self._proposal_lane_threads.values() if thread.is_alive()]
+                if (dispatch_thread is None or not dispatch_thread.is_alive()) and not threads:
+                    return True
+                continue
+            for lane_thread in threads:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                lane_thread.join(timeout=remaining)
+                if deadline is not None and time.monotonic() >= deadline and lane_thread.is_alive():
+                    return False
 
     def close(self) -> None:
         with self._driver_lock:
@@ -639,14 +675,34 @@ class COrchRuntime:
     def _run_proposal_dispatch_loop(self) -> None:
         if self.proposals_path is None or self._scheduler_config is None:
             return
-        while True:
-            limit = max(1, self._scheduler_config.max_parallel_workspaces)
-            self._promote_waiting_workspace_proposals(limit=limit)
-            claimed = self._claim_planning_proposals(limit=limit)
-            if not claimed:
-                return
-            for proposal_id, run_id in claimed:
-                self._process_proposal_planning_job(proposal_id=proposal_id, run_id=run_id)
+        self._start_available_proposal_lanes()
+
+    def _start_available_proposal_lanes(self) -> None:
+        if self.proposals_path is None or self._scheduler_config is None:
+            return
+        max_parallel = max(1, self._scheduler_config.max_parallel_workspaces)
+        active_count = self._active_proposal_lane_count()
+        if active_count >= max_parallel:
+            return
+        self._promote_waiting_workspace_proposals(limit=max_parallel - active_count)
+        active_count = self._active_proposal_lane_count()
+        if active_count >= max_parallel:
+            return
+        claimed = self._claim_planning_proposals(limit=max_parallel - active_count)
+        for lane_id, proposal_id, run_id in claimed:
+            with self._proposal_lane_threads_lock:
+                existing = self._proposal_lane_threads.get(lane_id)
+                if existing is not None and existing.is_alive():
+                    continue
+                self._proposal_lane_threads.pop(lane_id, None)
+                thread = threading.Thread(
+                    target=self._run_proposal_lane_worker,
+                    name=f"c-orch-proposal-lane-{proposal_id}",
+                    kwargs={"lane_id": lane_id, "proposal_id": proposal_id, "run_id": run_id},
+                    daemon=True,
+                )
+                self._proposal_lane_threads[lane_id] = thread
+            thread.start()
 
     def _promote_waiting_workspace_proposals(self, *, limit: int) -> int:
         if self.proposals_path is None or self._scheduler_config is None:
@@ -716,16 +772,19 @@ class COrchRuntime:
                 proposal_store.save(pool)
         return promoted
 
-    def _claim_planning_proposals(self, *, limit: int) -> List[Tuple[str, str]]:
+    def _claim_planning_proposals(self, *, limit: int) -> List[Tuple[str, str, str]]:
         if self.proposals_path is None:
             return []
+        active_lanes = set(self._active_proposal_lane_ids())
         with self._action_lock:
             proposal_store = ProposalStore(self.proposals_path)
             try:
                 pool = proposal_store.load()
             except (OSError, ValueError):
                 return []
-            claimed: List[Tuple[str, str]] = []
+            run_store = RunStore(self.runs_dir)
+            claimed: List[Tuple[str, str, str]] = []
+            seen_lanes: set[str] = set()
             for proposal in pool.proposals:
                 if len(claimed) >= limit:
                     break
@@ -733,8 +792,53 @@ class COrchRuntime:
                     continue
                 if not proposal.run_id:
                     continue
-                claimed.append((proposal.proposal_id, proposal.run_id))
+                lane_id = self._proposal_workspace_id(proposal, run_store=run_store)
+                if lane_id in active_lanes or lane_id in seen_lanes:
+                    continue
+                seen_lanes.add(lane_id)
+                if _proposal_is_blocked_by_other_lane_item(
+                    proposal=proposal,
+                    proposals=pool.proposals,
+                    queue_path=self.queue_path,
+                    run_store=run_store,
+                ):
+                    continue
+                claimed.append((lane_id, proposal.proposal_id, proposal.run_id))
             return claimed
+
+    def _active_proposal_lane_ids(self) -> List[str]:
+        with self._proposal_lane_threads_lock:
+            self._proposal_lane_threads = {
+                lane: thread for lane, thread in self._proposal_lane_threads.items() if thread.is_alive()
+            }
+            return list(self._proposal_lane_threads)
+
+    def _proposal_workspace_id(self, proposal: ProposalRecord, *, run_store: RunStore) -> str:
+        proposal_cwd = proposal.cwd
+        if not proposal_cwd and proposal.run_id:
+            try:
+                proposal_cwd = run_store.load(proposal.run_id).cwd
+            except OSError:
+                proposal_cwd = None
+        if not proposal_cwd and self._scheduler_config is not None:
+            proposal_cwd = str(self._scheduler_config.cwd)
+        if proposal_cwd:
+            try:
+                return str(canonical_git_root(proposal_cwd))
+            except WorkspaceResolutionError:
+                return str(Path(proposal_cwd).expanduser().resolve())
+        return "__default__"
+
+    def _run_proposal_lane_worker(self, *, lane_id: str, proposal_id: str, run_id: str) -> None:
+        try:
+            self._process_proposal_planning_job(proposal_id=proposal_id, run_id=run_id)
+        except Exception as exc:
+            self._last_proposal_dispatch_error = str(exc)
+        finally:
+            with self._proposal_lane_threads_lock:
+                self._proposal_lane_threads.pop(lane_id, None)
+            self.dispatch_proposals_async()
+            self.dispatch_queue_async()
 
     def _process_proposal_planning_job(self, *, proposal_id: str, run_id: str) -> None:
         if self._scheduler_config is None:
@@ -755,7 +859,7 @@ class COrchRuntime:
             return
         planner_error: Optional[Exception] = None
         try:
-            with self._driver_context(self._scheduler_config.codex_binary_path) as driver:
+            with self._fresh_driver_context(self._scheduler_config.codex_binary_path) as driver:
                 orchestrator = self._build_proposal_orchestrator(run_store=run_store, driver=driver)
                 manifest = orchestrator.run(manifest)
         except Exception as exc:
@@ -1366,6 +1470,34 @@ def _workspace_lane_is_locked(
         if task_cwd and _same_workspace(task_cwd, workspace_root):
             return True
     return False
+
+
+def _proposal_is_blocked_by_other_lane_item(
+    *,
+    proposal: ProposalRecord,
+    proposals: Sequence[ProposalRecord],
+    queue_path: Optional[Pathish],
+    run_store: RunStore,
+) -> bool:
+    proposal_cwd = proposal.cwd
+    if not proposal_cwd and proposal.run_id:
+        try:
+            proposal_cwd = run_store.load(proposal.run_id).cwd
+        except OSError:
+            proposal_cwd = None
+    if not proposal_cwd:
+        return False
+    try:
+        workspace_root = canonical_git_root(proposal_cwd)
+    except WorkspaceResolutionError:
+        return False
+    return _workspace_lane_is_locked(
+        workspace_root=workspace_root,
+        proposals=proposals,
+        queue_path=queue_path,
+        run_store=run_store,
+        ignore_proposal_id=proposal.proposal_id,
+    )
 
 
 def _same_workspace(path: Pathish, workspace_root: Path) -> bool:

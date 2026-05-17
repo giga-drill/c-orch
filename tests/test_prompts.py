@@ -27,6 +27,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Keep JSON keys", prompt)
         self.assertIn("docs/architecture-principles.md", prompt)
         self.assertIn("docs/mcp-orchestrator-design.md", prompt)
+        self.assertIn("verification_commands` are hard gates", prompt)
+        self.assertIn("any non-zero exit blocks apply/commit", prompt)
+        self.assertIn("optional diagnostics", prompt)
 
     def test_planner_revision_prompt_requests_chinese_plan_content(self) -> None:
         prompt = planner_revision_prompt(human_feedback="请缩小范围")
@@ -38,6 +41,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("risk_notes", prompt)
         self.assertIn("Keep JSON keys", prompt)
         self.assertIn("docs/architecture-principles.md", prompt)
+        self.assertIn("verification_commands` are hard gates", prompt)
 
     def test_worker_prompt_includes_project_context_docs(self) -> None:
         prompt = worker_prompt(
