@@ -11,6 +11,7 @@ and verification evidence, and asks the Planner to approve or request changes.
 
 - [MCP-based orchestrator technical design](docs/mcp-orchestrator-design.md)
 - [Architecture principles and state model](docs/architecture-principles.md)
+- [Automation roadmap](docs/automation-roadmap.md)
 
 ## Workflow Shape
 

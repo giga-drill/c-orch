@@ -51,6 +51,9 @@ Codex thread ids, and Codex disk sessions remain the recovery source of truth.
 For self-modifying runs, `c-orch supervise-ui` is the preferred wrapper around
 the dashboard server. The supervisor owns process restart, while the restarted
 backend still owns clearing the restart gate through the normal queue action.
+Automatic restart should eventually use a drain protocol: stop starting new
+lanes, let active lanes reach durable checkpoints or persist leases, restart
+the child runtime, reconcile persisted state, and then clear the restart gate.
 
 Worker worktrees isolate code changes, not package caches. Verification must run
 inside the worker worktree, but dependency setup should follow the target
@@ -65,6 +68,10 @@ Planner and Worker own semantic work:
   decisions.
 - Planner and Worker for the same run use one isolated task workspace.
 - Worker implements the approved plan inside that task workspace.
+- c-orch may insert deterministic quality tools, such as a Codex code review
+  gate, inside the Planner review phase. These tools produce evidence for the
+  Planner; they do not create an additional business outcome beyond
+  `accepted` and `revision_requested`.
 
 The task workspace is currently implemented as the single Worker's git
 worktree. Planner sessions must start in the same workspace before planning, and
@@ -140,6 +147,11 @@ the session through `codex exec resume <session-id>`. If that resume path also
 fails, c-orch may start a replacement Planner or Worker using saved manifest,
 evidence, and the same concrete prompt. The run state should not become a
 special exception state.
+Longer term, recovery policy should be centralized and phase-durable: runner
+subprocesses may keep Agent work alive across runtime restart, but they are not
+the source of truth. Run manifests, events, queue/proposal records, evidence,
+and phase checkpoints must be persisted before c-orch treats a phase as
+complete.
 
 Task state is the user-level lifecycle; run state is one execution attempt.
 One task can have multiple run attempts over time. `active_run_id` points to the

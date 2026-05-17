@@ -61,6 +61,8 @@ class PromptTests(unittest.TestCase):
             diff_summary="diff",
             diff_path="runs/r/evidence/git-diff.patch",
             test_summary="tests passed",
+            code_review_summary="codex review found 1 issue",
+            code_review_output_path="runs/r/evidence/codex-review-output.txt",
         )
         fallback = planner_review_fallback_prompt(
             user_task="Task",
@@ -71,6 +73,8 @@ class PromptTests(unittest.TestCase):
             diff_summary="diff",
             diff_path="runs/r/evidence/git-diff.patch",
             test_summary="tests passed",
+            code_review_summary="codex review found 1 issue",
+            code_review_output_path="runs/r/evidence/codex-review-output.txt",
         )
 
         for value in (prompt, fallback):
@@ -86,6 +90,9 @@ class PromptTests(unittest.TestCase):
             self.assertIn("every acceptance criterion", value)
             self.assertIn("regressions outside the edited lines", value)
             self.assertIn("reason` field must briefly state what you inspected", value)
+            self.assertIn("Code review summary:", value)
+            self.assertIn("codex review found 1 issue", value)
+            self.assertIn("codex-review-output.txt", value)
 
 
 if __name__ == "__main__":

@@ -686,6 +686,9 @@ def run_resume(args: argparse.Namespace) -> int:
             print("No usable Codex binary found. Run `c-orch doctor` for details.", file=sys.stderr)
             return 1
         codex_path = report.selected.path
+    manifest.codex_binary_path = codex_path
+    manifest.planner.codex_binary_path = codex_path
+    store.save(manifest)
 
     try:
         with McpCodexDriver(codex_bin=codex_path) as driver:

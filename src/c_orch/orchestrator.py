@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Protocol, Union
 
+from .codex_review import CodexReviewReport, run_codex_uncommitted_review
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver, SessionResult
 from .failure_policy import (
@@ -91,6 +92,18 @@ class VerificationRunner(Protocol):
         ...
 
 
+class CodeReviewRunner(Protocol):
+    def __call__(
+        self,
+        *,
+        cwd: Pathish,
+        evidence_dir: Pathish,
+        codex_binary_path: Optional[str] = None,
+        patch_path: Optional[Pathish] = None,
+    ) -> CodexReviewReport:
+        ...
+
+
 class DiffApplier(Protocol):
     def __call__(
         self,
@@ -155,6 +168,7 @@ class RunOrchestrator:
         repo_staged_paths_collector: RepoStagedPathsCollector = collect_repo_staged_paths,
         git_committer: GitCommitter = commit_applied_changes,
         verification_runner: VerificationRunner = run_verification_commands,
+        code_review_runner: Optional[CodeReviewRunner] = None,
         config: Optional[OrchestratorConfig] = None,
     ) -> None:
         self.store = store
@@ -165,6 +179,7 @@ class RunOrchestrator:
         self.repo_staged_paths_collector = repo_staged_paths_collector
         self.git_committer = git_committer
         self.verification_runner = verification_runner
+        self.code_review_runner = code_review_runner or run_codex_uncommitted_review
         self.config = config or OrchestratorConfig()
         if self.config.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -666,9 +681,8 @@ class RunOrchestrator:
             worker_attempt=worker.attempt,
         )
         manifest.planner.status = RUN_REVIEWING
-        self._save(manifest)
-        evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
         workspace_path = _required_worktree_path(worker)
+        evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
         attempt = ReviewAttemptRecord(
             id=f"review-{len(manifest.review_attempts) + 1}",
             worker_id=worker.id,
@@ -689,40 +703,66 @@ class RunOrchestrator:
         )
 
         try:
+            code_review = self._run_code_review(
+                manifest=manifest,
+                worker=worker,
+                attempt=attempt,
+                worktree_path=workspace_path,
+                evidence=evidence,
+            )
+        except Exception as exc:
+            self._mark_retryable_review_failure(
+                manifest=manifest,
+                worker=worker,
+                attempt=attempt,
+                evidence_files=evidence_files,
+                error=str(exc),
+                reason="code_review_failed",
+                event_type="code_review_failed",
+                event_message="Code review failed before Planner review",
+            )
+            return None
+
+        evidence_files = _append_unique(evidence_files, code_review.evidence_files)
+        attempt.evidence_files = list(evidence_files)
+        self._save(manifest)
+        if code_review.status == "error":
+            detail = (
+                f"status={code_review.status} returncode={code_review.returncode} "
+                f"summary={code_review.summary}"
+            )
+            self._mark_retryable_review_failure(
+                manifest=manifest,
+                worker=worker,
+                attempt=attempt,
+                evidence_files=evidence_files,
+                error=detail,
+                reason="code_review_error",
+                event_type="code_review_failed",
+                event_message="Code review infra error blocked Planner review",
+            )
+            return None
+
+        try:
             decision = self._request_review_decision(
                 manifest=manifest,
                 plan=plan,
                 worker_result=worker_result,
                 evidence=evidence,
                 verification=verification,
+                code_review=code_review,
                 review_workspace=workspace_path,
             )
         except Exception as exc:
-            attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
-            attempt.completed_at = self.store.now_iso()
-            attempt.error = str(exc)
-            self._transition_status(
-                manifest,
-                RUN_WORK_DONE,
-                worker_id=worker.id,
-                worker_attempt=worker.attempt,
-                reason="planner_review_failed",
-            )
-            manifest.planner.status = (
-                RUN_PLAN_APPROVED
-                if manifest.plan and manifest.plan.approval_status in {"approved", "not_required"}
-                else RUN_PLAN_READY
-            )
-            worker.status = WORKER_DONE if worker.status == WORKER_DONE else worker.status
-            manifest.review = ReviewRecord(evidence_files=evidence_files)
-            self._save(manifest)
-            self._record_event(
-                manifest,
-                "planner_review_failed",
-                "Planner review failed after Worker evidence was saved",
-                review_attempt_id=attempt.id,
-                worker_id=worker.id,
+            self._mark_retryable_review_failure(
+                manifest=manifest,
+                worker=worker,
+                attempt=attempt,
+                evidence_files=evidence_files,
                 error=str(exc),
+                reason="planner_review_failed",
+                event_type="planner_review_failed",
+                event_message="Planner review failed after Worker evidence was saved",
             )
             return None
 
@@ -749,6 +789,46 @@ class RunOrchestrator:
         )
         return decision
 
+    def _mark_retryable_review_failure(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        attempt: ReviewAttemptRecord,
+        evidence_files: List[str],
+        error: str,
+        reason: str,
+        event_type: str,
+        event_message: str,
+    ) -> None:
+        attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
+        attempt.completed_at = self.store.now_iso()
+        attempt.error = error
+        attempt.evidence_files = list(evidence_files)
+        self._transition_status(
+            manifest,
+            RUN_WORK_DONE,
+            worker_id=worker.id,
+            worker_attempt=worker.attempt,
+            reason=reason,
+        )
+        manifest.planner.status = (
+            RUN_PLAN_APPROVED
+            if manifest.plan and manifest.plan.approval_status in {"approved", "not_required"}
+            else RUN_PLAN_READY
+        )
+        worker.status = WORKER_DONE if worker.status == WORKER_DONE else worker.status
+        manifest.review = ReviewRecord(evidence_files=evidence_files)
+        self._save(manifest)
+        self._record_event(
+            manifest,
+            event_type,
+            event_message,
+            review_attempt_id=attempt.id,
+            worker_id=worker.id,
+            error=error,
+        )
+
     def _request_review_decision(
         self,
         *,
@@ -757,6 +837,7 @@ class RunOrchestrator:
         worker_result: WorkerResult,
         evidence: DiffEvidence,
         verification: VerificationReport,
+        code_review: CodexReviewReport,
         review_workspace: str,
     ) -> ReviewDecision:
         if not manifest.planner.thread_id:
@@ -769,6 +850,8 @@ class RunOrchestrator:
             diff_path=str(evidence.patch_path),
             test_summary=verification.summary,
             test_output_path=str(verification.output_path),
+            code_review_summary=code_review.summary,
+            code_review_output_path=str(code_review.output_path),
         )
         previous_thread_id = manifest.planner.thread_id
         try:
@@ -805,6 +888,8 @@ class RunOrchestrator:
                     diff_path=str(evidence.patch_path),
                     test_summary=verification.summary,
                     test_output_path=str(verification.output_path),
+                    code_review_summary=code_review.summary,
+                    code_review_output_path=str(code_review.output_path),
                 ),
                 sandbox=self.config.sandbox,
                 approval_policy=self.config.approval_policy,
@@ -821,6 +906,25 @@ class RunOrchestrator:
                 new_thread_id=fallback_result.thread_id,
             )
             return ReviewDecision.parse(fallback_result.content)
+
+    def _run_code_review(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        attempt: ReviewAttemptRecord,
+        worktree_path: str,
+        evidence: DiffEvidence,
+    ) -> CodexReviewReport:
+        report = self.code_review_runner(
+            cwd=worktree_path,
+            evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
+            codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
+            patch_path=evidence.patch_path,
+        )
+        worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
+        self._save(manifest)
+        return report
 
     def _record_review_recovery_event(
         self,
@@ -1363,6 +1467,13 @@ def _changed_paths_from_patch(patch: str) -> List[str]:
             seen.add(candidate)
             paths.append(candidate)
     return paths
+
+
+def _effective_codex_binary_path(manifest: RunManifest, driver: CodexDriver) -> Optional[str]:
+    driver_path = getattr(driver, "codex_bin", None)
+    if isinstance(driver_path, str) and driver_path.strip():
+        return driver_path
+    return manifest.codex_binary_path or manifest.planner.codex_binary_path
 
 
 def _verification_has_failures(report: VerificationReport) -> bool:

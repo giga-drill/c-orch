@@ -109,8 +109,16 @@ def planner_review_prompt(
     diff_path: str,
     test_summary: str,
     test_output_path: Optional[str] = None,
+    code_review_summary: Optional[str] = None,
+    code_review_output_path: Optional[str] = None,
 ) -> str:
     test_path_line = f"\nFull test output file: {test_output_path}" if test_output_path else ""
+    review_summary = code_review_summary or "Code review was not available."
+    review_path_line = (
+        f"\nCode review output file: {code_review_output_path}"
+        if code_review_output_path
+        else ""
+    )
     return f"""You are the Planner reviewing a Worker result for c-orch.
 
 {PROJECT_CONTEXT_INSTRUCTIONS}
@@ -131,6 +139,9 @@ Full git diff file: {diff_path}
 
 Verification summary:
 {test_summary}{test_path_line}
+
+Code review summary:
+{review_summary}{review_path_line}
 
 {PLANNER_REVIEW_INSTRUCTIONS}
 
@@ -190,9 +201,17 @@ def planner_review_fallback_prompt(
     diff_path: str,
     test_summary: str,
     test_output_path: Optional[str] = None,
+    code_review_summary: Optional[str] = None,
+    code_review_output_path: Optional[str] = None,
 ) -> str:
     criteria = "\n".join(f"- {item}" for item in acceptance_criteria)
     test_path_line = f"\nVerification output path: {test_output_path}" if test_output_path else ""
+    review_summary = code_review_summary or "Code review was not available."
+    review_path_line = (
+        f"\nCode review output path: {code_review_output_path}"
+        if code_review_output_path
+        else ""
+    )
     return f"""You are a fallback Planner reviewer for c-orch.
 
 The original Planner thread is not recoverable. You are only reviewing the
@@ -222,6 +241,9 @@ Full git diff file: {diff_path}
 
 Verification summary:
 {test_summary}{test_path_line}
+
+Code review summary:
+{review_summary}{review_path_line}
 
 {PLANNER_REVIEW_INSTRUCTIONS}
 

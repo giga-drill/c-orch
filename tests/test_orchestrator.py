@@ -7,10 +7,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from c_orch.codex_review import CodexReviewReport
 from c_orch.drivers import SessionResult
+from c_orch.failure_policy import has_retryable_review_failure
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.verification import CommandVerification, VerificationReport
@@ -87,7 +90,7 @@ class FakeEvidenceCollector:
         summary_path = evidence_dir / "git-diff-summary.md"
         patch_path = evidence_dir / "git-diff.patch"
         summary = f"summary for {Path(worktree_path).name}"
-        patch = "diff --git a/file b/file\n"
+        patch = ""
         summary_path.write_text(summary, encoding="utf-8")
         patch_path.write_text(patch, encoding="utf-8")
         self.calls.append(
@@ -174,6 +177,123 @@ class FakeFailingVerificationRunner:
                     summary="fake failed",
                 )
             ],
+        )
+
+
+class FakeCodeReviewRunner:
+    def __init__(self, *, summary: str = "Codex review completed successfully.") -> None:
+        self.summary = summary
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        cwd: str,
+        evidence_dir: Path,
+        codex_binary_path: Optional[str] = None,
+        patch_path: Optional[Path] = None,
+    ) -> CodexReviewReport:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        output_path = evidence_dir / "codex-review-output.txt"
+        result_path = evidence_dir / "codex-review-result.json"
+        output_path.write_text("fake codex review output\n", encoding="utf-8")
+        result_path.write_text('{"status":"passed"}\n', encoding="utf-8")
+        self.calls.append(
+            {
+                "cwd": Path(cwd),
+                "evidence_dir": evidence_dir,
+                "codex_binary_path": codex_binary_path,
+                "patch_path": Path(patch_path) if patch_path is not None else None,
+            }
+        )
+        return CodexReviewReport(
+            summary=self.summary,
+            output_path=output_path,
+            result_path=result_path,
+            status="passed",
+            returncode=0,
+            command="codex review --uncommitted",
+        )
+
+
+class FakeCodeReviewInfraErrorRunner:
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        cwd: str,
+        evidence_dir: Path,
+        codex_binary_path: Optional[str] = None,
+        patch_path: Optional[Path] = None,
+    ) -> CodexReviewReport:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        output_path = evidence_dir / "codex-review-output.txt"
+        result_path = evidence_dir / "codex-review-result.json"
+        output_path.write_text("fake codex review infra error\n", encoding="utf-8")
+        result_path.write_text('{"status":"error"}\n', encoding="utf-8")
+        self.calls.append(
+            {
+                "cwd": Path(cwd),
+                "evidence_dir": evidence_dir,
+                "codex_binary_path": codex_binary_path,
+                "patch_path": Path(patch_path) if patch_path is not None else None,
+            }
+        )
+        return CodexReviewReport(
+            summary="Codex review could not start because the Codex binary was not found.",
+            output_path=output_path,
+            result_path=result_path,
+            status="error",
+            returncode=None,
+            command="codex review --uncommitted",
+        )
+
+
+class CheckpointingCodeReviewRunner:
+    def __init__(self, *, store: RunStore, run_id: str) -> None:
+        self.store = store
+        self.run_id = run_id
+        self.calls: List[Dict[str, Any]] = []
+        self.saved_statuses: List[str] = []
+        self.saved_attempt_statuses: List[str] = []
+
+    def __call__(
+        self,
+        *,
+        cwd: str,
+        evidence_dir: Path,
+        codex_binary_path: Optional[str] = None,
+        patch_path: Optional[Path] = None,
+    ) -> CodexReviewReport:
+        saved = self.store.load(self.run_id)
+        self.saved_statuses.append(saved.status)
+        if saved.review_attempts:
+            self.saved_attempt_statuses.append(saved.review_attempts[-1].status)
+        self.calls.append(
+            {
+                "cwd": Path(cwd),
+                "evidence_dir": Path(evidence_dir),
+                "codex_binary_path": codex_binary_path,
+                "patch_path": Path(patch_path) if patch_path is not None else None,
+            }
+        )
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        output_path = evidence_dir / "codex-review-output.txt"
+        result_path = evidence_dir / "codex-review-result.json"
+        output_path.write_text("checkpoint runner output\n", encoding="utf-8")
+        result_path.write_text('{"status":"passed"}\n', encoding="utf-8")
+        return CodexReviewReport(
+            summary="Codex review completed successfully.",
+            output_path=output_path,
+            result_path=result_path,
+            status="passed",
+            returncode=0,
+            command="codex review --uncommitted",
         )
 
 
@@ -529,6 +649,14 @@ class FallbackWorkerReworkDriver:
 
 
 class OrchestratorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._code_review_patch = mock.patch(
+            "c_orch.orchestrator.run_codex_uncommitted_review",
+            FakeCodeReviewRunner(),
+        )
+        self._code_review_patch.start()
+        self.addCleanup(self._code_review_patch.stop)
+
     def test_approved_flow_updates_manifest_and_uses_worker_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -537,6 +665,7 @@ class OrchestratorTests(unittest.TestCase):
             manifest.planner.service_tier = "fast"
             manifest.workers[0].reasoning_effort = "medium"
             manifest.workers[0].service_tier = "flex"
+            manifest.codex_binary_path = "/bin/custom-codex"
             driver = FakeDriver(
                 start_results=[
                     _session("planner-thread", _planner_plan()),
@@ -546,6 +675,7 @@ class OrchestratorTests(unittest.TestCase):
             )
             evidence = FakeEvidenceCollector()
             verification = FakeVerificationRunner()
+            code_review = FakeCodeReviewRunner()
             applier = FakeDiffApplier()
 
             result = RunOrchestrator(
@@ -554,6 +684,7 @@ class OrchestratorTests(unittest.TestCase):
                 evidence_collector=evidence,
                 diff_applier=applier,
                 verification_runner=verification,
+                code_review_runner=code_review,
                 config=OrchestratorConfig(controller_repo_path=manifest.cwd),
             ).run(manifest)
 
@@ -581,6 +712,8 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("summary for worker-1", driver.reply_calls[0]["prompt"])
             self.assertIn("All fake verification passed.", driver.reply_calls[0]["prompt"])
             self.assertIn("verification-output.txt", driver.reply_calls[0]["prompt"])
+            self.assertIn("Code review summary:", driver.reply_calls[0]["prompt"])
+            self.assertIn("codex-review-output.txt", driver.reply_calls[0]["prompt"])
             self.assertEqual(evidence.calls[0]["worktree_path"], worktree)
             self.assertEqual(
                 evidence.calls[0]["evidence_dir"],
@@ -592,16 +725,25 @@ class OrchestratorTests(unittest.TestCase):
                 verification.calls[0]["evidence_dir"],
                 store.run_dir(manifest.run_id) / "evidence" / "attempt-1",
             )
+            self.assertEqual(code_review.calls[0]["cwd"], worktree)
+            self.assertEqual(
+                code_review.calls[0]["evidence_dir"],
+                store.run_dir(manifest.run_id) / "evidence" / "attempt-1" / "review-1",
+            )
+            self.assertEqual(code_review.calls[0]["codex_binary_path"], "/bin/custom-codex")
+            self.assertTrue(str(code_review.calls[0]["patch_path"]).endswith("git-diff.patch"))
             self.assertIsNotNone(result.review)
             self.assertEqual(result.review.decision, "accepted")
-            self.assertEqual(len(result.review.evidence_files), 7)
+            self.assertGreaterEqual(len(result.review.evidence_files), 9)
+            self.assertTrue(any(path.endswith("codex-review-output.txt") for path in result.review.evidence_files))
+            self.assertTrue(any(path.endswith("codex-review-result.json") for path in result.review.evidence_files))
             self.assertEqual(result.review_attempts[0].workspace_path, str(worktree))
             self.assertEqual(result.review_attempts[0].worker_attempt, 1)
             self.assertIn("git-commit-hash.txt", result.review.evidence_files[-1])
             self.assertFalse(result.requires_restart)
             self.assertIsNone(result.restart_reason)
             self.assertEqual(result.restart_paths, [])
-            self.assertEqual(len(result.workers[0].evidence_files), 7)
+            self.assertGreaterEqual(len(result.workers[0].evidence_files), 9)
             self.assertEqual(len(applier.calls), 1)
             self.assertEqual(applier.calls[0]["target_repo_path"], Path(manifest.cwd))
             self.assertEqual(
@@ -624,7 +766,7 @@ class OrchestratorTests(unittest.TestCase):
             loaded = store.load(manifest.run_id)
             self.assertEqual(loaded.status, "APPROVED")
             self.assertEqual(loaded.review.decision, "accepted")
-            self.assertEqual(len(loaded.review.evidence_files), 7)
+            self.assertGreaterEqual(len(loaded.review.evidence_files), 9)
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
             self.assertEqual(loaded.restart_paths, [])
@@ -657,6 +799,101 @@ class OrchestratorTests(unittest.TestCase):
             phase_names = [segment["phase"] for segment in result.timing.get("segments", [])]
             self.assertIn("planning", phase_names)
             self.assertIn("worker_execution", phase_names)
+
+    def test_code_review_uses_effective_driver_codex_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            manifest.codex_binary_path = "/stale/codex"
+            store.save(manifest)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            driver.codex_bin = "/effective/codex"
+            code_review = FakeCodeReviewRunner()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=code_review,
+                diff_applier=FakeDiffApplier(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(code_review.calls[0]["codex_binary_path"], "/effective/codex")
+
+    def test_code_review_error_blocks_planner_review_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            code_review = FakeCodeReviewInfraErrorRunner()
+            applier = FakeDiffApplier()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=code_review,
+                diff_applier=applier,
+            ).run(manifest)
+
+            self.assertEqual(result.status, "WORK_DONE")
+            self.assertEqual(result.planner.status, "PLAN_APPROVED")
+            self.assertEqual(result.workers[0].status, "DONE")
+            self.assertEqual(len(driver.reply_calls), 0)
+            self.assertEqual(len(applier.calls), 0)
+            self.assertTrue(has_retryable_review_failure(result))
+            self.assertIsNotNone(result.review)
+            self.assertTrue(any(path.endswith("codex-review-output.txt") for path in result.review.evidence_files))
+            self.assertTrue(any(path.endswith("codex-review-result.json") for path in result.review.evidence_files))
+            self.assertEqual(result.review_attempts[-1].status, "FAILED_RETRYABLE")
+            self.assertIn("status=error", result.review_attempts[-1].error or "")
+
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertIn("planner_review_start", event_types)
+            self.assertIn("code_review_failed", event_types)
+            self.assertNotIn("planner_review_completed", event_types)
+
+    def test_review_checkpoint_is_saved_before_code_review_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            code_review = CheckpointingCodeReviewRunner(store=store, run_id=manifest.run_id)
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=code_review,
+                diff_applier=FakeDiffApplier(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(code_review.saved_statuses, ["REVIEWING"])
+            self.assertEqual(code_review.saved_attempt_statuses, ["ACTIVE"])
 
     def test_plan_review_required_pauses_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,7 +1119,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("attempt-1", result.review_attempts[0].evidence_files[0])
             self.assertIn("attempt-2", result.review_attempts[1].evidence_files[0])
             self.assertEqual(len(verification.calls), 2)
-            self.assertEqual(len(result.workers[0].evidence_files), 10)
+            self.assertGreaterEqual(len(result.workers[0].evidence_files), 14)
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-commit-hash.txt", result.review.evidence_files[-1])
 
@@ -1484,6 +1721,19 @@ class OrchestratorTests(unittest.TestCase):
                 [attempt.status for attempt in result.review_attempts],
                 ["FAILED_RETRYABLE", "ACCEPTED"],
             )
+            first_review_output = next(
+                path
+                for path in result.review_attempts[0].evidence_files
+                if path.endswith("codex-review-output.txt")
+            )
+            second_review_output = next(
+                path
+                for path in result.review_attempts[1].evidence_files
+                if path.endswith("codex-review-output.txt")
+            )
+            self.assertIn("review-1", Path(first_review_output).parts)
+            self.assertIn("review-2", Path(second_review_output).parts)
+            self.assertNotEqual(first_review_output, second_review_output)
 
     def test_retry_review_revision_requested_records_revision_wait_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1695,13 +1945,17 @@ def _create_manifest(root: Path):
     _git(repo, ["config", "user.name", "c-orch test"])
     _git(repo, ["add", "."])
     _git(repo, ["commit", "-m", "initial"])
-    worktree = root / "worktrees" / "run" / "worker-1"
-    worktree.mkdir(parents=True)
     manifest = store.create_run(
         cwd=repo,
         user_task="Implement feature X",
         planner_model="planner-model",
         worker_model="worker-model",
+    )
+    worktree = create_worker_worktree(
+        repo_path=repo,
+        worktrees_dir=root / "worktrees",
+        run_id=manifest.run_id,
+        worker_id="worker-1",
     )
     manifest.workers[0].worktree_path = str(worktree)
     store.save(manifest)
