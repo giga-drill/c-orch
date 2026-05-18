@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 
 from c_orch.failure_policy import (
@@ -29,6 +30,7 @@ from c_orch.failure_policy import (
     classify_operation_failure,
     classify_retry_task_decision,
     classify_retry_verification_action,
+    classify_retry_backoff_decision,
     classify_retryable_review_failure,
     classify_session_recovery_result,
     classify_verification_gate_failure,
@@ -76,6 +78,90 @@ class FailurePolicyTests(unittest.TestCase):
         self.assertTrue(decision.automatic)
         self.assertEqual(decision.category, CATEGORY_TRANSIENT_INFRASTRUCTURE)
         self.assertEqual(decision.attempt, 2)
+        self.assertEqual(decision.retry_attempt, 1)
+        self.assertEqual(decision.retry_budget, 3)
+        self.assertFalse(decision.budget_exhausted)
+        self.assertIsNone(decision.next_retry_at)
+        self.assertEqual(decision.backoff_reason, "legacy_retry_immediate")
+
+    def test_retryable_review_failure_backoff_not_ready_requires_wait(self) -> None:
+        manifest = SimpleNamespace(
+            status="WORK_DONE",
+            review=SimpleNamespace(evidence_files=["git-diff.patch"]),
+            review_attempts=[
+                SimpleNamespace(
+                    status="FAILED_RETRYABLE",
+                    error="Timed out waiting for MCP server output",
+                    reason="planner_review_failed",
+                    retry_attempt=1,
+                    retry_budget=3,
+                    next_retry_at="2026-05-19T10:00:30+00:00",
+                    backoff_reason="retry_backoff_30s",
+                    retry_budget_exhausted=False,
+                )
+            ],
+        )
+        decision = classify_retryable_review_failure(
+            manifest,
+            source=SOURCE_QUEUE_SCHEDULER,
+            now=datetime.fromisoformat("2026-05-19T10:00:05+00:00"),
+        )
+        assert decision is not None
+        self.assertFalse(decision.automatic)
+        self.assertTrue(decision.requires_human)
+        self.assertEqual(decision.next_retry_at, "2026-05-19T10:00:30+00:00")
+        self.assertEqual(decision.backoff_reason, "retry_backoff_30s")
+        self.assertFalse(decision.budget_exhausted)
+
+    def test_retryable_review_failure_budget_exhausted_stops_automatic_retry(self) -> None:
+        manifest = SimpleNamespace(
+            status="WORK_DONE",
+            review=SimpleNamespace(evidence_files=["git-diff.patch"]),
+            review_attempts=[
+                SimpleNamespace(
+                    status="FAILED_RETRYABLE",
+                    error="Session not found for thread_id: planner-thread",
+                    reason="planner_review_failed",
+                    retry_attempt=3,
+                    retry_budget=3,
+                    next_retry_at=None,
+                    backoff_reason="retry_budget_exhausted",
+                    retry_budget_exhausted=True,
+                )
+            ],
+        )
+        decision = classify_retryable_review_failure(
+            manifest,
+            source=SOURCE_QUEUE_SCHEDULER,
+            now=datetime.fromisoformat("2026-05-19T10:00:05+00:00"),
+        )
+        assert decision is not None
+        self.assertFalse(decision.automatic)
+        self.assertTrue(decision.requires_human)
+        self.assertTrue(decision.budget_exhausted)
+        self.assertEqual(decision.retry_attempt, 3)
+        self.assertEqual(decision.retry_budget, 3)
+
+    def test_retry_backoff_decision_ready_when_now_past_deadline(self) -> None:
+        manifest = SimpleNamespace(
+            status="WORK_DONE",
+            review=SimpleNamespace(evidence_files=["git-diff.patch"]),
+            review_attempts=[
+                SimpleNamespace(
+                    status="FAILED_RETRYABLE",
+                    completed_at="2026-05-19T10:00:00+00:00",
+                )
+            ],
+        )
+        decision = classify_retry_backoff_decision(
+            manifest,
+            now=datetime.fromisoformat("2026-05-19T10:00:10+00:00"),
+        )
+        assert decision is not None
+        self.assertTrue(decision.ready)
+        self.assertFalse(decision.budget_exhausted)
+        self.assertEqual(decision.retry_attempt, 1)
+        self.assertEqual(decision.retry_budget, 3)
 
     def test_session_resume_result_is_classified(self) -> None:
         result = SimpleNamespace(raw={"resumedWithCodexExec": True})

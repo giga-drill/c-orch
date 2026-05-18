@@ -146,6 +146,11 @@ class ReviewAttemptRecord:
     summary: Optional[str] = None
     next_worker_prompt: Optional[str] = None
     error: Optional[str] = None
+    retry_attempt: Optional[int] = None
+    retry_budget: Optional[int] = None
+    next_retry_at: Optional[str] = None
+    backoff_reason: Optional[str] = None
+    retry_budget_exhausted: Optional[bool] = None
     evidence_files: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -163,6 +168,11 @@ class ReviewAttemptRecord:
             "summary": self.summary,
             "next_worker_prompt": self.next_worker_prompt,
             "error": self.error,
+            "retry_attempt": self.retry_attempt,
+            "retry_budget": self.retry_budget,
+            "next_retry_at": self.next_retry_at,
+            "backoff_reason": self.backoff_reason,
+            "retry_budget_exhausted": self.retry_budget_exhausted,
             "evidence_files": list(self.evidence_files),
         }
 
@@ -184,6 +194,17 @@ class ReviewAttemptRecord:
             summary=data.get("summary"),
             next_worker_prompt=data.get("next_worker_prompt"),
             error=data.get("error"),
+            retry_attempt=int(data["retry_attempt"])
+            if data.get("retry_attempt") is not None
+            else None,
+            retry_budget=int(data["retry_budget"])
+            if data.get("retry_budget") is not None
+            else None,
+            next_retry_at=data.get("next_retry_at"),
+            backoff_reason=data.get("backoff_reason"),
+            retry_budget_exhausted=bool(data["retry_budget_exhausted"])
+            if data.get("retry_budget_exhausted") is not None
+            else None,
             evidence_files=_list_of_strings(data.get("evidence_files")),
         )
 

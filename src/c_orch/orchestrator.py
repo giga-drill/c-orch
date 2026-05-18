@@ -11,6 +11,7 @@ from .codex_review import CodexReviewReport, run_codex_uncommitted_review
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver, SessionResult
 from .failure_policy import (
+    DEFAULT_RETRY_BUDGET,
     FailurePolicyDecision,
     SOURCE_ORCHESTRATOR,
     classify_apply_failure,
@@ -20,6 +21,7 @@ from .failure_policy import (
     has_retryable_review_failure,
     has_retryable_verification_failure,
     classify_operation_failure,
+    classify_retry_backoff_decision,
     classify_retryable_review_failure,
     classify_session_recovery_result,
     classify_verification_gate_failure,
@@ -1089,6 +1091,17 @@ class RunOrchestrator:
         )
         worker.status = WORKER_DONE if worker.status == WORKER_DONE else worker.status
         manifest.review = ReviewRecord(evidence_files=evidence_files)
+        attempt.retry_attempt = sum(
+            1 for item in manifest.review_attempts if item.status == REVIEW_ATTEMPT_FAILED_RETRYABLE
+        )
+        attempt.retry_budget = DEFAULT_RETRY_BUDGET
+        retry_backoff = classify_retry_backoff_decision(manifest)
+        if retry_backoff is not None:
+            attempt.retry_attempt = retry_backoff.retry_attempt
+            attempt.retry_budget = retry_backoff.retry_budget
+            attempt.next_retry_at = retry_backoff.next_retry_at
+            attempt.backoff_reason = retry_backoff.backoff_reason
+            attempt.retry_budget_exhausted = retry_backoff.budget_exhausted
         self._save(manifest)
         self._record_event(
             manifest,

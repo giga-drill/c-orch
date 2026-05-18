@@ -708,9 +708,31 @@ class COrchRuntime:
                 if action != "accepted_terminalization_reconcile" and (
                     retry_review_decision is not None
                     and retry_review_decision.recovery_action == "retry_review"
-                    and retry_review_decision.automatic
                 ):
-                    action = "retry_review"
+                    if retry_review_decision.automatic:
+                        action = "retry_review"
+                    else:
+                        reconcile_task_with_active_run(
+                            task,
+                            active_run=manifest,
+                            active_run_events=active_events,
+                            completed_at=run_store.now_iso(),
+                        )
+                        task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_WAITING,
+                            error=None,
+                            reason=_retry_waiting_reason(retry_review_decision),
+                        )
+                        reconcile_queue(
+                            queue,
+                            run_loader=run_store.load,
+                            run_events_loader=run_store.load_events,
+                            now_iso=run_store.now_iso,
+                        )
+                        task_store.save(queue)
+                        return
                 elif action != "accepted_terminalization_reconcile" and manifest.status == RUN_PLAN_APPROVED:
                     action = "run"
                 elif action != "accepted_terminalization_reconcile":
@@ -826,6 +848,11 @@ class COrchRuntime:
                         "Queue scheduler started automatic planner review retry",
                         source=SOURCE_QUEUE_SCHEDULER,
                         action="retry-review",
+                        retry_attempt=retry_review_decision.retry_attempt if retry_review_decision else None,
+                        retry_budget=retry_review_decision.retry_budget if retry_review_decision else None,
+                        next_retry_at=retry_review_decision.next_retry_at if retry_review_decision else None,
+                        backoff_reason=retry_review_decision.backoff_reason if retry_review_decision else None,
+                        budget_exhausted=retry_review_decision.budget_exhausted if retry_review_decision else None,
                     )
                     manifest = orchestrator.retry_review(manifest)
                 elif action == "accepted_terminalization_reconcile":
@@ -2439,6 +2466,12 @@ def _policy_decision_for_run_action(
             source=source,
         )
     return None
+
+
+def _retry_waiting_reason(decision) -> str:  # type: ignore[no-untyped-def]
+    if bool(getattr(decision, "budget_exhausted", False)):
+        return "retry_budget_exhausted"
+    return "retry_backoff"
 
 
 

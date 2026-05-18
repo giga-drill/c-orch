@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .failure_policy import has_retryable_review_failure
+from .failure_policy import (
+    SOURCE_QUEUE_SCHEDULER,
+    classify_retryable_review_failure,
+    has_retryable_review_failure,
+)
 from .run_store import RunManifest
 from .states import (
     RUN_APPROVED,
@@ -51,6 +55,8 @@ WAITING_PLANNER_REVISION = "planner_revision"
 WAITING_WORKER = "worker"
 WAITING_PLANNER_REVIEW = "planner_review"
 WAITING_PLANNER_REVIEW_RETRY = "planner_review_retry"
+WAITING_RETRY_BACKOFF = "retry_backoff"
+WAITING_RETRY_BUDGET_EXHAUSTED = "retry_budget_exhausted"
 WAITING_WORKER_REWORK = "worker_rework"
 WAITING_RETRY_TASK = "retry_task"
 WAITING_RESTART = "restart"
@@ -86,6 +92,15 @@ def derive_run_waiting_for_with_events(
     if run.status == RUN_FAILED:
         return WAITING_FAILED
     if has_retryable_review_failure(run):
+        retry_decision = classify_retryable_review_failure(
+            run,
+            source=SOURCE_QUEUE_SCHEDULER,
+        )
+        if retry_decision is not None:
+            if retry_decision.budget_exhausted:
+                return WAITING_RETRY_BUDGET_EXHAUSTED
+            if not retry_decision.automatic:
+                return WAITING_RETRY_BACKOFF
         return WAITING_PLANNER_REVIEW_RETRY
     if run.status in {RUN_NEW, RUN_PLANNING}:
         return WAITING_PLANNER
@@ -133,6 +148,8 @@ def derive_task_progress(
             )
         if waiting_for in {
             WAITING_PLANNER_REVIEW_RETRY,
+            WAITING_RETRY_BACKOFF,
+            WAITING_RETRY_BUDGET_EXHAUSTED,
             WAITING_ACCEPTED_TERMINALIZATION_RECOVERY,
             WAITING_MANUAL_TERMINALIZATION_RECOVERY,
         }:

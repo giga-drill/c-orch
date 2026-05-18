@@ -52,6 +52,8 @@ const statusText: Record<string, string> = {
   PLAN_REVISING: "Planner 修改计划中",
   WAITING_WORKSPACE: "等待 workspace",
   WAITING_WORKSPACE_CLEAN: "等待工作区清理",
+  retry_backoff: "重试退避等待",
+  retry_budget_exhausted: "自动重试预算耗尽",
   PLAN_APPROVED: "计划已通过",
   WORKING: "Worker 工作中",
   WORK_DONE: "Worker 已完成",
@@ -128,6 +130,8 @@ function timingSourceLabel(source?: string | null): string {
 
 function reviewStageLabel(run: RunListItem): string {
   if (run.waiting_for === "planner_review_retry") return "Review 基础设施失败，可重试";
+  if (run.waiting_for === "retry_backoff") return "Review 基础设施失败，等待退避窗口";
+  if (run.waiting_for === "retry_budget_exhausted") return "Review 基础设施失败，自动重试预算耗尽";
   if (run.waiting_for === "planner_review") return "Planner 正在复核";
   if (run.waiting_for === "worker_rework") return "Worker 返工中";
   if (run.waiting_for === "worker") return "Worker 工作中";
@@ -1293,6 +1297,14 @@ function RunSummaryStrip({ run }: { run: RunListItem }) {
     run.latest_revision_request?.summary ?? run.latest_revision_request?.reason;
   const showReviewFailure = Boolean(run.latest_review_failure) && isActiveReviewInfraFailure(run);
   const reviewRetryCount = run.review_retry_count ?? 0;
+  const retryState = run.retry_state;
+  const showRetryState = Boolean(
+    retryState && (
+      retryState.next_retry_at ||
+      retryState.backoff_reason ||
+      retryState.budget_exhausted
+    ),
+  );
   return (
     <section className="runSummaryStrip">
       <div className="summaryCell">
@@ -1363,6 +1375,24 @@ function RunSummaryStrip({ run }: { run: RunListItem }) {
           {run.latest_review_failure?.review_attempt_id ? (
             <span className="meta mono">attempt: {run.latest_review_failure.review_attempt_id}</span>
           ) : null}
+        </div>
+      ) : null}
+      {showRetryState ? (
+        <div className="summaryNote failureNote">
+          <span className="label">自动重试状态</span>
+          <strong>
+            {retryState?.budget_exhausted
+              ? "预算耗尽，等待人工处理"
+              : retryState?.next_retry_at
+                ? `下一次自动重试：${displayValue(retryState.next_retry_at)}`
+                : "等待下一次调度"}
+          </strong>
+          {retryState?.backoff_reason ? (
+            <span className="meta">reason: {displayValue(retryState.backoff_reason)}</span>
+          ) : null}
+          <span className="meta">
+            attempt/budget: {displayValue(retryState?.retry_attempt)} / {displayValue(retryState?.retry_budget)}
+          </span>
         </div>
       ) : null}
     </section>

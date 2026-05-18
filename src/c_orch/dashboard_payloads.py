@@ -42,6 +42,8 @@ from .terminalization_recovery import (
     latest_terminalization_recovery_required_event,
 )
 from .task_lifecycle import (
+    WAITING_RETRY_BACKOFF,
+    WAITING_RETRY_BUDGET_EXHAUSTED,
     derive_run_waiting_for,
     derive_run_waiting_for_with_events,
     derive_task_progress,
@@ -503,6 +505,7 @@ def _summarize_manifest(
     updated_at = str(manifest.get("updated_at", ""))
     created_at = str(manifest.get("created_at", ""))
     waiting_for = _derive_manifest_waiting_for(manifest, event_list)
+    retry_state = _retry_state_from_manifest(manifest, waiting_for=waiting_for)
     terminalization_recovery = _terminalization_recovery_summary(manifest, event_list)
     service_tiers = _service_tier_summary(manifest, workers=workers, review_attempts=review_attempts)
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -543,6 +546,7 @@ def _summarize_manifest(
         "last_review_attempt": _review_attempt_summary(review_attempts[-1]) if review_attempts else None,
         "latest_revision_request": latest_revision_request,
         "latest_review_failure": latest_review_failure,
+        "retry_state": retry_state,
         "can_retry_review": has_retryable_review_failure_dict(manifest),
         "last_event": _event_summary(event_list[-1]) if event_list else None,
         "last_error_event": last_error_event,
@@ -626,6 +630,11 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         active_run=active_run,
         active_run_events=active_run_events,
     )
+    active_retry_state = (
+        _retry_state_from_manifest(active_run.to_dict(), waiting_for=progress.waiting_for)
+        if active_run is not None
+        else None
+    )
     last_error_event = _last_error_event(active_run_events)
     return {
         "task_id": task.task_id,
@@ -643,6 +652,7 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         "last_error_event": last_error_event,
         "waiting_for": progress.waiting_for,
         "next_action": progress.waiting_for,
+        "retry_state": active_retry_state,
         "blocked_by": None,
         "allowed_actions": _allowed_task_actions(task, active_run=active_run, events=active_run_events),
     }
@@ -963,6 +973,11 @@ def _latest_review_failure_summary(
             ),
             "error": attempt.get("error"),
             "completed_at": attempt.get("completed_at"),
+            "retry_attempt": attempt.get("retry_attempt"),
+            "retry_budget": attempt.get("retry_budget"),
+            "next_retry_at": attempt.get("next_retry_at"),
+            "backoff_reason": attempt.get("backoff_reason"),
+            "retry_budget_exhausted": attempt.get("retry_budget_exhausted"),
             "source": "review_attempt",
         }
     if not isinstance(last_error_event, dict):
@@ -1033,6 +1048,11 @@ def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
         "reason": attempt.get("reason"),
         "summary": attempt.get("summary"),
         "error": attempt.get("error"),
+        "retry_attempt": attempt.get("retry_attempt"),
+        "retry_budget": attempt.get("retry_budget"),
+        "next_retry_at": attempt.get("next_retry_at"),
+        "backoff_reason": attempt.get("backoff_reason"),
+        "retry_budget_exhausted": attempt.get("retry_budget_exhausted"),
         "completed_at": attempt.get("completed_at"),
     }
 
@@ -1049,6 +1069,45 @@ def _event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
         "decision": event.get("decision"),
         "error": event.get("error"),
         "applied": event.get("applied"),
+        "retry_attempt": event.get("retry_attempt"),
+        "retry_budget": event.get("retry_budget"),
+        "next_retry_at": event.get("next_retry_at"),
+        "backoff_reason": event.get("backoff_reason"),
+        "budget_exhausted": event.get("budget_exhausted"),
+    }
+
+
+def _retry_state_from_manifest(
+    manifest: Dict[str, Any],
+    *,
+    waiting_for: str,
+) -> Optional[Dict[str, Any]]:
+    review_attempts = _list_value(manifest.get("review_attempts"))
+    if not review_attempts:
+        return None
+    last_attempt = _dict_value(review_attempts[-1])
+    if last_attempt.get("status") != REVIEW_ATTEMPT_FAILED_RETRYABLE:
+        return None
+    retry_attempt = last_attempt.get("retry_attempt")
+    retry_budget = last_attempt.get("retry_budget")
+    next_retry_at = last_attempt.get("next_retry_at")
+    backoff_reason = last_attempt.get("backoff_reason")
+    budget_exhausted = last_attempt.get("retry_budget_exhausted")
+    if (
+        retry_attempt is None
+        and retry_budget is None
+        and next_retry_at is None
+        and backoff_reason is None
+        and budget_exhausted is None
+    ):
+        return None
+    return {
+        "retry_attempt": retry_attempt,
+        "retry_budget": retry_budget,
+        "next_retry_at": next_retry_at,
+        "backoff_reason": backoff_reason,
+        "budget_exhausted": budget_exhausted,
+        "ready": waiting_for == "planner_review_retry",
     }
 
 
@@ -1365,6 +1424,8 @@ def _current_phase_label(*, status: str, waiting_for: str) -> str:
         "planner": "Planner planning",
         "planner_review": "Planner reviewing",
         "planner_review_retry": "Planner review retry",
+        WAITING_RETRY_BACKOFF: "Planner review retry backoff",
+        WAITING_RETRY_BUDGET_EXHAUSTED: "Planner review retry budget exhausted",
         "worker": "Worker executing",
         "worker_rework": "Worker reworking",
         "verification": "Verification running",

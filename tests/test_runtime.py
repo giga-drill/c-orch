@@ -648,6 +648,106 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(recovery_events[-1]["recovery_action"], "retry_review")
             self.assertTrue(recovery_events[-1]["automatic"])
 
+    def test_queue_lane_retry_review_backoff_waits_without_calling_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            _mark_retryable_review_failure(manifest)
+            manifest.review_attempts[-1].next_retry_at = "2099-01-01T00:00:00+00:00"
+            manifest.review_attempts[-1].backoff_reason = "retry_backoff_30s"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status="WAITING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _RetryReviewQueueOrchestrator(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 0)
+            queue_payload = runtime.build_queue_payload()
+            self.assertEqual(queue_payload["tasks"][0]["status"], "WAITING")
+            self.assertEqual(queue_payload["tasks"][0]["reason"], "retry_backoff")
+
+    def test_queue_lane_retry_review_budget_exhausted_waits_without_calling_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            _mark_retryable_review_failure(manifest)
+            manifest.review_attempts[-1].retry_attempt = 3
+            manifest.review_attempts[-1].retry_budget = 3
+            manifest.review_attempts[-1].retry_budget_exhausted = True
+            manifest.review_attempts[-1].backoff_reason = "retry_budget_exhausted"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status="WAITING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _RetryReviewQueueOrchestrator(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 0)
+            queue_payload = runtime.build_queue_payload()
+            self.assertEqual(queue_payload["tasks"][0]["status"], "WAITING")
+            self.assertEqual(queue_payload["tasks"][0]["reason"], "retry_budget_exhausted")
+
     def test_queue_dispatch_runs_different_git_workspaces_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -239,8 +239,18 @@ class TaskScheduler:
                     if (
                         decision is None
                         or decision.recovery_action != "retry_review"
-                        or not decision.automatic
                     ):
+                        queue.status = QUEUE_RUNNING
+                        self.task_store.save(queue)
+                        return queue
+                    if not decision.automatic:
+                        self.task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_WAITING,
+                            error=None,
+                            reason=_retry_waiting_reason(decision),
+                        )
                         queue.status = QUEUE_RUNNING
                         self.task_store.save(queue)
                         return queue
@@ -257,6 +267,11 @@ class TaskScheduler:
                         "Queue scheduler started automatic planner review retry",
                         source="queue_scheduler",
                         action="retry-review",
+                        retry_attempt=decision.retry_attempt,
+                        retry_budget=decision.retry_budget,
+                        next_retry_at=decision.next_retry_at,
+                        backoff_reason=decision.backoff_reason,
+                        budget_exhausted=decision.budget_exhausted,
                     )
                     try:
                         active = orchestrator.retry_review(active)
@@ -461,3 +476,9 @@ class TaskScheduler:
             )
         self.task_store.save(queue)
         return False
+
+
+def _retry_waiting_reason(decision) -> str:  # type: ignore[no-untyped-def]
+    if bool(getattr(decision, "budget_exhausted", False)):
+        return "retry_budget_exhausted"
+    return "retry_backoff"

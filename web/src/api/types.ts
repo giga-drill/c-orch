@@ -37,6 +37,7 @@ export interface TaskSummary {
   last_error_event: RunEvent | null;
   waiting_for: string;
   next_action: string;
+  retry_state?: RetryStateSummary | null;
   blocked_by?: { type?: string; id?: string; title?: string; status?: string } | null;
   allowed_actions: AllowedTaskAction[];
 }
@@ -157,6 +158,11 @@ export interface ReviewAttemptSummary {
   reason: string | null;
   summary: string | null;
   error: string | null;
+  retry_attempt?: number | null;
+  retry_budget?: number | null;
+  next_retry_at?: string | null;
+  backoff_reason?: string | null;
+  retry_budget_exhausted?: boolean | null;
   completed_at: string | null;
 }
 
@@ -185,7 +191,21 @@ export interface LatestReviewFailureSummary {
   summary: string | null;
   error: string | null;
   completed_at: string | null;
+  retry_attempt?: number | null;
+  retry_budget?: number | null;
+  next_retry_at?: string | null;
+  backoff_reason?: string | null;
+  retry_budget_exhausted?: boolean | null;
   source: "review_attempt" | "event";
+}
+
+export interface RetryStateSummary {
+  retry_attempt?: number | null;
+  retry_budget?: number | null;
+  next_retry_at?: string | null;
+  backoff_reason?: string | null;
+  budget_exhausted?: boolean | null;
+  ready?: boolean | null;
 }
 
 export interface RunTimingSegment {
@@ -246,6 +266,7 @@ export interface RunListItem {
   last_review_attempt?: ReviewAttemptSummary | null;
   latest_revision_request?: LatestRevisionRequestSummary | null;
   latest_review_failure?: LatestReviewFailureSummary | null;
+  retry_state?: RetryStateSummary | null;
   last_event: RunEvent | null;
   last_error_event: RunEvent | null;
   can_retry_review: boolean;
@@ -322,6 +343,11 @@ export interface ReviewAttempt {
   reason: string | null;
   next_worker_prompt: string | null;
   error: string | null;
+  retry_attempt?: number | null;
+  retry_budget?: number | null;
+  next_retry_at?: string | null;
+  backoff_reason?: string | null;
+  retry_budget_exhausted?: boolean | null;
   evidence_files: string[];
 }
 

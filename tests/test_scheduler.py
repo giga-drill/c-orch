@@ -270,6 +270,98 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(fake.run_calls, 0)
             self.assertEqual(fake.retry_review_calls, 1)
 
+    def test_active_retryable_review_failure_backoff_waits_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            _mark_retryable_review_failure(manifest)
+            manifest.review_attempts[-1].next_retry_at = "2099-01-01T00:00:00+00:00"
+            manifest.review_attempts[-1].backoff_reason = "retry_backoff_30s"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_WAITING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[], retry_outcomes=[("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, "RUNNING")
+            self.assertEqual(fake.retry_review_calls, 0)
+            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
+            self.assertEqual(loaded.tasks[0].reason, "retry_backoff")
+
+    def test_active_retryable_review_failure_budget_exhausted_waits_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            _mark_retryable_review_failure(manifest)
+            manifest.review_attempts[-1].retry_attempt = 3
+            manifest.review_attempts[-1].retry_budget = 3
+            manifest.review_attempts[-1].retry_budget_exhausted = True
+            manifest.review_attempts[-1].backoff_reason = "retry_budget_exhausted"
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_WAITING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(run_store, outcomes=[], retry_outcomes=[("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, "RUNNING")
+            self.assertEqual(fake.retry_review_calls, 0)
+            self.assertEqual(loaded.tasks[0].status, TASK_WAITING)
+            self.assertEqual(loaded.tasks[0].reason, "retry_budget_exhausted")
+
     def test_active_accepted_review_terminalization_auto_reconciles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

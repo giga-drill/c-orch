@@ -193,6 +193,11 @@ class RunStoreTests(unittest.TestCase):
                     service_tier="flex",
                     completed_at="2026-05-12T09:02:00+08:00",
                     error="Timed out",
+                    retry_attempt=2,
+                    retry_budget=3,
+                    next_retry_at="2026-05-12T09:02:30+08:00",
+                    backoff_reason="retry_backoff_30s",
+                    retry_budget_exhausted=False,
                     evidence_files=["runs/example/evidence/git-diff.patch"],
                 )
             )
@@ -234,6 +239,11 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.review_attempts[0].workspace_path, "/tmp/workspace")
             self.assertEqual(loaded.review_attempts[0].service_tier, "flex")
             self.assertEqual(loaded.review_attempts[0].error, "Timed out")
+            self.assertEqual(loaded.review_attempts[0].retry_attempt, 2)
+            self.assertEqual(loaded.review_attempts[0].retry_budget, 3)
+            self.assertEqual(loaded.review_attempts[0].next_retry_at, "2026-05-12T09:02:30+08:00")
+            self.assertEqual(loaded.review_attempts[0].backoff_reason, "retry_backoff_30s")
+            self.assertFalse(loaded.review_attempts[0].retry_budget_exhausted)
             self.assertEqual(loaded.workers[0].result["summary"], "done")
             self.assertIsNotNone(loaded.timing)
 

@@ -149,6 +149,91 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             summary = payload["run"]["latest_revision_request"]["summary"]
             self.assertEqual(summary, "First sentence only.")
 
+    def test_run_payload_retry_backoff_state_is_exposed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["runs/example/evidence/git-diff.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-18T11:00:00+00:00",
+                    completed_at="2026-05-18T11:01:00+00:00",
+                    reason="planner_review_failed",
+                    error="Timed out waiting for MCP server output",
+                    retry_attempt=1,
+                    retry_budget=3,
+                    next_retry_at="2099-01-01T00:00:00+00:00",
+                    backoff_reason="retry_backoff_30s",
+                    retry_budget_exhausted=False,
+                )
+            ]
+            store.save(manifest)
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            run = payload["run"]
+            self.assertEqual(run["waiting_for"], "retry_backoff")
+            self.assertEqual(run["retry_state"]["next_retry_at"], "2099-01-01T00:00:00+00:00")
+            self.assertEqual(run["retry_state"]["backoff_reason"], "retry_backoff_30s")
+            self.assertFalse(run["retry_state"]["budget_exhausted"])
+            self.assertEqual(run["latest_review_failure"]["next_retry_at"], "2099-01-01T00:00:00+00:00")
+
+    def test_queue_payload_retry_budget_exhausted_wait_reason_is_exposed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-1", "title": "Task", "prompt": "Do task", "cwd": str(root)}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["runs/example/evidence/git-diff.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-18T11:00:00+00:00",
+                    completed_at="2026-05-18T11:01:00+00:00",
+                    reason="planner_review_failed",
+                    error="Timed out waiting for MCP server output",
+                    retry_attempt=3,
+                    retry_budget=3,
+                    backoff_reason="retry_budget_exhausted",
+                    retry_budget_exhausted=True,
+                )
+            ]
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-1",
+                status="WAITING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+
+            payload = dashboard_payloads.build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "retry_budget_exhausted")
+            self.assertTrue(payload["tasks"][0]["retry_state"]["budget_exhausted"])
+
     def test_run_payload_uses_chinese_first_sentence_without_whitespace_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

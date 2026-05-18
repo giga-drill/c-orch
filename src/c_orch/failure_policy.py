@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Optional, Union
 
 from .states import REVIEW_ATTEMPT_FAILED_RETRYABLE, RUN_FAILED, RUN_WORK_DONE
@@ -35,6 +36,9 @@ SOURCE_ORCHESTRATOR = "orchestrator"
 SOURCE_QUEUE_SCHEDULER = "queue_scheduler"
 SOURCE_DASHBOARD_ACTION = "dashboard_action"
 
+DEFAULT_RETRY_BUDGET = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = (5, 30, 120)
+
 
 @dataclass(frozen=True)
 class FailurePolicyDecision:
@@ -48,6 +52,11 @@ class FailurePolicyDecision:
     source: str
     attempt: Union[int, str] = "unknown"
     error: Optional[str] = None
+    retry_attempt: Optional[int] = None
+    retry_budget: Optional[int] = None
+    next_retry_at: Optional[str] = None
+    backoff_reason: Optional[str] = None
+    budget_exhausted: Optional[bool] = None
 
     def to_event_fields(self) -> dict[str, Any]:
         return {
@@ -61,7 +70,32 @@ class FailurePolicyDecision:
             "automatic": self.automatic,
             "requires_human": self.requires_human,
             "error": self.error,
+            "retry_attempt": self.retry_attempt,
+            "retry_budget": self.retry_budget,
+            "next_retry_at": self.next_retry_at,
+            "backoff_reason": self.backoff_reason,
+            "budget_exhausted": self.budget_exhausted,
         }
+
+
+@dataclass(frozen=True)
+class RetryBackoffState:
+    retry_attempt: int
+    retry_budget: int
+    next_retry_at: Optional[str]
+    backoff_reason: str
+    budget_exhausted: bool
+    ready: bool
+
+
+@dataclass(frozen=True)
+class RetryBackoffDecision:
+    retry_attempt: int
+    retry_budget: int
+    next_retry_at: Optional[str]
+    backoff_reason: str
+    budget_exhausted: bool
+    ready: bool
 
 
 def classify_operation_failure(
@@ -172,6 +206,7 @@ def classify_retryable_review_failure(
     *,
     source: str,
     attempt: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> Optional[FailurePolicyDecision]:
     if not _has_retryable_review_failure(manifest):
         return None
@@ -187,7 +222,16 @@ def classify_retryable_review_failure(
             source=source,
             attempt=attempt,
         ).category
-    automatic = source == SOURCE_QUEUE_SCHEDULER
+    retry_state = classify_retry_backoff_decision(
+        manifest,
+        now=now,
+        retry_budget=DEFAULT_RETRY_BUDGET,
+        backoff_schedule_seconds=DEFAULT_RETRY_BACKOFF_SECONDS,
+    )
+    if retry_state is None:
+        return None
+    automatic = source == SOURCE_QUEUE_SCHEDULER and retry_state.ready and not retry_state.budget_exhausted
+    requires_human = source != SOURCE_QUEUE_SCHEDULER or retry_state.budget_exhausted or not retry_state.ready
     return _decision(
         phase=PHASE_PLANNER_REVIEW,
         category=category,
@@ -195,10 +239,116 @@ def classify_retryable_review_failure(
         recovery_action=RECOVERY_RETRY_REVIEW,
         retryable=True,
         automatic=automatic,
-        requires_human=not automatic,
+        requires_human=requires_human,
         source=source,
         attempt=attempt,
         error=error or None,
+        retry_attempt=retry_state.retry_attempt,
+        retry_budget=retry_state.retry_budget,
+        next_retry_at=retry_state.next_retry_at,
+        backoff_reason=retry_state.backoff_reason,
+        budget_exhausted=retry_state.budget_exhausted,
+    )
+
+
+def classify_retry_backoff_decision(
+    manifest: Any,
+    *,
+    now: Optional[datetime] = None,
+    retry_budget: int = DEFAULT_RETRY_BUDGET,
+    backoff_schedule_seconds: tuple[int, ...] = DEFAULT_RETRY_BACKOFF_SECONDS,
+) -> Optional[RetryBackoffDecision]:
+    state = derive_retry_backoff_state(
+        manifest,
+        now=now,
+        retry_budget=retry_budget,
+        backoff_schedule_seconds=backoff_schedule_seconds,
+    )
+    if state is None:
+        return None
+    return RetryBackoffDecision(
+        retry_attempt=state.retry_attempt,
+        retry_budget=state.retry_budget,
+        next_retry_at=state.next_retry_at,
+        backoff_reason=state.backoff_reason,
+        budget_exhausted=state.budget_exhausted,
+        ready=state.ready,
+    )
+
+
+def derive_retry_backoff_state(
+    manifest: Any,
+    *,
+    now: Optional[datetime] = None,
+    retry_budget: int = DEFAULT_RETRY_BUDGET,
+    backoff_schedule_seconds: tuple[int, ...] = DEFAULT_RETRY_BACKOFF_SECONDS,
+) -> Optional[RetryBackoffState]:
+    if not _has_retryable_review_failure(manifest):
+        return None
+    attempts = list(getattr(manifest, "review_attempts", []) or [])
+    last_attempt = attempts[-1] if attempts else None
+    if last_attempt is None:
+        return None
+    persisted_retry_attempt = getattr(last_attempt, "retry_attempt", None)
+    persisted_retry_budget = getattr(last_attempt, "retry_budget", None)
+    persisted_next_retry_at = getattr(last_attempt, "next_retry_at", None)
+    persisted_backoff_reason = getattr(last_attempt, "backoff_reason", None)
+    persisted_budget_exhausted = getattr(last_attempt, "retry_budget_exhausted", None)
+    has_persisted_retry_state = any(
+        value is not None
+        for value in (
+            persisted_retry_attempt,
+            persisted_retry_budget,
+            persisted_next_retry_at,
+            persisted_backoff_reason,
+            persisted_budget_exhausted,
+        )
+    )
+    normalized_budget = _normalize_retry_budget(getattr(last_attempt, "retry_budget", None), retry_budget)
+    retry_attempt = _normalize_retry_attempt(getattr(last_attempt, "retry_attempt", None))
+    if retry_attempt is None:
+        retry_attempt = _retryable_review_failure_count(attempts)
+    if retry_attempt < 1:
+        retry_attempt = 1
+    persisted_exhausted = bool(getattr(last_attempt, "retry_budget_exhausted", False))
+    budget_exhausted = persisted_exhausted or retry_attempt >= normalized_budget
+    next_retry_at = _string_or_none(getattr(last_attempt, "next_retry_at", None))
+    backoff_reason = _string_or_none(getattr(last_attempt, "backoff_reason", None))
+    if not has_persisted_retry_state:
+        return RetryBackoffState(
+            retry_attempt=retry_attempt,
+            retry_budget=normalized_budget,
+            next_retry_at=None,
+            backoff_reason=backoff_reason or "legacy_retry_immediate",
+            budget_exhausted=False,
+            ready=True,
+        )
+    if not budget_exhausted and not next_retry_at:
+        base = _parse_iso_datetime(_string_or_none(getattr(last_attempt, "completed_at", None)))
+        delay_seconds = _backoff_delay_seconds(retry_attempt, backoff_schedule_seconds)
+        if base is not None:
+            next_retry_at = (base + timedelta(seconds=delay_seconds)).isoformat(timespec="seconds")
+        backoff_reason = backoff_reason or f"retry_backoff_{delay_seconds}s"
+    if budget_exhausted:
+        backoff_reason = backoff_reason or "retry_budget_exhausted"
+        return RetryBackoffState(
+            retry_attempt=retry_attempt,
+            retry_budget=normalized_budget,
+            next_retry_at=next_retry_at,
+            backoff_reason=backoff_reason,
+            budget_exhausted=True,
+            ready=False,
+        )
+    current_time = now or datetime.now().astimezone()
+    next_retry_dt = _parse_iso_datetime(next_retry_at)
+    ready = next_retry_dt is None or current_time >= next_retry_dt
+    return RetryBackoffState(
+        retry_attempt=retry_attempt,
+        retry_budget=normalized_budget,
+        next_retry_at=next_retry_at,
+        backoff_reason=backoff_reason or "retry_backoff_waiting",
+        budget_exhausted=False,
+        ready=ready,
     )
 
 
@@ -422,6 +572,11 @@ def _decision(
     source: str,
     attempt: Optional[int] = None,
     error: Optional[str] = None,
+    retry_attempt: Optional[int] = None,
+    retry_budget: Optional[int] = None,
+    next_retry_at: Optional[str] = None,
+    backoff_reason: Optional[str] = None,
+    budget_exhausted: Optional[bool] = None,
 ) -> FailurePolicyDecision:
     normalized_attempt: Union[int, str] = "unknown"
     if isinstance(attempt, int) and attempt > 0:
@@ -437,6 +592,11 @@ def _decision(
         source=source,
         attempt=normalized_attempt,
         error=error,
+        retry_attempt=retry_attempt,
+        retry_budget=retry_budget,
+        next_retry_at=next_retry_at,
+        backoff_reason=backoff_reason,
+        budget_exhausted=budget_exhausted,
     )
 
 
@@ -491,3 +651,61 @@ def _latest_git_commit_reason(events: list[Any]) -> Optional[str]:
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.astimezone()
+    return parsed
+
+
+def _normalize_retry_budget(value: Any, default_value: int) -> int:
+    candidate = value
+    if not isinstance(candidate, int):
+        candidate = default_value
+    if candidate < 1:
+        return 1
+    return candidate
+
+
+def _normalize_retry_attempt(value: Any) -> Optional[int]:
+    if not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+def _retryable_review_failure_count(attempts: list[Any]) -> int:
+    total = 0
+    for attempt in attempts:
+        if getattr(attempt, "status", None) == REVIEW_ATTEMPT_FAILED_RETRYABLE:
+            total += 1
+    return total
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _backoff_delay_seconds(retry_attempt: int, schedule: tuple[int, ...]) -> int:
+    if retry_attempt <= 0:
+        return schedule[0] if schedule else 0
+    if not schedule:
+        return 0
+    index = min(retry_attempt - 1, len(schedule) - 1)
+    return schedule[index]

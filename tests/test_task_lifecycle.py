@@ -5,10 +5,12 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from c_orch.run_store import RunStore
+from c_orch.run_store import ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.task_lifecycle import (
     REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
     WAITING_RESTART,
+    WAITING_RETRY_BUDGET_EXHAUSTED,
+    WAITING_RETRY_BACKOFF,
     WAITING_RETRY_TASK,
     WAITING_SKIPPED,
     derive_run_waiting_for,
@@ -121,6 +123,59 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertEqual(queue.status, QUEUE_RESTART_REQUIRED)
             self.assertEqual(queue.tasks[0].status, "APPROVED")
             self.assertEqual(derive_run_waiting_for(manifest), WAITING_RESTART)
+
+    def test_retryable_review_failure_waiting_for_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-19T10:00:00+00:00",
+                    next_retry_at="2099-01-01T00:00:00+00:00",
+                    backoff_reason="retry_backoff_30s",
+                    retry_budget_exhausted=False,
+                )
+            ]
+
+            self.assertEqual(derive_run_waiting_for(manifest), WAITING_RETRY_BACKOFF)
+
+    def test_retryable_review_failure_waiting_for_budget_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-19T10:00:00+00:00",
+                    retry_attempt=3,
+                    retry_budget=3,
+                    retry_budget_exhausted=True,
+                    backoff_reason="retry_budget_exhausted",
+                )
+            ]
+
+            self.assertEqual(derive_run_waiting_for(manifest), WAITING_RETRY_BUDGET_EXHAUSTED)
 
     def test_failed_task_waits_for_retry_without_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
