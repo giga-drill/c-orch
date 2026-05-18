@@ -6,6 +6,7 @@ import type {
   AllowedRunAction,
   AllowedTaskAction,
   AgentSummary,
+  CostModePayload,
   EvidenceFile,
   ManifestRecord,
   ProposalPlanDetail,
@@ -358,6 +359,7 @@ export function App() {
           queuePayload={queuePayload}
           runsGeneratedAt={runsPayload?.generated_at}
           runtimeBusy={runtimeBusy}
+          costMode={stateQuery.data?.cost_mode}
         />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
@@ -387,10 +389,12 @@ function SystemStatus({
   queuePayload,
   runsGeneratedAt,
   runtimeBusy,
+  costMode,
 }: {
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
   runtimeBusy?: boolean;
+  costMode?: CostModePayload;
 }) {
   const queueActionMutation = useQueueActionMutation();
   const [queueActionError, setQueueActionError] = useState<string | null>(null);
@@ -398,6 +402,17 @@ function SystemStatus({
   const queue = queuePayload?.queue;
   const restartRequired = queue?.status === "RESTART_REQUIRED";
   const currentQueueRevision = queueRevision(queuePayload);
+  const tiers = costMode?.effective_service_tiers;
+  const modeLabel = costMode?.mode_label === "low_cost"
+    ? "低消耗模式"
+    : costMode?.mode_label === "standard"
+      ? "标准模式"
+      : "不可用";
+  const modeState = costMode?.mode_label === "unavailable"
+    ? "未连接执行配置"
+    : costMode?.low_cost_mode
+      ? "开启"
+      : "关闭";
   usePendingActionRefresh(Boolean(pendingQueueAction));
 
   useEffect(() => {
@@ -440,6 +455,17 @@ function SystemStatus({
       <div>
         <span className="label">runtime</span>
         <strong>{restartRequired ? "需重启" : runtimeBusy ? "运行中" : "空闲"}</strong>
+      </div>
+      <div className="systemStatusWide">
+        <span className="label">低消耗模式</span>
+        <strong>{modeState}</strong>
+        <span className="meta">{modeLabel}</span>
+      </div>
+      <div className="systemStatusWide">
+        <span className="label">新 run tiers</span>
+        <strong>
+          Planner {displayValue(tiers?.planner)} / Worker {displayValue(tiers?.worker)} / Reviewer {displayValue(tiers?.reviewer)}
+        </strong>
       </div>
       {restartRequired ? (
         <>
@@ -1140,6 +1166,19 @@ function RunSummaryStrip({ run }: { run: RunListItem }) {
       <div className="summaryCell">
         <span className="label">Worker</span>
         <strong>{formatStatus(run.workers[0]?.status ?? "PENDING")}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">Planner tier</span>
+        <strong>{displayValue(run.service_tiers.planner)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">Worker tier</span>
+        <strong>{displayValue(run.service_tiers.worker)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">Reviewer gate tier</span>
+        <strong>{displayValue(run.service_tiers.reviewer)}</strong>
+        <span className="meta">source: {displayValue(run.service_tiers.reviewer_source)}</span>
       </div>
       <div className="summaryCell">
         <span className="label">复核/重试次数</span>

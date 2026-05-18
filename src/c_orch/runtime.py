@@ -156,6 +156,7 @@ class COrchRuntime:
             queue_path=self.queue_path,
             proposals_path=self.proposals_path,
             runtime_generation=self._runtime_generation,
+            cost_mode=self._build_cost_mode_payload(),
             dispatch_running=queue_dispatch_running or proposal_dispatch_running,
             queue_dispatch_running=queue_dispatch_running,
             proposal_dispatch_running=proposal_dispatch_running,
@@ -163,6 +164,29 @@ class COrchRuntime:
             last_proposal_dispatch_error=self._last_proposal_dispatch_error,
             selected_run_id=selected_run_id,
         )
+
+    def _build_cost_mode_payload(self) -> Dict[str, Any]:
+        if self._scheduler_config is None:
+            return {
+                "low_cost_mode": False,
+                "mode_label": "unavailable",
+                "effective_service_tiers": {
+                    "planner": None,
+                    "worker": None,
+                    "reviewer": None,
+                },
+                "toggle_available": False,
+            }
+        return {
+            "low_cost_mode": self._scheduler_config.low_cost_mode,
+            "mode_label": "low_cost" if self._scheduler_config.low_cost_mode else "standard",
+            "effective_service_tiers": {
+                "planner": self._scheduler_config.planner_service_tier,
+                "worker": self._scheduler_config.worker_service_tier,
+                "reviewer": self._scheduler_config.reviewer_service_tier,
+            },
+            "toggle_available": False,
+        }
 
     def _active_queue_lane_count(self) -> int:
         with self._queue_lane_threads_lock:

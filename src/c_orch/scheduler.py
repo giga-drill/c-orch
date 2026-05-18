@@ -66,6 +66,7 @@ class SchedulerConfig:
     planner_service_tier: Optional[str] = None
     worker_service_tier: Optional[str] = None
     reviewer_service_tier: Optional[str] = None
+    low_cost_mode: bool = False
     max_tasks: Optional[int] = None
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
     require_proposal_plan_review: bool = False

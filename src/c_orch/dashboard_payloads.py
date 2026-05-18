@@ -125,6 +125,7 @@ def build_state_payload(
     queue_path: Optional[Pathish],
     proposals_path: Optional[Pathish],
     runtime_generation: str,
+    cost_mode: Optional[Dict[str, Any]] = None,
     dispatch_running: bool = False,
     queue_dispatch_running: bool = False,
     proposal_dispatch_running: bool = False,
@@ -157,6 +158,7 @@ def build_state_payload(
             "last_dispatch_error": last_dispatch_error,
             "last_proposal_dispatch_error": last_proposal_dispatch_error,
         },
+        "cost_mode": _cost_mode_payload(cost_mode),
         "workspace_lanes": _workspace_lane_summary(
             proposals_payload=proposals_payload,
             queue_payload=queue_payload,
@@ -431,6 +433,7 @@ def _summarize_manifest(
     updated_at = str(manifest.get("updated_at", ""))
     created_at = str(manifest.get("created_at", ""))
     waiting_for = _derive_manifest_waiting_for(manifest)
+    service_tiers = _service_tier_summary(manifest, workers=workers, review_attempts=review_attempts)
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
     timing = build_timing_summary(manifest, events or [], now_iso=now_iso)
     return {
@@ -457,6 +460,7 @@ def _summarize_manifest(
             "service_tier": planner.get("service_tier"),
         },
         "workers": workers,
+        "service_tiers": service_tiers,
         "review": {
             "decision": review.get("decision"),
             "reason": review.get("reason"),
@@ -483,6 +487,56 @@ def _summarize_manifest(
         "verification_count": len(_list_value(manifest.get("verification_commands"))),
         "evidence_count": len(evidence_files),
     }
+
+
+def _cost_mode_payload(cost_mode: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = _dict_value(cost_mode)
+    tiers = _dict_value(payload.get("effective_service_tiers"))
+    return {
+        "low_cost_mode": bool(payload.get("low_cost_mode", False)),
+        "mode_label": payload.get("mode_label") or "unavailable",
+        "effective_service_tiers": {
+            "planner": tiers.get("planner"),
+            "worker": tiers.get("worker"),
+            "reviewer": tiers.get("reviewer"),
+        },
+        "toggle_available": bool(payload.get("toggle_available", False)),
+    }
+
+
+def _service_tier_summary(
+    manifest: Dict[str, Any],
+    *,
+    workers: List[Dict[str, Any]],
+    review_attempts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    planner = _dict_value(manifest.get("planner"))
+    worker_tier = None
+    for worker in reversed(workers):
+        worker_tier = worker.get("service_tier")
+        if worker_tier is not None:
+            break
+    reviewer_tier = manifest.get("reviewer_service_tier")
+    reviewer_source = "manifest"
+    if reviewer_tier is None:
+        reviewer_source = "review_attempt"
+        reviewer_tier = _latest_review_attempt_service_tier(review_attempts)
+    if reviewer_tier is None:
+        reviewer_source = "unset"
+    return {
+        "planner": planner.get("service_tier"),
+        "worker": worker_tier,
+        "reviewer": reviewer_tier,
+        "reviewer_source": reviewer_source,
+    }
+
+
+def _latest_review_attempt_service_tier(review_attempts: List[Dict[str, Any]]) -> Optional[str]:
+    for attempt in reversed(review_attempts):
+        service_tier = attempt.get("service_tier")
+        if isinstance(service_tier, str) and service_tier.strip():
+            return service_tier.strip()
+    return None
 
 
 def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, Any]:

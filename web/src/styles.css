@@ -172,6 +172,11 @@ pre {
   color: var(--amber);
 }
 
+.systemStatusWide {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
 .queueStats {
   display: flex;
   flex-wrap: wrap;

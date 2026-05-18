@@ -151,12 +151,20 @@ export interface ReviewAttemptSummary {
   status: string | null;
   worker_attempt: number | null;
   workspace_path: string | null;
+  service_tier: string | null;
   evidence_count: number;
   decision: string | null;
   reason: string | null;
   summary: string | null;
   error: string | null;
   completed_at: string | null;
+}
+
+export interface RunServiceTiers {
+  planner: string | null;
+  worker: string | null;
+  reviewer: string | null;
+  reviewer_source: "manifest" | "review_attempt" | "unset";
 }
 
 export interface LatestRevisionRequestSummary {
@@ -231,6 +239,7 @@ export interface RunListItem {
   updated_at: string;
   planner: AgentSummary;
   workers: AgentSummary[];
+  service_tiers: RunServiceTiers;
   review: { decision: string | null; reason: string | null; summary?: string | null } | null;
   review_attempt_count: number;
   review_retry_count?: number | null;
@@ -307,12 +316,24 @@ export interface ReviewAttempt {
   started_at: string;
   worker_attempt: number | null;
   workspace_path: string | null;
+  service_tier: string | null;
   completed_at: string | null;
   decision: string | null;
   reason: string | null;
   next_worker_prompt: string | null;
   error: string | null;
   evidence_files: string[];
+}
+
+export interface CostModePayload {
+  low_cost_mode: boolean;
+  mode_label: string;
+  effective_service_tiers: {
+    planner: string | null;
+    worker: string | null;
+    reviewer: string | null;
+  };
+  toggle_available: boolean;
 }
 
 export interface WorkerActivity {
@@ -346,6 +367,7 @@ export interface DashboardStatePayload {
   generated_at: string;
   version: number;
   runtime: RuntimeState;
+  cost_mode: CostModePayload;
   proposals: ProposalsPayload;
   queue: QueuePayload;
   workspace_lanes?: WorkspaceLanesPayload;

@@ -174,6 +174,29 @@ class _AutoQueueProposalOrchestrator:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_build_state_payload_exposes_low_cost_mode_from_scheduler_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                scheduler_config=replace(
+                    _scheduler_config(root),
+                    planner_service_tier="flex",
+                    worker_service_tier="flex",
+                    reviewer_service_tier="flex",
+                    low_cost_mode=True,
+                ),
+            )
+
+            payload = runtime.build_state_payload()
+
+            self.assertTrue(payload["cost_mode"]["low_cost_mode"])
+            self.assertEqual(payload["cost_mode"]["mode_label"], "low_cost")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["planner"], "flex")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["worker"], "flex")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["reviewer"], "flex")
+            self.assertFalse(payload["cost_mode"]["toggle_available"])
+
     def test_runtime_run_action_forwards_scheduler_reviewer_service_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

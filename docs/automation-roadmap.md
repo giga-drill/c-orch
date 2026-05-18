@@ -33,11 +33,12 @@ Dashboard UX follow-ups:
 - Worker activity should be promoted to a first-class panel so execution
   progress, phase events, and actionable evidence stay visible without
   expanding raw logs by default.
-- Low-cost mode should become visible in the dashboard. The first UI slice can
-  show whether `[run].low_cost_mode` is active and display the effective
-  Planner/Worker/Reviewer `service_tier` for new runs. A later slice can add a
-  backend-owned action for toggling the mode, rather than letting frontend
-  mutate config files directly.
+- Low-cost mode dashboard visibility (phase 1 delivered): backend state payload
+  now exposes whether `[run].low_cost_mode` is active and the effective
+  Planner/Worker/Reviewer `service_tier` for new run/proposal/queue dispatch.
+  This slice is read-only in the UI.
+- Low-cost mode toggle remains a follow-up backend-owned action. Frontend must
+  not read or mutate `.c-orch.toml` directly.
 
 ## Future Evolution Directions
 

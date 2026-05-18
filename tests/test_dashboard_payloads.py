@@ -182,6 +182,135 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                 "缺少失败路径测试。",
             )
 
+    def test_state_payload_includes_low_cost_mode_and_effective_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            store.save(manifest)
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=None,
+                proposals_path=None,
+                runtime_generation="test-generation",
+                cost_mode={
+                    "low_cost_mode": True,
+                    "mode_label": "low_cost",
+                    "effective_service_tiers": {
+                        "planner": "flex",
+                        "worker": "flex",
+                        "reviewer": "flex",
+                    },
+                    "toggle_available": False,
+                },
+            )
+
+            self.assertTrue(payload["cost_mode"]["low_cost_mode"])
+            self.assertEqual(payload["cost_mode"]["mode_label"], "low_cost")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["planner"], "flex")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["worker"], "flex")
+            self.assertEqual(payload["cost_mode"]["effective_service_tiers"]["reviewer"], "flex")
+            self.assertFalse(payload["cost_mode"]["toggle_available"])
+
+    def test_state_payload_cost_mode_defaults_to_unavailable_without_scheduler_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=None,
+                proposals_path=None,
+                runtime_generation="test-generation",
+            )
+
+            self.assertFalse(payload["cost_mode"]["low_cost_mode"])
+            self.assertEqual(payload["cost_mode"]["mode_label"], "unavailable")
+            self.assertIsNone(payload["cost_mode"]["effective_service_tiers"]["planner"])
+            self.assertIsNone(payload["cost_mode"]["effective_service_tiers"]["worker"])
+            self.assertIsNone(payload["cost_mode"]["effective_service_tiers"]["reviewer"])
+            self.assertFalse(payload["cost_mode"]["toggle_available"])
+
+    def test_run_payload_service_tiers_uses_manifest_reviewer_tier_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                planner_service_tier="fast",
+                worker_service_tier="fast",
+                reviewer_service_tier="flex",
+            )
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="APPROVED",
+                    started_at="2026-05-18T12:00:00+00:00",
+                    completed_at="2026-05-18T12:01:00+00:00",
+                    service_tier="fast",
+                )
+            ]
+            store.save(manifest)
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            tiers = payload["run"]["service_tiers"]
+            self.assertEqual(tiers["planner"], "fast")
+            self.assertEqual(tiers["worker"], "fast")
+            self.assertEqual(tiers["reviewer"], "flex")
+            self.assertEqual(tiers["reviewer_source"], "manifest")
+
+    def test_run_payload_service_tiers_fallbacks_reviewer_tier_to_latest_review_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                planner_service_tier="flex",
+                worker_service_tier="flex",
+                reviewer_service_tier=None,
+            )
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-18T11:00:00+00:00",
+                    completed_at="2026-05-18T11:01:00+00:00",
+                    service_tier="fast",
+                ),
+                ReviewAttemptRecord(
+                    id="review-2",
+                    worker_id="worker-1",
+                    status="APPROVED",
+                    started_at="2026-05-18T11:02:00+00:00",
+                    completed_at="2026-05-18T11:03:00+00:00",
+                    service_tier="flex",
+                ),
+            ]
+            store.save(manifest)
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            tiers = payload["run"]["service_tiers"]
+            self.assertEqual(tiers["planner"], "flex")
+            self.assertEqual(tiers["worker"], "flex")
+            self.assertEqual(tiers["reviewer"], "flex")
+            self.assertEqual(tiers["reviewer_source"], "review_attempt")
+
 
 if __name__ == "__main__":
     unittest.main()
