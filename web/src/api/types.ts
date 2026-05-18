@@ -359,8 +359,26 @@ export interface RuntimeState {
   dispatch_running: boolean;
   queue_dispatch_running?: boolean;
   proposal_dispatch_running?: boolean;
+  queue_lane_active_count?: number;
+  proposal_lane_active_count?: number;
   last_dispatch_error: string | null;
   last_proposal_dispatch_error?: string | null;
+  restart_gate?: {
+    active: boolean;
+    waiting_for: string;
+    run_ids: string[];
+    task_ids: string[];
+    message: string | null;
+    items: {
+      task_id: string;
+      run_id: string;
+      run_status: string;
+      restart_reason: string | null;
+      restart_paths: string[];
+      cwd: string | null;
+      workspace_id: string | null;
+    }[];
+  } | null;
 }
 
 export interface DashboardStatePayload {

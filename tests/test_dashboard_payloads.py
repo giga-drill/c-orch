@@ -7,6 +7,7 @@ from pathlib import Path
 from c_orch import dashboard_payloads
 from c_orch.proposal_store import ProposalStore
 from c_orch.run_store import ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.task_store import TaskStore
 
 
 class DashboardPayloadBoundaryTests(unittest.TestCase):
@@ -234,6 +235,54 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertIsNone(payload["cost_mode"]["effective_service_tiers"]["worker"])
             self.assertIsNone(payload["cost_mode"]["effective_service_tiers"]["reviewer"])
             self.assertFalse(payload["cost_mode"]["toggle_available"])
+
+    def test_state_payload_exposes_restart_gate_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "gate-task", "title": "Gate task", "prompt": "Gate task", "cwd": str(repo)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Task B", "cwd": str(repo)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            gate_manifest.restart_reason = "Runtime changed"
+            gate_manifest.restart_paths = ["src/c_orch/runtime.py"]
+            run_store.save(gate_manifest)
+            queue_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=None,
+                runtime_generation="test-generation",
+            )
+
+            restart_gate = payload["runtime"]["restart_gate"]
+            self.assertTrue(restart_gate["active"])
+            self.assertEqual(restart_gate["waiting_for"], "restart")
+            self.assertEqual(restart_gate["task_ids"], ["gate-task"])
+            self.assertEqual(restart_gate["run_ids"], [gate_manifest.run_id])
+            self.assertEqual(restart_gate["items"][0]["task_id"], "gate-task")
+            self.assertEqual(restart_gate["items"][0]["run_id"], gate_manifest.run_id)
 
     def test_run_payload_service_tiers_uses_manifest_reviewer_tier_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

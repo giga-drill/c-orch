@@ -1056,6 +1056,26 @@ class UiTests(unittest.TestCase):
         self.assertIn("/api/*", API_ONLY_INDEX_HTML)
         self.assertIn("dev-ui", API_ONLY_INDEX_HTML)
 
+    def test_system_status_waiting_point_uses_restart_gate_only_when_active(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_source = (root / "web" / "src" / "components" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("export function systemStatusWaitingPoint(", app_source)
+        self.assertIn("if (restartGate?.active) {", app_source)
+        self.assertIn("return restartGate.waiting_for;", app_source)
+        self.assertIn("return queueWaitingPoint;", app_source)
+        self.assertIn(
+            "const waitingPoint = systemStatusWaitingPoint(",
+            app_source,
+        )
+        self.assertIn(
+            "queuePayload?.summary?.current_waiting_point",
+            app_source,
+        )
+        self.assertIn("const restartMessage = restartGateActive ? restartGate?.message : null;", app_source)
+        self.assertIn("const restartTaskIds = restartGateActive ? (restartGate?.task_ids ?? []) : [];", app_source)
+        self.assertIn("const restartRunIds = restartGateActive ? (restartGate?.run_ids ?? []) : [];", app_source)
+
     def test_dashboard_server_serves_root_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

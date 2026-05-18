@@ -232,6 +232,11 @@ class DashboardSupervisor:
 
 
 def is_restart_required(payload: Mapping[str, Any]) -> bool:
+    runtime = payload.get("runtime")
+    if isinstance(runtime, dict):
+        restart_gate = runtime.get("restart_gate")
+        if isinstance(restart_gate, dict) and bool(restart_gate.get("active")):
+            return True
     queue_payload = _queue_payload(payload)
     queue = queue_payload.get("queue")
     if isinstance(queue, dict) and queue.get("status") == "RESTART_REQUIRED":
@@ -241,6 +246,18 @@ def is_restart_required(payload: Mapping[str, Any]) -> bool:
 
 
 def restart_gate_key(payload: Mapping[str, Any]) -> str:
+    runtime = payload.get("runtime")
+    if isinstance(runtime, dict):
+        restart_gate = runtime.get("restart_gate")
+        if isinstance(restart_gate, dict) and bool(restart_gate.get("active")):
+            run_ids = restart_gate.get("run_ids")
+            task_ids = restart_gate.get("task_ids")
+            if isinstance(run_ids, list) and isinstance(task_ids, list):
+                return json.dumps(
+                    {"run_ids": run_ids, "task_ids": task_ids},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
     queue_payload = _queue_payload(payload)
     tasks = queue_payload.get("tasks")
     if not isinstance(tasks, list):
@@ -266,10 +283,15 @@ def restart_drain_reasons(payload: Mapping[str, Any]) -> list[str]:
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict):
         return []
+    queue_lane_active_count = runtime.get("queue_lane_active_count")
+    proposal_lane_active_count = runtime.get("proposal_lane_active_count")
     reasons: list[str] = []
-    if runtime.get("queue_dispatch_running"):
+    queue_dispatch_running = bool(runtime.get("queue_dispatch_running"))
+    proposal_dispatch_running = bool(runtime.get("proposal_dispatch_running"))
+
+    if queue_dispatch_running or (isinstance(queue_lane_active_count, int) and queue_lane_active_count > 0):
         reasons.append("queue-dispatch-running")
-    if runtime.get("proposal_dispatch_running"):
+    if proposal_dispatch_running or (isinstance(proposal_lane_active_count, int) and proposal_lane_active_count > 0):
         reasons.append("proposal-dispatch-running")
     if runtime.get("dispatch_running") and not reasons:
         reasons.append("dispatch-running")

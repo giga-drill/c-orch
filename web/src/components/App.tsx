@@ -163,6 +163,24 @@ type PendingQueueAction = {
   observedRevision: string;
 };
 
+type RuntimeRestartGate = {
+  active: boolean;
+  waiting_for: string;
+  run_ids: string[];
+  task_ids: string[];
+  message: string | null;
+} | null | undefined;
+
+export function systemStatusWaitingPoint(
+  restartGate: RuntimeRestartGate,
+  queueWaitingPoint: string | null | undefined,
+): string | null | undefined {
+  if (restartGate?.active) {
+    return restartGate.waiting_for;
+  }
+  return queueWaitingPoint;
+}
+
 function actionRevision(actions: readonly string[]): string {
   return actions.slice().sort().join(",");
 }
@@ -360,6 +378,7 @@ export function App() {
           runsGeneratedAt={runsPayload?.generated_at}
           runtimeBusy={runtimeBusy}
           costMode={stateQuery.data?.cost_mode}
+          restartGate={stateQuery.data?.runtime.restart_gate}
         />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
@@ -390,18 +409,34 @@ function SystemStatus({
   runsGeneratedAt,
   runtimeBusy,
   costMode,
+  restartGate,
 }: {
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
   runtimeBusy?: boolean;
   costMode?: CostModePayload;
+  restartGate?: {
+    active: boolean;
+    waiting_for: string;
+    run_ids: string[];
+    task_ids: string[];
+    message: string | null;
+  } | null;
 }) {
   const queueActionMutation = useQueueActionMutation();
   const [queueActionError, setQueueActionError] = useState<string | null>(null);
   const [pendingQueueAction, setPendingQueueAction] = useState<PendingQueueAction | null>(null);
   const queue = queuePayload?.queue;
-  const restartRequired = queue?.status === "RESTART_REQUIRED";
+  const restartGateActive = Boolean(restartGate?.active);
+  const restartRequired = Boolean(restartGate?.active || queue?.status === "RESTART_REQUIRED");
   const currentQueueRevision = queueRevision(queuePayload);
+  const waitingPoint = systemStatusWaitingPoint(
+    restartGate,
+    queuePayload?.summary?.current_waiting_point,
+  );
+  const restartMessage = restartGateActive ? restartGate?.message : null;
+  const restartTaskIds = restartGateActive ? (restartGate?.task_ids ?? []) : [];
+  const restartRunIds = restartGateActive ? (restartGate?.run_ids ?? []) : [];
   const tiers = costMode?.effective_service_tiers;
   const modeLabel = costMode?.mode_label === "low_cost"
     ? "低消耗模式"
@@ -446,7 +481,7 @@ function SystemStatus({
       </div>
       <div>
         <span className="label">waiting_for</span>
-        <strong>{displayValue(queuePayload?.summary?.current_waiting_point)}</strong>
+        <strong>{displayValue(waitingPoint)}</strong>
       </div>
       <div>
         <span className="label">updated</span>
@@ -469,7 +504,13 @@ function SystemStatus({
       </div>
       {restartRequired ? (
         <>
-          <p>当前队列被 restart gate 暂停。请在 runtime 完成重启后确认继续。</p>
+          <p>{displayValue(restartMessage ?? "当前队列被 restart gate 暂停。请在 runtime 完成重启后确认继续。")}</p>
+          {restartTaskIds.length ? (
+            <p className="meta">gate task_ids: {restartTaskIds.join(", ")}</p>
+          ) : null}
+          {restartRunIds.length ? (
+            <p className="meta">gate run_ids: {restartRunIds.join(", ")}</p>
+          ) : null}
           <button
             type="button"
             onClick={confirmRuntimeRestarted}

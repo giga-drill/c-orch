@@ -27,6 +27,7 @@ from .proposal_store import (
     ProposalRecord,
     ProposalStore,
 )
+from .restart_gate import detect_restart_gate
 from .run_store import RunManifest, RunStore
 from .states import (
     REVIEW_ATTEMPT_FAILED_RETRYABLE,
@@ -129,6 +130,8 @@ def build_state_payload(
     dispatch_running: bool = False,
     queue_dispatch_running: bool = False,
     proposal_dispatch_running: bool = False,
+    queue_lane_active_count: int = 0,
+    proposal_lane_active_count: int = 0,
     last_dispatch_error: Optional[str] = None,
     last_proposal_dispatch_error: Optional[str] = None,
     selected_run_id: Optional[str] = None,
@@ -136,6 +139,10 @@ def build_state_payload(
     runs_payload = build_runs_payload(runs_dir)
     queue_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
     proposals_payload = build_proposals_payload(proposals_path, runs_dir=runs_dir)
+    restart_gate = _restart_gate_payload(
+        queue_path=Path(queue_path).expanduser().resolve() if queue_path is not None else None,
+        runs_dir=Path(runs_dir).expanduser().resolve(),
+    )
     focused_run_id = selected_run_id or _focused_run_id(
         proposals_payload=proposals_payload,
         queue_payload=queue_payload,
@@ -155,8 +162,11 @@ def build_state_payload(
             "dispatch_running": dispatch_running,
             "queue_dispatch_running": queue_dispatch_running,
             "proposal_dispatch_running": proposal_dispatch_running,
+            "queue_lane_active_count": max(0, int(queue_lane_active_count)),
+            "proposal_lane_active_count": max(0, int(proposal_lane_active_count)),
             "last_dispatch_error": last_dispatch_error,
             "last_proposal_dispatch_error": last_proposal_dispatch_error,
+            "restart_gate": restart_gate,
         },
         "cost_mode": _cost_mode_payload(cost_mode),
         "workspace_lanes": _workspace_lane_summary(
@@ -169,6 +179,32 @@ def build_state_payload(
         "focused_run_id": focused_run_id,
         "selected_run": selected_run,
     }
+
+
+def _restart_gate_payload(*, queue_path: Optional[Path], runs_dir: Path) -> Dict[str, Any]:
+    if queue_path is None:
+        return {
+            "active": False,
+            "waiting_for": "done",
+            "run_ids": [],
+            "task_ids": [],
+            "message": None,
+            "items": [],
+        }
+    try:
+        queue = TaskStore(queue_path).load()
+    except (OSError, ValueError):
+        return {
+            "active": False,
+            "waiting_for": "done",
+            "run_ids": [],
+            "task_ids": [],
+            "message": None,
+            "items": [],
+        }
+    run_store = RunStore(runs_dir)
+    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    return detect_restart_gate(queue, run_loader=run_store.load).to_payload()
 
 
 def build_queue_payload(

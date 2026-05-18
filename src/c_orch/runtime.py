@@ -32,6 +32,7 @@ from .proposal_store import (
     ProposalRecord,
     ProposalStore,
 )
+from .restart_gate import RestartGateState, detect_restart_gate
 from .run_store import RunManifest, RunStore
 from .scheduler import OrchestratorLike, SchedulerConfig, TaskScheduler
 from .states import (
@@ -145,12 +146,14 @@ class COrchRuntime:
         return dashboard_payloads.build_run_payload(self.runs_dir, run_id)
 
     def build_state_payload(self, selected_run_id: Optional[str] = None) -> Dict[str, Any]:
+        queue_lane_active_count = self._active_queue_lane_count()
+        proposal_lane_active_count = self._active_proposal_lane_count()
         queue_dispatch_running = self._dispatch_thread is not None and self._dispatch_thread.is_alive()
-        queue_dispatch_running = queue_dispatch_running or self._active_queue_lane_count() > 0
+        queue_dispatch_running = queue_dispatch_running or queue_lane_active_count > 0
         proposal_dispatch_running = (
             self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive()
         )
-        proposal_dispatch_running = proposal_dispatch_running or self._active_proposal_lane_count() > 0
+        proposal_dispatch_running = proposal_dispatch_running or proposal_lane_active_count > 0
         return dashboard_payloads.build_state_payload(
             runs_dir=self.runs_dir,
             queue_path=self.queue_path,
@@ -160,6 +163,8 @@ class COrchRuntime:
             dispatch_running=queue_dispatch_running or proposal_dispatch_running,
             queue_dispatch_running=queue_dispatch_running,
             proposal_dispatch_running=proposal_dispatch_running,
+            queue_lane_active_count=queue_lane_active_count,
+            proposal_lane_active_count=proposal_lane_active_count,
             last_dispatch_error=self._last_dispatch_error,
             last_proposal_dispatch_error=self._last_proposal_dispatch_error,
             selected_run_id=selected_run_id,
@@ -253,6 +258,7 @@ class COrchRuntime:
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
+                self.dispatch_proposals_async()
             return self._attach_state(result)
 
     def create_proposal(self, title: Any, prompt: Any, cwd: Any = None) -> RunActionResponse:
@@ -487,6 +493,10 @@ class COrchRuntime:
             except (OSError, ValueError):
                 return
             reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+            restart_gate = self._detect_restart_gate(queue=queue, run_store=run_store)
+            if restart_gate.active:
+                task_store.save(queue)
+                return
             candidates = self._queue_lane_candidates(queue, run_store=run_store)
             started = 0
             for lane_id, task in candidates:
@@ -569,6 +579,39 @@ class COrchRuntime:
         except OSError:
             return None
 
+    def _detect_restart_gate(
+        self,
+        *,
+        queue: Optional[TaskQueue] = None,
+        run_store: Optional[RunStore] = None,
+    ) -> RestartGateState:
+        if self.queue_path is None:
+            return RestartGateState(
+                active=False,
+                waiting_for="done",
+                run_ids=[],
+                task_ids=[],
+                items=[],
+                message=None,
+            )
+        store = run_store or RunStore(self.runs_dir)
+        if queue is not None:
+            return detect_restart_gate(queue, run_loader=store.load)
+        task_store = TaskStore(self.queue_path)
+        try:
+            loaded = task_store.load()
+        except (OSError, ValueError):
+            return RestartGateState(
+                active=False,
+                waiting_for="done",
+                run_ids=[],
+                task_ids=[],
+                items=[],
+                message=None,
+            )
+        reconcile_queue(loaded, run_loader=store.load, now_iso=store.now_iso)
+        return detect_restart_gate(loaded, run_loader=store.load)
+
     def _run_queue_lane_worker(self, *, lane_id: str, task_id: str) -> None:
         try:
             self._execute_queue_lane_task(task_id=task_id)
@@ -601,6 +644,11 @@ class COrchRuntime:
         retry_review_decision = None
         with self._queue_lock:
             queue = task_store.load()
+            restart_gate = self._detect_restart_gate(queue=queue, run_store=run_store)
+            if restart_gate.active:
+                reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                task_store.save(queue)
+                return
             task = _find_task_record(queue, task_id)
             if task.active_run_id:
                 manifest = run_store.load(task.active_run_id)
@@ -775,6 +823,9 @@ class COrchRuntime:
 
     def _start_available_proposal_lanes(self) -> None:
         if self.proposals_path is None or self._scheduler_config is None:
+            return
+        restart_gate = self._detect_restart_gate()
+        if restart_gate.active:
             return
         max_parallel = max(1, self._scheduler_config.max_parallel_workspaces)
         active_count = self._active_proposal_lane_count()
@@ -1046,6 +1097,8 @@ class COrchRuntime:
 
     def _process_proposal_planning_job(self, *, proposal_id: str, run_id: str) -> None:
         if self._scheduler_config is None:
+            return
+        if self._detect_restart_gate().active:
             return
         should_continue, current_run_id = self._preflight_proposal_planning(
             proposal_id=proposal_id,

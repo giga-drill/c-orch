@@ -55,10 +55,12 @@ class _BlockingQueueOrchestrator:
         *,
         release: threading.Event,
         statuses: Optional[Dict[str, str]] = None,
+        requires_restart_by_task: Optional[Dict[str, bool]] = None,
     ) -> None:
         self.run_store = run_store
         self.release = release
         self.statuses = statuses or {}
+        self.requires_restart_by_task = requires_restart_by_task or {}
         self.lock = threading.Lock()
         self.started = threading.Event()
         self.two_started = threading.Event()
@@ -74,6 +76,10 @@ class _BlockingQueueOrchestrator:
                 self.two_started.set()
         self.release.wait(timeout=5)
         manifest.status = self.statuses.get(manifest.user_task, "APPROVED")
+        manifest.requires_restart = bool(self.requires_restart_by_task.get(manifest.user_task, False))
+        if manifest.requires_restart:
+            manifest.restart_reason = "Runtime files changed"
+            manifest.restart_paths = ["src/c_orch/runtime.py"]
         self.run_store.save(manifest)
         return manifest
 
@@ -168,6 +174,33 @@ class _AutoQueueProposalOrchestrator:
             manifest.verification_commands = ["pytest -q"]
         elif manifest.status == RUN_PLAN_APPROVED:
             self.worker_run_ids.append(manifest.run_id)
+            manifest.status = "APPROVED"
+        self.run_store.save(manifest)
+        return manifest
+
+
+class _MixedGateRecoveryOrchestrator:
+    def __init__(self, run_store: RunStore) -> None:
+        self.run_store = run_store
+        self.input_statuses: List[str] = []
+        self.user_tasks: List[str] = []
+
+    def run(self, manifest):  # type: ignore[no-untyped-def]
+        self.input_statuses.append(manifest.status)
+        self.user_tasks.append(manifest.user_task)
+        if manifest.user_task == "Do proposal":
+            if manifest.status in {"NEW", "PLANNING"}:
+                manifest.status = RUN_PLAN_REVIEW_REQUIRED
+                manifest.plan = PlanRecord(
+                    summary=f"Plan for {manifest.run_id}",
+                    worker_prompt=f"Implement {manifest.user_task}",
+                    risk_notes=["risk-1"],
+                )
+                manifest.acceptance_criteria = [f"accept-{manifest.run_id}"]
+                manifest.verification_commands = ["pytest -q"]
+            elif manifest.status == RUN_PLAN_APPROVED:
+                manifest.status = "APPROVED"
+        else:
             manifest.status = "APPROVED"
         self.run_store.save(manifest)
         return manifest
@@ -718,6 +751,234 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(loaded.status, "FAILED")
             self.assertEqual([task.status for task in loaded.tasks], ["FAILED", "APPROVED"])
             self.assertEqual(set(fake.user_tasks), {"Do A", "Do B"})
+
+    def test_queue_dispatch_restart_gate_blocks_pending_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            gate_manifest.restart_reason = "Runtime changed"
+            run_store.save(gate_manifest)
+
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "gate-task", "title": "Gate task", "prompt": "Gate", "cwd": str(repo)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo)},
+                ]
+            )
+            task_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            task_store.save(queue)
+
+            fake = _FakeOrchestrator(run_store, "APPROVED")
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            loaded = task_store.load()
+            self.assertEqual(loaded.status, "RESTART_REQUIRED")
+            self.assertEqual(loaded.tasks[1].status, "PENDING")
+            self.assertEqual(fake.run_calls, 0)
+
+    def test_proposal_dispatch_restart_gate_blocks_planning_lane_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            gate_manifest.restart_reason = "Runtime changed"
+            run_store.save(gate_manifest)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate", "cwd": str(repo)}]
+            )
+            task_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            task_store.save(queue)
+
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            proposal_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Do A",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task A", prompt="Do A", cwd=str(repo))
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                run_id=proposal_manifest.run_id,
+                status="PLANNING",
+                reason="planner",
+            )
+            proposal_store.save(pool)
+
+            runtime.dispatch_proposals_async()
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+            manifest = run_store.load(proposal_manifest.run_id)
+            proposal = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(manifest.status, "NEW")
+            self.assertEqual(proposal.status, "PLANNING")
+            self.assertEqual(fake_planner.run_calls, 0)
+
+    def test_running_queue_lane_completes_then_restart_gate_blocks_followup_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo-a"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {"task_id": "task-a", "title": "Task A", "prompt": "Do A", "cwd": str(repo)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            release = threading.Event()
+            fake = _BlockingQueueOrchestrator(
+                run_store,
+                release=release,
+                requires_restart_by_task={"Do A": True},
+            )
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo, max_parallel_workspaces=2),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(fake.started.wait(timeout=2))
+            self.assertEqual(fake.user_tasks, ["Do A"])
+            release.set()
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            loaded = task_store.load()
+            self.assertEqual(loaded.status, "RESTART_REQUIRED")
+            self.assertEqual([task.status for task in loaded.tasks], ["APPROVED", "PENDING"])
+            self.assertEqual(fake.user_tasks, ["Do A"])
+
+    def test_confirm_runtime_restarted_unblocks_queue_and_proposal_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            gate_manifest.restart_reason = "Runtime changed"
+            run_store.save(gate_manifest)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "gate-task", "title": "Gate task", "prompt": "Gate", "cwd": str(repo)},
+                    {"task_id": "task-b", "title": "Task B", "prompt": "Do B", "cwd": str(repo)},
+                ]
+            )
+            task_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            task_store.save(queue)
+
+            fake = _MixedGateRecoveryOrchestrator(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            status, payload = runtime.create_proposal("Task proposal", "Do proposal")
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_created_waiting_workspace")
+
+            runtime.dispatch_queue_async()
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            self.assertEqual(fake.input_statuses, [])
+            self.assertEqual(TaskStore(root / "queue.json").load().status, "RESTART_REQUIRED")
+
+            confirm_status, _confirm_payload = runtime.queue_action("confirm-runtime-restarted")
+            self.assertEqual(int(confirm_status), 200)
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            self.assertFalse(run_store.load(gate_manifest.run_id).requires_restart)
+            loaded_queue = TaskStore(root / "queue.json").load()
+            self.assertEqual(loaded_queue.status, "APPROVED")
+            proposals = ProposalStore(root / "proposals.json").load().proposals
+            self.assertEqual(proposals, [])
+            self.assertIn("Do proposal", fake.user_tasks)
+            self.assertIn("Do B", fake.user_tasks)
+            self.assertIn(RUN_PLAN_APPROVED, fake.input_statuses)
 
     def test_proposal_approve_dispatches_existing_approved_run_to_worker(self) -> None:
         from c_orch.run_store import RunStore
