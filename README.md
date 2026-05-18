@@ -188,8 +188,8 @@ this mode; its root page only points back to the Vite dev UI.
 
 For self-modifying Cork runs, prefer the supervised dashboard. It starts the
 same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the
-child after active queue/proposal dispatch drains, and then clears the restart
-gate through the backend queue action:
+child after backend-authored restart-drain reaches a safe restart point, and
+then clears the restart gate through the backend queue action:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
@@ -301,6 +301,21 @@ only the last fallback.
   evidence. `restart` remains an operational gate when running the plain
   dashboard, and the `supervise-ui` wrapper can clear it after restarting the
   UI/runtime child.
+- Runtime state includes backend-authored `runtime.restart_drain` with
+  `stage`, `can_restart`, `blocking_reasons`, runtime lane counts, and active
+  lease summaries. Supervisor/UI should use this state as restart safety
+  source-of-truth instead of inferring safety in frontend code.
+- Active self-bootstrap restart is conservative: when restart gate is active,
+  backend stops starting new proposal/queue lanes; existing lanes may continue
+  to durable boundaries. Supervisor only auto-restarts after runtime lanes are
+  drained and restart blockers are cleared by backend-authored
+  `runtime.restart_drain`.
+- Current fail-safe guard: active `phase=code_review` external subprocess
+  leases still block restart until a completed result manifest is durable and
+  importable. Without post-restart watcher/adoption for in-flight reviewer
+  subprocesses, c-orch does not clear restart gate for these active leases.
+- Runtime-owned, unknown, stale-without-live-subprocess-proof, or ambiguous
+  active leases block restart and surface readable blocking reasons.
 - The current MVP does not support parallel runs that modify the same target
   repo. Even though different tasks may target different repos, tasks that
   target the same repo must still run serially; otherwise patch apply can

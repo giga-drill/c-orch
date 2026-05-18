@@ -511,6 +511,34 @@ export interface RuntimeState {
       workspace_id: string | null;
     }[];
   } | null;
+  restart_drain?: {
+    stage: string;
+    can_restart: boolean;
+    message: string | null;
+    blocking_reasons: string[];
+    queue_lane_active_count: number;
+    proposal_lane_active_count: number;
+    active_runtime_lane_count: number;
+    queue_dispatch_running: boolean;
+    proposal_dispatch_running: boolean;
+    active_runner_lease_count: number;
+    safe_external_runner_lease_count: number;
+    unsafe_active_runner_lease_count: number;
+    active_runner_leases: Array<{
+      run_id: string;
+      runner_id: string;
+      phase: string;
+      status: string;
+      effective_status: string;
+      heartbeat_at: string | null;
+      lease_expires_at: string | null;
+      process_hint: string | null;
+      pid: number | null;
+      checkpoint: Record<string, unknown>;
+      restart_safe_external: boolean;
+      restart_blocking_reason: string;
+    }>;
+  } | null;
 }
 
 export interface TelemetryCoverage {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -83,6 +84,157 @@ class StartupReconciliationTests(unittest.TestCase):
             ]
             self.assertEqual(len(startup_events), 1)
             self.assertEqual(startup_events[0]["reason"], "lease_active_process_alive")
+
+    def test_code_review_subprocess_started_uses_checkpoint_pid_for_liveness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="External code review still alive",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = RUN_REVIEWING
+            manifest.planner.status = RUN_REVIEWING
+            manifest.plan = PlanRecord(
+                summary="Plan",
+                worker_prompt="Do work",
+                approval_status="approved",
+                approved_by="human",
+            )
+            worker = manifest.workers[0]
+            worker.status = WORKER_DONE
+            manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id=worker.id,
+                    status=REVIEW_ATTEMPT_ACTIVE,
+                    started_at=store.now_iso(),
+                    worker_attempt=worker.attempt,
+                    workspace_path=str(root),
+                    evidence_files=["evidence/review.patch"],
+                )
+            ]
+            store.save(manifest)
+            now = datetime.now(timezone.utc)
+            lease = store.runner_lease_store(manifest.run_id).create(
+                runtime_generation="runtime-1",
+                run_id=manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                process_hint="runtime:dead-parent",
+                pid=999999,  # simulated dead parent runtime pid
+                checkpoint={
+                    "review_attempt_id": "review-1",
+                    "run_status": RUN_REVIEWING,
+                    "phase_boundary": "runner_subprocess_started",
+                    "runner_phase": RUNNER_PHASE_CODE_REVIEW,
+                    "request_path": "runs/request.json",
+                    "result_path": "runs/result.json",
+                    "pid": os.getpid(),  # simulated live subprocess pid
+                    "process_hint": f"pid:{os.getpid()}",
+                },
+                now=now,
+                lease_ttl_seconds=3600,
+            )
+
+            decisions = reconcile_runtime_startup_leases(
+                run_store=store,
+                runtime_generation="runtime-2",
+                process_hint="runtime:test",
+                now=now,
+            )
+
+            alive = [item for item in decisions if item["runner_id"] == lease.runner_id]
+            self.assertEqual(len(alive), 1)
+            self.assertEqual(alive[0]["category"], "runner_alive")
+            self.assertEqual(alive[0]["recovery_action"], "noop_keep_running")
+            events = store.load_events(manifest.run_id)
+            startup_events = [
+                event
+                for event in events
+                if event.get("type") == "recovery_decision_recorded"
+                and event.get("source") == "runtime_startup"
+            ]
+            self.assertEqual(len(startup_events), 1)
+            self.assertEqual(startup_events[0]["reason"], "lease_active_process_alive")
+
+    def test_stale_code_review_subprocess_with_live_checkpoint_pid_is_kept_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="External code review stale heartbeat but subprocess alive",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = RUN_REVIEWING
+            manifest.planner.status = RUN_REVIEWING
+            manifest.plan = PlanRecord(
+                summary="Plan",
+                worker_prompt="Do work",
+                approval_status="approved",
+                approved_by="human",
+            )
+            worker = manifest.workers[0]
+            worker.status = WORKER_DONE
+            manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id=worker.id,
+                    status=REVIEW_ATTEMPT_ACTIVE,
+                    started_at=store.now_iso(),
+                    worker_attempt=worker.attempt,
+                    workspace_path=str(root),
+                    evidence_files=["evidence/review.patch"],
+                )
+            ]
+            store.save(manifest)
+            now = datetime.now(timezone.utc)
+            stale_time = now - timedelta(hours=2)
+            lease = store.runner_lease_store(manifest.run_id).create(
+                runtime_generation="runtime-1",
+                run_id=manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                process_hint="runtime:dead-parent",
+                pid=999999,
+                checkpoint={
+                    "review_attempt_id": "review-1",
+                    "run_status": RUN_REVIEWING,
+                    "phase_boundary": "runner_subprocess_started",
+                    "runner_phase": RUNNER_PHASE_CODE_REVIEW,
+                    "request_path": "runs/request.json",
+                    "result_path": "runs/result.json",
+                    "pid": os.getpid(),
+                    "process_hint": f"pid:{os.getpid()}",
+                },
+                now=stale_time,
+                lease_ttl_seconds=60,
+            )
+
+            decisions = reconcile_runtime_startup_leases(
+                run_store=store,
+                runtime_generation="runtime-2",
+                process_hint="runtime:test",
+                now=now,
+            )
+
+            alive = [item for item in decisions if item["runner_id"] == lease.runner_id]
+            self.assertEqual(len(alive), 1)
+            self.assertEqual(alive[0]["category"], "runner_alive")
+            self.assertEqual(alive[0]["reason"], "lease_stale_but_subprocess_alive")
+            self.assertEqual(alive[0]["recovery_action"], "noop_keep_running")
+            leases = store.runner_lease_store(manifest.run_id).read(now=now).to_dict()
+            row = next(item for item in leases["leases"] if item["runner_id"] == lease.runner_id)
+            self.assertEqual(row["status"], LEASE_STATUS_ACTIVE)
+            self.assertEqual(row["effective_status"], "stale")
 
     def test_stale_worker_lease_terminalizes_and_marks_run_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

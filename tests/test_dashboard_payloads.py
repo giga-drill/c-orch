@@ -8,6 +8,7 @@ from pathlib import Path
 
 from c_orch import dashboard_payloads
 from c_orch.proposal_store import ProposalStore
+from c_orch.runner_subprocess import RUNNER_PHASE_CODE_REVIEW
 from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.runner_leases import RunnerLeaseStore
 from c_orch.task_store import TaskStore
@@ -478,6 +479,176 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertEqual(restart_gate["run_ids"], [gate_manifest.run_id])
             self.assertEqual(restart_gate["items"][0]["task_id"], "gate-task")
             self.assertEqual(restart_gate["items"][0]["run_id"], gate_manifest.run_id)
+
+    def test_state_payload_restart_drain_blocks_unsafe_active_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate task", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            run_store.save(gate_manifest)
+            queue_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            RunnerLeaseStore(run_store.runner_leases_path(gate_manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=gate_manifest.run_id,
+                phase="worker_implement",
+                task_id=gate_manifest.task_id,
+                proposal_id=gate_manifest.proposal_id,
+                process_hint="runtime:123",
+                pid=123,
+                checkpoint={"phase_boundary": "worker_call_inflight", "run_status": "WORKING"},
+            )
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=None,
+                runtime_generation="test-generation",
+            )
+
+            restart_drain = payload["runtime"]["restart_drain"]
+            self.assertEqual(restart_drain["stage"], "blocked")
+            self.assertFalse(restart_drain["can_restart"])
+            self.assertEqual(restart_drain["unsafe_active_runner_lease_count"], 1)
+            self.assertIn("worker_implement", restart_drain["blocking_reasons"][0])
+
+    def test_state_payload_restart_drain_blocks_active_external_code_review_until_result_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate task", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            run_store.save(gate_manifest)
+            queue_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            RunnerLeaseStore(run_store.runner_leases_path(gate_manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=gate_manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                task_id=gate_manifest.task_id,
+                proposal_id=gate_manifest.proposal_id,
+                process_hint="pid:456",
+                pid=456,
+                checkpoint={
+                    "phase_boundary": "runner_subprocess_started",
+                    "runner_phase": RUNNER_PHASE_CODE_REVIEW,
+                    "request_path": "runs/request.json",
+                    "result_path": "runs/result.json",
+                    "pid": 456,
+                },
+            )
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=None,
+                runtime_generation="test-generation",
+            )
+
+            restart_drain = payload["runtime"]["restart_drain"]
+            self.assertEqual(restart_drain["stage"], "blocked")
+            self.assertFalse(restart_drain["can_restart"])
+            self.assertEqual(restart_drain["safe_external_runner_lease_count"], 0)
+            self.assertEqual(restart_drain["unsafe_active_runner_lease_count"], 1)
+            self.assertIn("waiting for completed result manifest import", restart_drain["blocking_reasons"][0])
+
+    def test_state_payload_restart_drain_blocks_code_review_lease_without_checkpoint_process_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate task", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            run_store.save(gate_manifest)
+            queue_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            # Only top-level process hint exists; subprocess checkpoint metadata is incomplete.
+            RunnerLeaseStore(run_store.runner_leases_path(gate_manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=gate_manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                task_id=gate_manifest.task_id,
+                proposal_id=gate_manifest.proposal_id,
+                process_hint="runtime:123",
+                pid=123,
+                checkpoint={
+                    "phase_boundary": "runner_subprocess_started",
+                    "runner_phase": RUNNER_PHASE_CODE_REVIEW,
+                    "request_path": "runs/request.json",
+                    "result_path": "runs/result.json",
+                },
+            )
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=None,
+                runtime_generation="test-generation",
+            )
+
+            restart_drain = payload["runtime"]["restart_drain"]
+            self.assertEqual(restart_drain["stage"], "blocked")
+            self.assertFalse(restart_drain["can_restart"])
+            self.assertEqual(restart_drain["safe_external_runner_lease_count"], 0)
+            self.assertEqual(restart_drain["unsafe_active_runner_lease_count"], 1)
+            self.assertIn("missing request/result/process metadata", restart_drain["blocking_reasons"][0])
 
     def test_state_payload_includes_telemetry_without_writing_state_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

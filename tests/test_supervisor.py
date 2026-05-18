@@ -118,6 +118,7 @@ def state_payload(
     queue_dispatch_running: bool,
     proposal_dispatch_running: bool,
     restart_gate: Optional[Mapping[str, Any]] = None,
+    restart_drain: Optional[Mapping[str, Any]] = None,
     queue_lane_active_count: int = 0,
     proposal_lane_active_count: int = 0,
 ) -> Mapping[str, Any]:
@@ -129,6 +130,7 @@ def state_payload(
             "queue_lane_active_count": queue_lane_active_count,
             "proposal_lane_active_count": proposal_lane_active_count,
             "restart_gate": restart_gate,
+            "restart_drain": restart_drain,
         },
         "queue": queue,
     }
@@ -188,6 +190,28 @@ class SupervisorTests(unittest.TestCase):
         )
 
         self.assertEqual(restart_drain_reasons(payload), [])
+
+    def test_restart_drain_reasons_prefer_backend_restart_drain_blockers(self) -> None:
+        payload = state_payload(
+            queue=queue_payload(status="RESTART_REQUIRED", waiting_for="restart"),
+            queue_dispatch_running=False,
+            proposal_dispatch_running=False,
+            restart_gate={"active": True, "run_ids": ["run-1"], "task_ids": ["task-1"]},
+            restart_drain={
+                "stage": "blocked",
+                "can_restart": False,
+                "blocking_reasons": [
+                    "run-1:runner-1 code_review lease missing runner_subprocess_started boundary (got 'code_review_subprocess_launch_inflight')",
+                ],
+            },
+        )
+
+        self.assertEqual(
+            restart_drain_reasons(payload),
+            [
+                "run-1:runner-1 code_review lease missing runner_subprocess_started boundary (got 'code_review_subprocess_launch_inflight')",
+            ],
+        )
 
     def test_build_ui_command_uses_resolved_dashboard_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,6 +390,161 @@ class SupervisorTests(unittest.TestCase):
 
         self.assertEqual(first, "restart-draining")
         self.assertEqual(second, "restart-confirmed")
+        self.assertEqual(len(started), 2)
+        self.assertTrue(started[0].terminated)
+        self.assertEqual(client.confirm_calls, 1)
+
+    def test_restart_gate_waits_when_backend_marks_restart_drain_blocked(self) -> None:
+        started: list[FakeProcess] = []
+
+        def process_factory(command: Sequence[str], cwd: Path) -> FakeProcess:
+            process = FakeProcess()
+            started.append(process)
+            return process
+
+        client = FakeClient(
+            [queue_payload(status="PENDING")],
+            state_payloads=[
+                state_payload(
+                    queue=queue_payload(status="RESTART_REQUIRED", waiting_for="restart"),
+                    queue_dispatch_running=False,
+                    proposal_dispatch_running=False,
+                    queue_lane_active_count=0,
+                    proposal_lane_active_count=0,
+                    restart_gate={"active": True, "run_ids": ["run-1"], "task_ids": ["task-1"]},
+                    restart_drain={
+                        "stage": "blocked",
+                        "can_restart": False,
+                        "blocking_reasons": [
+                            "run-1:runner-1 active phase 'worker_implement' is runtime-owned or unsupported for restart handoff",
+                        ],
+                    },
+                ),
+            ],
+        )
+        supervisor = DashboardSupervisor(
+            SupervisorConfig(
+                command=["python", "-m", "c_orch.cli", "ui"],
+                cwd=Path("/tmp"),
+                base_url="http://127.0.0.1:8765",
+                startup_timeout_seconds=1,
+                stop_timeout_seconds=1,
+            ),
+            client=client,
+            process_factory=process_factory,
+        )
+
+        supervisor.start()
+        outcome = supervisor.check_once()
+
+        self.assertEqual(outcome, "restart-draining")
+        self.assertEqual(len(started), 1)
+        self.assertFalse(started[0].terminated)
+        self.assertEqual(client.confirm_calls, 0)
+
+    def test_restart_gate_waits_for_active_external_code_review_result_import(self) -> None:
+        started: list[FakeProcess] = []
+
+        def process_factory(command: Sequence[str], cwd: Path) -> FakeProcess:
+            process = FakeProcess()
+            started.append(process)
+            return process
+
+        client = FakeClient(
+            [queue_payload(status="PENDING")],
+            state_payloads=[
+                state_payload(
+                    queue=queue_payload(status="RESTART_REQUIRED", waiting_for="restart"),
+                    queue_dispatch_running=False,
+                    proposal_dispatch_running=False,
+                    queue_lane_active_count=0,
+                    proposal_lane_active_count=0,
+                    restart_gate={"active": True, "run_ids": ["run-1"], "task_ids": ["task-1"]},
+                    restart_drain={
+                        "stage": "blocked",
+                        "can_restart": False,
+                        "blocking_reasons": [
+                            "run-1:runner-1 code_review subprocess still active; waiting for completed result manifest import before restart",
+                        ],
+                    },
+                ),
+            ],
+        )
+        supervisor = DashboardSupervisor(
+            SupervisorConfig(
+                command=["python", "-m", "c_orch.cli", "ui"],
+                cwd=Path("/tmp"),
+                base_url="http://127.0.0.1:8765",
+                startup_timeout_seconds=1,
+                stop_timeout_seconds=1,
+            ),
+            client=client,
+            process_factory=process_factory,
+        )
+
+        supervisor.start()
+        outcome = supervisor.check_once()
+
+        self.assertEqual(outcome, "restart-draining")
+        self.assertEqual(len(started), 1)
+        self.assertFalse(started[0].terminated)
+        self.assertEqual(client.confirm_calls, 0)
+
+    def test_restart_gate_allows_backend_marked_ready_restart(self) -> None:
+        started: list[FakeProcess] = []
+
+        def process_factory(command: Sequence[str], cwd: Path) -> FakeProcess:
+            process = FakeProcess()
+            started.append(process)
+            return process
+
+        client = FakeClient(
+            [queue_payload(status="PENDING")],
+            state_payloads=[
+                state_payload(
+                    queue=queue_payload(status="RESTART_REQUIRED", waiting_for="restart"),
+                    queue_dispatch_running=False,
+                    proposal_dispatch_running=False,
+                    queue_lane_active_count=0,
+                    proposal_lane_active_count=0,
+                    restart_gate={"active": True, "run_ids": ["run-1"], "task_ids": ["task-1"]},
+                    restart_drain={
+                        "stage": "ready_to_restart",
+                        "can_restart": True,
+                        "blocking_reasons": [],
+                    },
+                ),
+                state_payload(
+                    queue=queue_payload(status="RESTART_REQUIRED", waiting_for="restart"),
+                    queue_dispatch_running=False,
+                    proposal_dispatch_running=False,
+                    queue_lane_active_count=0,
+                    proposal_lane_active_count=0,
+                    restart_gate={"active": True, "run_ids": ["run-1"], "task_ids": ["task-1"]},
+                    restart_drain={
+                        "stage": "ready_to_restart",
+                        "can_restart": True,
+                        "blocking_reasons": [],
+                    },
+                ),
+            ],
+        )
+        supervisor = DashboardSupervisor(
+            SupervisorConfig(
+                command=["python", "-m", "c_orch.cli", "ui"],
+                cwd=Path("/tmp"),
+                base_url="http://127.0.0.1:8765",
+                startup_timeout_seconds=1,
+                stop_timeout_seconds=1,
+            ),
+            client=client,
+            process_factory=process_factory,
+        )
+
+        supervisor.start()
+        outcome = supervisor.check_once()
+
+        self.assertEqual(outcome, "restart-confirmed")
         self.assertEqual(len(started), 2)
         self.assertTrue(started[0].terminated)
         self.assertEqual(client.confirm_calls, 1)

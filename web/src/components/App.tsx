@@ -58,6 +58,9 @@ const statusText: Record<string, string> = {
   stale: "过期未续约",
   retry_backoff: "重试退避等待",
   retry_budget_exhausted: "自动重试预算耗尽",
+  ready_to_restart: "可重启",
+  draining: "drain 中",
+  blocked: "阻塞",
   PLAN_APPROVED: "计划已通过",
   WORKING: "Worker 工作中",
   WORK_DONE: "Worker 已完成",
@@ -402,6 +405,7 @@ export function App() {
           runtimeBusy={runtimeBusy}
           costMode={stateQuery.data?.cost_mode}
           restartGate={stateQuery.data?.runtime.restart_gate}
+          restartDrain={stateQuery.data?.runtime.restart_drain}
           runtimeLeaseSummary={stateQuery.data?.runtime.runner_leases?.summary}
         />
         <RetrospectivePanel telemetry={stateQuery.data?.telemetry} />
@@ -435,6 +439,7 @@ function SystemStatus({
   runtimeBusy,
   costMode,
   restartGate,
+  restartDrain,
   runtimeLeaseSummary,
 }: {
   queuePayload?: QueuePayload;
@@ -447,6 +452,20 @@ function SystemStatus({
     run_ids: string[];
     task_ids: string[];
     message: string | null;
+  } | null;
+  restartDrain?: {
+    stage: string;
+    can_restart: boolean;
+    message: string | null;
+    blocking_reasons: string[];
+    queue_lane_active_count: number;
+    proposal_lane_active_count: number;
+    active_runtime_lane_count: number;
+    queue_dispatch_running: boolean;
+    proposal_dispatch_running: boolean;
+    active_runner_lease_count: number;
+    safe_external_runner_lease_count: number;
+    unsafe_active_runner_lease_count: number;
   } | null;
   runtimeLeaseSummary?: {
     active: number;
@@ -468,6 +487,15 @@ function SystemStatus({
   const restartMessage = restartGateActive ? restartGate?.message : null;
   const restartTaskIds = restartGateActive ? (restartGate?.task_ids ?? []) : [];
   const restartRunIds = restartGateActive ? (restartGate?.run_ids ?? []) : [];
+  const restartStage = restartDrain?.stage ?? (restartRequired ? "restart" : "idle");
+  const restartCanRestart = restartDrain ? Boolean(restartDrain.can_restart) : restartRequired;
+  const restartBlockingReasons = restartDrain?.blocking_reasons ?? [];
+  const restartActiveLaneSummary = restartDrain
+    ? `${restartDrain.queue_lane_active_count}/${restartDrain.proposal_lane_active_count}`
+    : "0/0";
+  const restartLeaseSummary = restartDrain
+    ? `${restartDrain.active_runner_lease_count}/${restartDrain.safe_external_runner_lease_count}/${restartDrain.unsafe_active_runner_lease_count}`
+    : "-";
   const tiers = costMode?.effective_service_tiers;
   const modeLabel = costMode?.mode_label === "low_cost"
     ? "低消耗模式"
@@ -541,18 +569,37 @@ function SystemStatus({
         </strong>
       </div>
       {restartRequired ? (
+        <div className="systemStatusWide">
+          <span className="label">restart stage</span>
+          <strong>{formatStatus(restartStage)}</strong>
+          <span className="meta">can_restart: {restartCanRestart ? "yes" : "no"}</span>
+        </div>
+      ) : null}
+      {restartRequired ? (
+        <div className="systemStatusWide">
+          <span className="label">active lanes (queue/proposal)</span>
+          <strong>{restartActiveLaneSummary}</strong>
+          <span className="meta">active/safe/unsafe leases: {restartLeaseSummary}</span>
+        </div>
+      ) : null}
+      {restartRequired ? (
         <>
-          <p>{displayValue(restartMessage ?? "当前队列被 restart gate 暂停。请在 runtime 完成重启后确认继续。")}</p>
+          <p>{displayValue(restartDrain?.message ?? restartMessage ?? "当前队列被 restart gate 暂停。请在 runtime 完成重启后确认继续。")}</p>
           {restartTaskIds.length ? (
             <p className="meta">gate task_ids: {restartTaskIds.join(", ")}</p>
           ) : null}
           {restartRunIds.length ? (
             <p className="meta">gate run_ids: {restartRunIds.join(", ")}</p>
           ) : null}
+          {restartBlockingReasons.length ? (
+            <Collapsible title="restart 阻塞原因" open>
+              <BulletList items={restartBlockingReasons} />
+            </Collapsible>
+          ) : null}
           <button
             type="button"
             onClick={confirmRuntimeRestarted}
-            disabled={Boolean(pendingQueueAction)}
+            disabled={Boolean(pendingQueueAction) || !restartCanRestart}
           >
             {pendingQueueAction ? "确认中..." : "确认已重启并继续"}
           </button>

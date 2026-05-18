@@ -144,8 +144,8 @@ def _reconcile_single_lease(
 ) -> Optional[StartupReconciliationDecision]:
     runner_id = str(lease.get("runner_id") or "")
     phase = str(lease.get("phase") or "")
-    pid = lease.get("pid")
-    pid_int = int(pid) if isinstance(pid, int) or (isinstance(pid, str) and pid.isdigit()) else None
+    pid_int = _lease_liveness_pid(phase=phase, lease=lease)
+    requires_external_liveness = _requires_external_subprocess_liveness(phase=phase, lease=lease)
     result_path = _string_or_none(lease.get("checkpoint", {}).get("result_path")) if isinstance(lease.get("checkpoint"), dict) else None
 
     if manifest.status in TERMINAL_RUN_STATUSES:
@@ -212,6 +212,9 @@ def _reconcile_single_lease(
     if status == LEASE_STATUS_ACTIVE and effective_status == LEASE_STATUS_ACTIVE:
         if pid_int is not None and not _pid_is_alive(pid_int):
             effective_status = "stale"
+        elif requires_external_liveness and pid_int is None:
+            # External subprocess lease cannot be proven alive without subprocess metadata.
+            effective_status = "stale"
         else:
             decision = StartupReconciliationDecision(
                 run_id=manifest.run_id,
@@ -238,8 +241,38 @@ def _reconcile_single_lease(
             return decision
 
     if status == LEASE_STATUS_ACTIVE and effective_status == "stale":
+        if requires_external_liveness and pid_int is not None and _pid_is_alive(pid_int):
+            decision = StartupReconciliationDecision(
+                run_id=manifest.run_id,
+                runner_id=runner_id,
+                phase=phase,
+                category=CATEGORY_RUNNER_ALIVE,
+                reason="lease_stale_but_subprocess_alive",
+                recovery_action=RECOVERY_NOOP_KEEP_RUNNING,
+                automatic=True,
+                requires_human=False,
+                retryable=False,
+                lease_status=status,
+                effective_status=effective_status,
+                result_path=result_path,
+            )
+            _record_startup_decision_event(
+                run_store=run_store,
+                events=events,
+                decision=decision,
+                runtime_generation=runtime_generation,
+                process_hint=process_hint,
+                lease=lease,
+            )
+            return decision
         if pid_int is not None and not _pid_is_alive(pid_int):
             lease_store.fail(runner_id, error="startup reconciliation: runner pid is not alive")
+            status = LEASE_STATUS_FAILED
+        elif requires_external_liveness:
+            lease_store.fail(
+                runner_id,
+                error="startup reconciliation: external runner subprocess pid/process_hint missing",
+            )
             status = LEASE_STATUS_FAILED
         else:
             lease_store.expire()
@@ -1056,6 +1089,45 @@ def _has_event_with_fields(events: List[Dict[str, Any]], event_type: str, fields
         if all(event.get(key) == value for key, value in fields.items()):
             return True
     return False
+
+
+def _requires_external_subprocess_liveness(*, phase: str, lease: Dict[str, Any]) -> bool:
+    if phase != RUNNER_PHASE_CODE_REVIEW:
+        return False
+    checkpoint = lease.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return False
+    return _string_or_none(checkpoint.get("phase_boundary")) == "runner_subprocess_started"
+
+
+def _lease_liveness_pid(*, phase: str, lease: Dict[str, Any]) -> Optional[int]:
+    checkpoint = lease.get("checkpoint")
+    if _requires_external_subprocess_liveness(phase=phase, lease=lease) and isinstance(checkpoint, dict):
+        checkpoint_pid = _int_or_none(checkpoint.get("pid"))
+        if checkpoint_pid is not None:
+            return checkpoint_pid
+        hint_pid = _pid_from_process_hint(checkpoint.get("process_hint"))
+        if hint_pid is not None:
+            return hint_pid
+        return None
+    return _int_or_none(lease.get("pid"))
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _pid_from_process_hint(value: Any) -> Optional[int]:
+    hint = _string_or_none(value)
+    if hint is None:
+        return None
+    if hint.startswith("pid:"):
+        return _int_or_none(hint.split(":", 1)[1])
+    return None
 
 
 def _pid_is_alive(pid: int) -> bool:

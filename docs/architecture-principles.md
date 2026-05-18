@@ -55,9 +55,19 @@ low-level child runtime/debug entry; it does not supervise its own restart gate.
 For self-modifying runs, the supervisor owns process restart, while the
 restarted backend still owns clearing the restart gate through the normal queue
 action.
-Automatic restart should eventually use a drain protocol: stop starting new
-lanes, let active lanes reach durable checkpoints or persist leases, restart
-the child runtime, reconcile persisted state, and then clear the restart gate.
+Automatic restart now follows a backend-authored drain protocol in
+`runtime.restart_drain`: stop starting new lanes, let active lanes reach durable
+checkpoints or persist leases, restart the child runtime only when
+`can_restart=true`, reconcile persisted state, and then clear the restart gate.
+Current fail-safe boundary is conservative: active self-bootstrap restart is
+allowed only when runtime lanes are drained and backend-authored
+`runtime.restart_drain` reports `can_restart=true`.
+Until post-restart watcher/adoption exists for in-flight external reviewer
+subprocesses, active `phase=code_review` runner-subprocess leases remain
+restart blockers even when subprocess metadata is present; runtime must wait
+for a completed result manifest that startup reconciliation can import.
+Any runtime-owned/unknown/stale-without-live-subprocess-proof/ambiguous active
+lease blocks restart.
 
 ## Usage Attribution Sidecar
 
@@ -236,6 +246,7 @@ Runner lease metadata (phase 1 delivered):
 Still not implemented:
 
 - Planner/Worker subprocess execution handoff
+- active self-bootstrap restart for Planner/Worker runtime-owned active leases
 - automatic rebase/replay for same-repo parallel apply conflicts
 
 Delivered in this phase:

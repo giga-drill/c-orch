@@ -29,6 +29,7 @@ from .proposal_store import (
     ProposalStore,
 )
 from .restart_gate import detect_restart_gate
+from .runner_subprocess import RUNNER_PHASE_CODE_REVIEW
 from .run_store import RunManifest, RunStore
 from .states import (
     REVIEW_ATTEMPT_FAILED_RETRYABLE,
@@ -57,6 +58,10 @@ from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 Pathish = Union[str, Path]
 _SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？]|[.?!](?=\s|$)|(?:\r?\n)")
+_RESTART_STAGE_IDLE = "idle"
+_RESTART_STAGE_DRAINING = "draining"
+_RESTART_STAGE_BLOCKED = "blocked"
+_RESTART_STAGE_READY = "ready_to_restart"
 
 
 def _proposal_status_from_run(manifest: RunManifest) -> str:
@@ -153,12 +158,25 @@ def build_state_payload(
     last_proposal_dispatch_error: Optional[str] = None,
     selected_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    runs_path = Path(runs_dir).expanduser().resolve()
+    queue_file = Path(queue_path).expanduser().resolve() if queue_path is not None else None
+    proposals_file = Path(proposals_path).expanduser().resolve() if proposals_path is not None else None
+    normalized_queue_lanes = max(0, int(queue_lane_active_count))
+    normalized_proposal_lanes = max(0, int(proposal_lane_active_count))
     runs_payload = build_runs_payload(runs_dir)
     queue_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
     proposals_payload = build_proposals_payload(proposals_path, runs_dir=runs_dir)
     restart_gate = _restart_gate_payload(
-        queue_path=Path(queue_path).expanduser().resolve() if queue_path is not None else None,
-        runs_dir=Path(runs_dir).expanduser().resolve(),
+        queue_path=queue_file,
+        runs_dir=runs_path,
+    )
+    restart_drain = _restart_drain_payload(
+        runs_dir=runs_path,
+        restart_gate=restart_gate,
+        queue_dispatch_running=queue_dispatch_running,
+        proposal_dispatch_running=proposal_dispatch_running,
+        queue_lane_active_count=normalized_queue_lanes,
+        proposal_lane_active_count=normalized_proposal_lanes,
     )
     focused_run_id = selected_run_id or _focused_run_id(
         proposals_payload=proposals_payload,
@@ -171,9 +189,9 @@ def build_state_payload(
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "version": _state_version(
-            runs_dir=Path(runs_dir).expanduser().resolve(),
-            queue_path=Path(queue_path).expanduser().resolve() if queue_path is not None else None,
-            proposals_path=Path(proposals_path).expanduser().resolve() if proposals_path is not None else None,
+            runs_dir=runs_path,
+            queue_path=queue_file,
+            proposals_path=proposals_file,
         ),
         "runtime": {
             "generation": runtime_generation,
@@ -181,11 +199,12 @@ def build_state_payload(
             "dispatch_running": dispatch_running,
             "queue_dispatch_running": queue_dispatch_running,
             "proposal_dispatch_running": proposal_dispatch_running,
-            "queue_lane_active_count": max(0, int(queue_lane_active_count)),
-            "proposal_lane_active_count": max(0, int(proposal_lane_active_count)),
+            "queue_lane_active_count": normalized_queue_lanes,
+            "proposal_lane_active_count": normalized_proposal_lanes,
             "last_dispatch_error": last_dispatch_error,
             "last_proposal_dispatch_error": last_proposal_dispatch_error,
             "restart_gate": restart_gate,
+            "restart_drain": restart_drain,
             "runner_leases": runner_leases,
         },
         "cost_mode": _cost_mode_payload(cost_mode),
@@ -231,6 +250,177 @@ def _restart_gate_payload(*, queue_path: Optional[Path], runs_dir: Path) -> Dict
         now_iso=run_store.now_iso,
     )
     return detect_restart_gate(queue, run_loader=run_store.load).to_payload()
+
+
+def _restart_drain_payload(
+    *,
+    runs_dir: Path,
+    restart_gate: Dict[str, Any],
+    queue_dispatch_running: bool,
+    proposal_dispatch_running: bool,
+    queue_lane_active_count: int,
+    proposal_lane_active_count: int,
+) -> Dict[str, Any]:
+    gate_active = bool(restart_gate.get("active"))
+    runtime_lane_blockers: List[str] = []
+    if queue_dispatch_running or queue_lane_active_count > 0:
+        runtime_lane_blockers.append(
+            f"queue lane active (dispatch={str(bool(queue_dispatch_running)).lower()}, lanes={queue_lane_active_count})"
+        )
+    if proposal_dispatch_running or proposal_lane_active_count > 0:
+        runtime_lane_blockers.append(
+            f"proposal lane active (dispatch={str(bool(proposal_dispatch_running)).lower()}, lanes={proposal_lane_active_count})"
+        )
+
+    active_leases = _collect_restart_relevant_leases(runs_dir)
+    active_lease_items: List[Dict[str, Any]] = []
+    safe_external_leases = 0
+    unsafe_active_leases = 0
+    lease_blockers: List[str] = []
+    for lease in active_leases:
+        assessment = _assess_restart_active_lease(lease)
+        lease_item = dict(lease)
+        lease_item["restart_safe_external"] = assessment["safe_external"]
+        lease_item["restart_blocking_reason"] = assessment["reason"]
+        active_lease_items.append(lease_item)
+        if assessment["safe_external"]:
+            safe_external_leases += 1
+            continue
+        unsafe_active_leases += 1
+        lease_blockers.append(str(assessment["reason"]))
+
+    blocking_reasons = runtime_lane_blockers + lease_blockers
+    if not gate_active:
+        stage = _RESTART_STAGE_IDLE
+        can_restart = False
+        message = "restart gate 未激活。"
+    elif blocking_reasons:
+        if runtime_lane_blockers:
+            stage = _RESTART_STAGE_DRAINING
+            message = "restart gate 已激活，runtime 正在 drain active lanes。"
+        else:
+            stage = _RESTART_STAGE_BLOCKED
+            message = "restart gate 已激活，但存在无法证明可恢复的 active lease，禁止自动重启。"
+        can_restart = False
+    else:
+        stage = _RESTART_STAGE_READY
+        can_restart = True
+        message = "restart gate 已激活，已达到安全重启条件。"
+
+    return {
+        "stage": stage,
+        "can_restart": can_restart,
+        "message": message,
+        "blocking_reasons": blocking_reasons,
+        "queue_lane_active_count": queue_lane_active_count,
+        "proposal_lane_active_count": proposal_lane_active_count,
+        "active_runtime_lane_count": queue_lane_active_count + proposal_lane_active_count,
+        "queue_dispatch_running": bool(queue_dispatch_running),
+        "proposal_dispatch_running": bool(proposal_dispatch_running),
+        "active_runner_lease_count": len(active_lease_items),
+        "safe_external_runner_lease_count": safe_external_leases,
+        "unsafe_active_runner_lease_count": unsafe_active_leases,
+        "active_runner_leases": active_lease_items,
+    }
+
+
+def _collect_restart_relevant_leases(runs_dir: Path) -> List[Dict[str, Any]]:
+    run_store = RunStore(runs_dir)
+    leases: List[Dict[str, Any]] = []
+    for lease_path in sorted(runs_dir.glob("*/runner-leases.json")):
+        run_id = lease_path.parent.name
+        try:
+            payload = run_store.load_runner_leases(run_id)
+        except OSError:
+            continue
+        for lease in _list_value(payload.get("leases")):
+            if not isinstance(lease, dict):
+                continue
+            status = str(lease.get("status") or "")
+            effective_status = str(lease.get("effective_status") or "")
+            if status != "active":
+                continue
+            if effective_status not in {"active", "stale"}:
+                continue
+            checkpoint = _dict_value(lease.get("checkpoint"))
+            leases.append(
+                {
+                    "run_id": str(lease.get("run_id") or run_id),
+                    "runner_id": str(lease.get("runner_id") or ""),
+                    "phase": str(lease.get("phase") or ""),
+                    "status": status,
+                    "effective_status": effective_status,
+                    "heartbeat_at": lease.get("heartbeat_at"),
+                    "lease_expires_at": lease.get("lease_expires_at"),
+                    "process_hint": lease.get("process_hint"),
+                    "pid": lease.get("pid"),
+                    "checkpoint": checkpoint,
+                }
+            )
+    leases.sort(
+        key=lambda item: (
+            str(item.get("heartbeat_at") or ""),
+            str(item.get("runner_id") or ""),
+        ),
+        reverse=True,
+    )
+    return leases
+
+
+def _assess_restart_active_lease(lease: Dict[str, Any]) -> Dict[str, Any]:
+    run_id = str(lease.get("run_id") or "unknown-run")
+    runner_id = str(lease.get("runner_id") or "unknown-runner")
+    phase = str(lease.get("phase") or "")
+    effective_status = str(lease.get("effective_status") or "")
+    checkpoint = _dict_value(lease.get("checkpoint"))
+    if effective_status == "stale":
+        return {
+            "safe_external": False,
+            "reason": f"{run_id}:{runner_id} stale active lease requires startup reconciliation first",
+        }
+    if phase != RUNNER_PHASE_CODE_REVIEW:
+        return {
+            "safe_external": False,
+            "reason": f"{run_id}:{runner_id} active phase '{phase}' is runtime-owned or unsupported for restart handoff",
+        }
+    phase_boundary = str(checkpoint.get("phase_boundary") or "")
+    runner_phase = str(checkpoint.get("runner_phase") or "")
+    request_path = str(checkpoint.get("request_path") or "")
+    result_path = str(checkpoint.get("result_path") or "")
+    checkpoint_pid = checkpoint.get("pid")
+    has_checkpoint_pid = isinstance(checkpoint_pid, int) or (
+        isinstance(checkpoint_pid, str) and checkpoint_pid.isdigit()
+    )
+    checkpoint_process_hint = str(checkpoint.get("process_hint") or "")
+    has_checkpoint_process_hint = bool(checkpoint_process_hint.strip())
+    has_checkpoint_process_metadata = has_checkpoint_pid or has_checkpoint_process_hint
+    if phase_boundary != "runner_subprocess_started":
+        return {
+            "safe_external": False,
+            "reason": (
+                f"{run_id}:{runner_id} code_review lease missing runner_subprocess_started boundary "
+                f"(got '{phase_boundary or 'unknown'}')"
+            ),
+        }
+    if runner_phase != RUNNER_PHASE_CODE_REVIEW:
+        return {
+            "safe_external": False,
+            "reason": f"{run_id}:{runner_id} code_review lease missing runner_phase={RUNNER_PHASE_CODE_REVIEW}",
+        }
+    if not request_path or not result_path or not has_checkpoint_process_metadata:
+        return {
+            "safe_external": False,
+            "reason": (
+                f"{run_id}:{runner_id} code_review subprocess lease missing request/result/process metadata"
+            ),
+        }
+    return {
+        "safe_external": False,
+        "reason": (
+            f"{run_id}:{runner_id} code_review subprocess still active; "
+            "waiting for completed result manifest import before restart"
+        ),
+    }
 
 
 def build_queue_payload(

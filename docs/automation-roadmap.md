@@ -23,7 +23,8 @@ idle self-restart slices. The remaining important automation gaps are:
 
 - long-running Planner/Worker execution is still owned by the dashboard runtime
   process instead of durable runner leases
-- self-bootstrap restart is only automatic when the runtime is idle
+- active self-bootstrap restart is still limited to provably safe external
+  runner-lease scenarios
 - same-repo parallel conflict recovery is still manual/fail-with-evidence
 - live Agent activity is available from Codex session logs but not yet treated
   as a first-class dashboard surface
@@ -491,21 +492,26 @@ Drain mode should mean:
 - if a lane cannot finish soon, its lease and phase state must be persisted
   before restart
 
-The first implementation can be simpler: only auto-restart when no active lanes
-exist. Later, runner subprocesses plus leases can allow restart while external
-work is still running.
-
-Status (Phase 1 delivered):
+Status (Phase 2 conservative delivery):
 
 - `supervise-ui` and `dev-ui` use `DashboardSupervisor` to own the runtime
   child process.
 - When an approved self-modifying run touches c-orch runtime code, c-orch marks
   `restart_required` with affected paths after apply and commit.
-- The supervisor detects the restart gate, waits until active queue/proposal
-  dispatch drains, restarts the runtime child, and clears the gate through the
-  backend `confirm-runtime-restarted` queue action.
-- This supports the safe idle case: no active proposal planning lanes and no
-  active queue execution lanes at restart time.
+- Backend state now exposes `runtime.restart_drain` with drain/restart stage,
+  `can_restart`, blocking reasons, active lane counts, and active lease
+  summaries. Supervisor and dashboard consume this backend-authored state.
+- With restart gate active, backend blocks new queue/proposal lane starts and
+  lets existing lanes drain to durable boundaries.
+- The supervisor restarts the runtime child only when
+  `runtime.restart_drain.can_restart=true`, then clears the gate through backend
+  `confirm-runtime-restarted`.
+- Active restart beyond idle remains fail-safe guarded. In-flight external
+  reviewer subprocess leases (`phase=code_review`) still block restart until a
+  completed result manifest is durable/importable by startup reconciliation;
+  there is no post-restart watcher/adoption for active reviewer subprocesses
+  yet. Runtime-owned/unknown/stale/ambiguous active leases also block restart
+  with explicit reasons.
 - The canonical dashboard entry points now prefer supervised startup; bare
   `c-orch ui` is treated as a low-level child runtime/debug entry.
 
@@ -598,9 +604,11 @@ larger lifecycle architecture changes.
 11. Runtime-startup lease reconciliation.
     Reconcile alive, stale, completed, and failed runners into explicit
     recovery decisions after restart.
-12. Active self-bootstrap drain-and-restart.
-    Extend self-bootstrap restart beyond the idle-only case so c-orch can
-    restart itself while external runners preserve or checkpoint active work.
+12. Active self-bootstrap drain-and-restart. (Phase 2 conservative delivery)
+    Runtime now supports a backend-authored drain gate and lane drain, but
+    keeps active external reviewer subprocess leases behind a restart guard
+    until completed result manifests are importable. Planner/Worker subprocess
+    handoff and broader active-lease restart remain follow-up.
 13. Same-repo parallel conflict recovery.
     Add rebase/recreate/apply-conflict recovery for concurrent same-target-repo
     work. Until then, same-target-repo edits remain serialized or fail with

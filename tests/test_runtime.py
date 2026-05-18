@@ -19,7 +19,9 @@ from c_orch.proposal_store import (
     ProposalRecord,
     ProposalStore,
 )
+from c_orch.runner_subprocess import RUNNER_PHASE_CODE_REVIEW
 from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.runner_leases import RunnerLeaseStore
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
 from c_orch.states import (
@@ -1092,6 +1094,114 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("Do proposal", fake.user_tasks)
             self.assertIn("Do B", fake.user_tasks)
             self.assertIn(RUN_PLAN_APPROVED, fake.input_statuses)
+
+    def test_runtime_state_restart_drain_blocks_unsafe_active_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            run_store.save(gate_manifest)
+            RunnerLeaseStore(run_store.runner_leases_path(gate_manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=gate_manifest.run_id,
+                phase="worker_implement",
+                task_id=gate_manifest.task_id,
+                proposal_id=gate_manifest.proposal_id,
+                process_hint="runtime:123",
+                pid=123,
+                checkpoint={"phase_boundary": "worker_call_inflight", "run_status": "WORKING"},
+            )
+
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate", "cwd": str(repo)}]
+            )
+            task_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            task_store.save(queue)
+
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+            )
+            state = runtime.build_state_payload()
+            restart_drain = state["runtime"]["restart_drain"]
+            self.assertEqual(restart_drain["stage"], "blocked")
+            self.assertFalse(restart_drain["can_restart"])
+            self.assertEqual(restart_drain["unsafe_active_runner_lease_count"], 1)
+
+    def test_runtime_state_restart_drain_blocks_active_external_code_review_until_result_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            gate_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Gate run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            gate_manifest.status = "APPROVED"
+            gate_manifest.requires_restart = True
+            run_store.save(gate_manifest)
+            RunnerLeaseStore(run_store.runner_leases_path(gate_manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=gate_manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                task_id=gate_manifest.task_id,
+                proposal_id=gate_manifest.proposal_id,
+                process_hint="pid:456",
+                pid=456,
+                checkpoint={
+                    "phase_boundary": "runner_subprocess_started",
+                    "runner_phase": RUNNER_PHASE_CODE_REVIEW,
+                    "request_path": "runs/request.json",
+                    "result_path": "runs/result.json",
+                    "pid": 456,
+                },
+            )
+
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "gate-task", "title": "Gate task", "prompt": "Gate", "cwd": str(repo)}]
+            )
+            task_store.update_task(
+                queue,
+                "gate-task",
+                status="APPROVED",
+                active_run_id=gate_manifest.run_id,
+                run_ids=[gate_manifest.run_id],
+            )
+            task_store.save(queue)
+
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+            )
+            state = runtime.build_state_payload()
+            restart_drain = state["runtime"]["restart_drain"]
+            self.assertEqual(restart_drain["stage"], "blocked")
+            self.assertFalse(restart_drain["can_restart"])
+            self.assertEqual(restart_drain["safe_external_runner_lease_count"], 0)
+            self.assertEqual(restart_drain["unsafe_active_runner_lease_count"], 1)
+            self.assertIn("waiting for completed result manifest import", restart_drain["blocking_reasons"][0])
 
     def test_proposal_approve_dispatches_existing_approved_run_to_worker(self) -> None:
         from c_orch.run_store import RunStore

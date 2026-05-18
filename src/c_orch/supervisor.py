@@ -283,6 +283,16 @@ def restart_drain_reasons(payload: Mapping[str, Any]) -> list[str]:
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict):
         return []
+    restart_drain = runtime.get("restart_drain")
+    if isinstance(restart_drain, dict):
+        can_restart = bool(restart_drain.get("can_restart"))
+        reasons = restart_drain.get("blocking_reasons")
+        if can_restart:
+            return []
+        if isinstance(reasons, list):
+            normalized = [str(item) for item in reasons if str(item).strip()]
+            if normalized:
+                return normalized
     queue_lane_active_count = runtime.get("queue_lane_active_count")
     proposal_lane_active_count = runtime.get("proposal_lane_active_count")
     reasons: list[str] = []
