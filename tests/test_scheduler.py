@@ -257,6 +257,61 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[1].active_run_id, loaded.tasks[1].run_ids[-1])
             self.assertEqual(len(fake.run_ids), 2)
 
+    def test_max_tasks_marks_queue_approved_when_last_task_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=replace(_config(root), max_tasks=1),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            self.assertEqual(loaded.status, QUEUE_APPROVED)
+            self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(len(fake.run_ids), 1)
+
+    def test_max_tasks_keeps_queue_pending_when_more_tasks_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            fake = _FakeOrchestrator(run_store, [("APPROVED", False)])
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=replace(_config(root), max_tasks=1),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+            loaded = task_store.load()
+
+            self.assertEqual(queue.status, "PENDING")
+            self.assertEqual(loaded.status, "PENDING")
+            self.assertEqual([task.status for task in loaded.tasks], [TASK_APPROVED, TASK_PENDING])
+            self.assertEqual(len(fake.run_ids), 1)
+
     def test_mixed_task_cwd_creates_runs_and_worktrees_per_task_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

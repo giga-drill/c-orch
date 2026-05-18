@@ -11,6 +11,7 @@ from .run_store import RunManifest, RunStore
 from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
 from .task_lifecycle import (
     REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
+    derive_queue_status,
     reconcile_queue,
     reconcile_task_with_active_run,
 )
@@ -120,9 +121,8 @@ class TaskScheduler:
                 self.task_store.save(queue)
                 return queue
             if self.config.max_tasks is not None and processed >= self.config.max_tasks:
-                if queue.status == QUEUE_RUNNING:
-                    queue.status = QUEUE_PENDING
-                    self.task_store.save(queue)
+                queue.status = derive_queue_status(queue)
+                self.task_store.save(queue)
                 return queue
 
             task = self._first_incomplete_task(queue)
