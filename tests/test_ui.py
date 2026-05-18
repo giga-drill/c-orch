@@ -880,6 +880,29 @@ class UiTests(unittest.TestCase):
             assert payload is not None
             self.assertEqual(payload["run"]["allowed_actions"], [])
 
+    def test_selected_task_must_not_affect_queue_ordering(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_source = (root / "web" / "src" / "components" / "App.tsx").read_text(encoding="utf-8")
+
+        sort_decl = "function sortQueueTasks(tasks: TaskSummary[]): TaskSummary[]"
+        self.assertIn(sort_decl, app_source)
+        self.assertIn("const sortedTasks = sortQueueTasks(queueTasks);", app_source)
+        self.assertNotIn("sortQueueTasks(queueTasks, selectedRunId)", app_source)
+        self.assertNotIn("function queueTaskPriority(", app_source)
+
+        sort_start = app_source.index(sort_decl)
+        sort_end = app_source.index("\n\nexport function App()", sort_start)
+        sort_block = app_source[sort_start:sort_end]
+        self.assertNotIn("selectedRunId", sort_block)
+        self.assertNotIn("task.status === \"RUNNING\"", sort_block)
+        self.assertNotIn("task.status === \"FAILED\"", sort_block)
+        self.assertIn("return rightUpdated - leftUpdated;", sort_block)
+        self.assertIn("return left.index - right.index;", sort_block)
+        self.assertIn(
+            "const selected = Boolean(taskRunId && taskRunId === selectedRunId);",
+            app_source,
+        )
+
     def test_react_frontend_sources_contain_dashboard_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_source = (root / "web" / "src" / "components" / "App.tsx").read_text(encoding="utf-8")

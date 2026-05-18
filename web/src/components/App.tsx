@@ -229,39 +229,10 @@ function parseTimestamp(value?: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function hasActionableWaitingPoint(value?: string | null): boolean {
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return false;
-  return normalized !== "-" && normalized !== "done";
-}
-
-function isActionableWaitingTask(task: TaskSummary): boolean {
-  if (task.status !== "WAITING") return false;
-  if (task.allowed_actions.length > 0) return true;
-  return (
-    hasActionableWaitingPoint(task.waiting_for) ||
-    hasActionableWaitingPoint(task.next_action)
-  );
-}
-
-function queueTaskPriority(task: TaskSummary, selectedRunId: string | null): number {
-  const taskRunId = pickTaskRun(task);
-  if (selectedRunId && taskRunId === selectedRunId) return 0;
-  if (task.status === "RUNNING") return 1;
-  if (isActionableWaitingTask(task)) return 2;
-  if (task.status === "FAILED") return 3;
-  return 4;
-}
-
-function sortQueueTasks(tasks: TaskSummary[], selectedRunId: string | null): TaskSummary[] {
+function sortQueueTasks(tasks: TaskSummary[]): TaskSummary[] {
   return tasks
     .map((task, index) => ({ task, index }))
     .sort((left, right) => {
-      const priorityDiff =
-        queueTaskPriority(left.task, selectedRunId) - queueTaskPriority(right.task, selectedRunId);
-      if (priorityDiff !== 0) return priorityDiff;
-
       const leftUpdated = parseTimestamp(left.task.updated_at);
       const rightUpdated = parseTimestamp(right.task.updated_at);
       if (leftUpdated !== null && rightUpdated !== null && leftUpdated !== rightUpdated) {
@@ -752,7 +723,7 @@ function QueuePanel({
   const [pendingTaskAction, setPendingTaskAction] = useState<PendingTaskAction | null>(null);
   const summary = payload?.summary;
   const queueTasks = payload?.tasks ?? [];
-  const sortedTasks = sortQueueTasks(queueTasks, selectedRunId);
+  const sortedTasks = sortQueueTasks(queueTasks);
   const hasHiddenTasks = sortedTasks.length > QUEUE_PREVIEW_LIMIT;
   const visibleTasks =
     hasHiddenTasks && !showAllTasks ? sortedTasks.slice(0, QUEUE_PREVIEW_LIMIT) : sortedTasks;
