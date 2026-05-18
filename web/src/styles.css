@@ -510,6 +510,18 @@ input {
   align-items: center;
 }
 
+.retrospectiveHeader,
+.retrospectiveRow {
+  grid-template-columns:
+    minmax(120px, 1.3fr)
+    minmax(90px, 0.8fr)
+    minmax(82px, 0.7fr)
+    minmax(82px, 0.7fr)
+    minmax(52px, 0.5fr)
+    minmax(60px, 0.55fr)
+    minmax(120px, 1fr);
+}
+
 .timingHeader {
   color: var(--muted);
   font-size: 12px;

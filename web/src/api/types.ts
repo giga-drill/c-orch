@@ -439,6 +439,52 @@ export interface RuntimeState {
   } | null;
 }
 
+export interface TelemetryCoverage {
+  exact_runs: number;
+  partial_runs: number;
+  unavailable_runs: number;
+  total_runs: number;
+}
+
+export interface TelemetryStage {
+  category: string;
+  label: string;
+  status: "complete" | "partial" | "unavailable";
+  count: number;
+  run_count: number;
+  total_duration_seconds: number;
+  avg_duration_seconds: number | null;
+  coverage: TelemetryCoverage;
+  sources: Record<string, number>;
+  limitations: string[];
+}
+
+export interface TelemetryBottleneck {
+  category: string;
+  label: string;
+  status: "complete" | "partial" | "unavailable";
+  total_duration_seconds: number;
+  avg_duration_seconds: number | null;
+  count: number;
+  run_count: number;
+}
+
+export interface ProjectTelemetryPayload {
+  runs_dir: string;
+  generated_at: string;
+  summary: {
+    total_runs: number;
+    terminal_runs: number;
+    approved_runs: number;
+    failed_runs: number;
+    rework_count: number;
+    review_retry_count: number;
+  };
+  stages: TelemetryStage[];
+  bottlenecks: TelemetryBottleneck[];
+  limitations: string[];
+}
+
 export interface DashboardStatePayload {
   generated_at: string;
   version: number;
@@ -446,6 +492,7 @@ export interface DashboardStatePayload {
   cost_mode: CostModePayload;
   proposals: ProposalsPayload;
   queue: QueuePayload;
+  telemetry: ProjectTelemetryPayload;
   workspace_lanes?: WorkspaceLanesPayload;
   runs: RunsPayload;
   focused_run_id: string | null;

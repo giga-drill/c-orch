@@ -371,6 +371,68 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertEqual(restart_gate["items"][0]["task_id"], "gate-task")
             self.assertEqual(restart_gate["items"][0]["run_id"], gate_manifest.run_id)
 
+    def test_state_payload_includes_telemetry_without_writing_state_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-1", "title": "Task 1", "prompt": "Do task", "cwd": str(root)}]
+            )
+            queue_store.save(queue)
+
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal_store.add_proposal(pool, title="P1", prompt="Do plan", cwd=str(root))
+            proposal_store.save(pool)
+
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "APPROVED"
+            run_store.save(manifest, touch=False)
+            run_store.append_event(manifest.run_id, "worker_done", "Worker done")
+            run_store.append_usage_attribution(
+                manifest.run_id,
+                role="planner",
+                phase="plan",
+                started_at="2026-05-19T10:00:00+00:00",
+                updated_at="2026-05-19T10:01:00+00:00",
+            )
+
+            manifest_path = root / "runs" / manifest.run_id / "manifest.json"
+            events_path = root / "runs" / manifest.run_id / "events.jsonl"
+            usage_path = root / "runs" / manifest.run_id / "usage-attribution.jsonl"
+            before = {
+                "queue": (root / "queue.json").stat().st_mtime_ns,
+                "proposals": (root / "proposals.json").stat().st_mtime_ns,
+                "manifest": manifest_path.stat().st_mtime_ns,
+                "events": events_path.stat().st_mtime_ns,
+                "usage": usage_path.stat().st_mtime_ns,
+            }
+
+            payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                runtime_generation="test-generation",
+            )
+
+            self.assertIn("telemetry", payload)
+            self.assertEqual(payload["telemetry"]["summary"]["total_runs"], 1)
+
+            after = {
+                "queue": (root / "queue.json").stat().st_mtime_ns,
+                "proposals": (root / "proposals.json").stat().st_mtime_ns,
+                "manifest": manifest_path.stat().st_mtime_ns,
+                "events": events_path.stat().st_mtime_ns,
+                "usage": usage_path.stat().st_mtime_ns,
+            }
+            self.assertEqual(before, after)
+
     def test_run_payload_service_tiers_uses_manifest_reviewer_tier_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

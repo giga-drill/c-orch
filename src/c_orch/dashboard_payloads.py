@@ -50,6 +50,7 @@ from .task_lifecycle import (
     reconcile_queue,
 )
 from .task_store import TASK_SKIPPED, TaskStore
+from .telemetry import build_project_telemetry
 from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
@@ -161,6 +162,7 @@ def build_state_payload(
         runs_payload=runs_payload,
     )
     selected_run = build_run_payload(runs_dir, focused_run_id) if focused_run_id else None
+    telemetry = build_project_telemetry(runs_dir)
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "version": _state_version(
@@ -187,6 +189,7 @@ def build_state_payload(
         ),
         "proposals": proposals_payload,
         "queue": queue_payload,
+        "telemetry": telemetry,
         "runs": runs_payload,
         "focused_run_id": focused_run_id,
         "selected_run": selected_run,
@@ -349,6 +352,11 @@ def _state_version(
             except OSError:
                 continue
         for path in runs_dir.glob("*/events.jsonl"):
+            try:
+                mtimes.append(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+        for path in runs_dir.glob("*/usage-attribution.jsonl"):
             try:
                 mtimes.append(path.stat().st_mtime_ns)
             except OSError:

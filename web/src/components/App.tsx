@@ -13,6 +13,7 @@ import type {
   ManifestRecord,
   ProposalPlanDetail,
   ProposalRecord,
+  ProjectTelemetryPayload,
   ProposalsPayload,
   QueuePayload,
   ReviewAttempt,
@@ -60,9 +61,11 @@ const statusText: Record<string, string> = {
   REVIEWING: "Planner 复核中",
   REVISION_REQUESTED: "Worker 返工中",
   active: "进行中",
+  complete: "完整",
   completed: "已完成",
   missing: "未发生",
   partial: "数据不完整",
+  unavailable: "不可用",
   failed: "失败",
   waiting_review: "等待审核",
   idle: "空闲",
@@ -386,6 +389,7 @@ export function App() {
           costMode={stateQuery.data?.cost_mode}
           restartGate={stateQuery.data?.runtime.restart_gate}
         />
+        <RetrospectivePanel telemetry={stateQuery.data?.telemetry} />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
           payload={proposalsPayload}
@@ -527,6 +531,96 @@ function SystemStatus({
           {queueActionError ? <div className="error">{queueActionError}</div> : null}
         </>
       ) : null}
+    </section>
+  );
+}
+
+function RetrospectivePanel({ telemetry }: { telemetry?: ProjectTelemetryPayload | null }) {
+  if (!telemetry) return null;
+  const summary = telemetry.summary;
+  const stageMap = telemetry.stages.reduce<Record<string, ProjectTelemetryPayload["stages"][number]>>(
+    (acc, stage) => {
+      acc[stage.category] = stage;
+      return acc;
+    },
+    {},
+  );
+  const coreStages = [
+    stageMap.planning,
+    stageMap.worker_execution,
+    stageMap.verification,
+    stageMap.codex_review,
+    stageMap.planner_review,
+    stageMap.rework,
+    stageMap.apply_commit,
+    stageMap.recovery,
+  ].filter((stage): stage is NonNullable<typeof stage> => Boolean(stage));
+  const topBottlenecks = telemetry.bottlenecks.slice(0, 5);
+
+  return (
+    <section className="panel">
+      <div className="sectionTitle">
+        <h2>Retrospective</h2>
+        <span className="meta">{formatShortTime(telemetry.generated_at)}</span>
+      </div>
+      <div className="queueStats" aria-label="retrospective summary">
+        <span>Runs {summary.total_runs}</span>
+        <span>完成 {summary.approved_runs}</span>
+        <span>失败 {summary.failed_runs}</span>
+        <span>Terminal {summary.terminal_runs}</span>
+        <span>返工 {summary.rework_count}</span>
+        <span>Review 重试 {summary.review_retry_count}</span>
+      </div>
+      <div className="timingTable" role="table" aria-label="retrospective stage metrics">
+        <div className="timingHeader retrospectiveHeader" role="row">
+          <span>阶段</span>
+          <span>状态</span>
+          <span>总耗时</span>
+          <span>平均耗时</span>
+          <span>次数</span>
+          <span>覆盖</span>
+          <span>来源</span>
+        </div>
+        {coreStages.map((stage) => (
+          <div key={stage.category} className={`timingPhaseSummary retrospectiveRow ${stage.status}`} role="row">
+            <span className="timingPhaseName">{displayValue(stage.label)}</span>
+            <span><StatusBadge status={stage.status} /></span>
+            <span>{formatDurationSeconds(stage.total_duration_seconds)}</span>
+            <span>
+              {stage.avg_duration_seconds === null || stage.avg_duration_seconds === undefined
+                ? "-"
+                : formatDurationSeconds(stage.avg_duration_seconds)}
+            </span>
+            <span>{stage.count}</span>
+            <span>
+              {stage.coverage.exact_runs}/{stage.coverage.total_runs}
+            </span>
+            <span className="meta">{Object.keys(stage.sources).join(", ") || "-"}</span>
+          </div>
+        ))}
+      </div>
+      <div className="laneList">
+        <div className="laneItem">
+          <strong>Bottlenecks</strong>
+          {topBottlenecks.length ? (
+            topBottlenecks.map((item) => (
+              <span className="meta" key={item.category}>
+                {item.label}: {formatDurationSeconds(item.total_duration_seconds)} · count {item.count}
+              </span>
+            ))
+          ) : (
+            <span className="meta">暂无瓶颈数据。</span>
+          )}
+        </div>
+        {telemetry.limitations.length ? (
+          <div className="laneItem">
+            <strong>Limitations</strong>
+            {telemetry.limitations.slice(0, 4).map((item) => (
+              <span className="meta" key={item}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }

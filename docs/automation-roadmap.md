@@ -82,6 +82,26 @@ tasks in a project:
 - rework loop count and reason categories
 - apply, commit, restart, and recovery time
 
+Status (phase 1 delivered):
+
+- Dashboard `GET /api/state` now includes a project-level read-only `telemetry`
+  payload built from `runs/<run_id>/manifest.json`, `events.jsonl`, and
+  `usage-attribution.jsonl`.
+- The telemetry slice does not write queue/proposal/run/event files during
+  payload construction; all GET endpoints remain pure reads.
+- Stage metrics include planning, Worker execution, verification, Codex review,
+  Planner review, rework, apply/commit, and recovery with
+  `complete/partial/unavailable` coverage markers.
+- Codex review vs Planner review split depends on usage-attribution
+  (`role=reviewer phase=review` and `role=planner phase=review`); without those
+  rows, telemetry marks split quality as `partial` or `unavailable`.
+- Verification and recovery durations are best-effort inferred from event
+  boundaries (for example `worker_done`/`evidence_collected` ->
+  `verification_finished`, `recovery_decision_recorded` -> next observable
+  event), and are explicitly marked as inferred when boundaries are missing.
+- usage-attribution is used only for phase-duration attribution, not token or
+  usage accounting.
+
 After enough runs, c-orch should produce retrospective suggestions such as:
 
 - which phases dominate wall-clock time
