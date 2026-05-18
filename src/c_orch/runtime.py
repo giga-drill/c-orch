@@ -37,6 +37,7 @@ from .proposal_store import (
 from .restart_gate import RestartGateState, detect_restart_gate
 from .run_store import RunManifest, RunStore
 from .scheduler import OrchestratorLike, SchedulerConfig, TaskScheduler
+from .startup_reconciliation import reconcile_runtime_startup_leases
 from .states import (
     RUN_PLAN_APPROVED,
     RUN_PLAN_REVIEW_REQUIRED,
@@ -135,6 +136,14 @@ class COrchRuntime:
         self._last_dispatch_error: Optional[str] = None
         self._last_proposal_dispatch_error: Optional[str] = None
         self._runtime_generation = f"{datetime.now().astimezone().isoformat(timespec='seconds')}:{os.getpid()}"
+        try:
+            reconcile_runtime_startup_leases(
+                run_store=RunStore(self.runs_dir),
+                runtime_generation=self._runtime_generation,
+                process_hint=f"runtime:{os.getpid()}",
+            )
+        except Exception as exc:
+            self._last_dispatch_error = f"startup_reconciliation_failed: {exc}"
         if self.proposals_path is not None:
             prune_queued_proposals(self.proposals_path)
         if self._scheduler_config is not None:

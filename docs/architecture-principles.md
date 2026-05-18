@@ -220,11 +220,22 @@ Runner lease metadata (phase 1 delivered):
   heartbeat/expiry, status, and checkpoint metadata
 - `stale` is derived on read from `active + lease_expires_at`; GET payload
   builders must not write lease files
+- runtime startup performs backend-only lease reconciliation before queue or
+  proposal dispatch. Reconciliation is idempotent and does not rely on GET
+  payload builders to mutate state.
+- startup reconciliation classifies relevant leases as alive/stale/completed/
+  failed using lease status/effective status, heartbeat+expiry, pid liveness,
+  runner-subprocess results, and run manifest/event context.
+- every startup reconciliation conclusion writes an auditable recovery decision
+  event (`source=runtime_startup`) with runner/phase/category/reason/action and
+  raw lease or result clues.
+- completed reviewer subprocess results (`phase=code_review`) are imported from
+  durable result manifests and converged into existing retryable review paths so
+  runs do not remain in ghost `REVIEWING`/`RUNNING` states after restart.
 
 Still not implemented:
 
 - Planner/Worker subprocess execution handoff
-- runtime-startup lease reconciliation across alive/stale/completed runners
 - automatic rebase/replay for same-repo parallel apply conflicts
 
 Delivered in this phase:

@@ -104,10 +104,17 @@ back to direct `code_review_runner`. A completed subprocess report with
 `CodexReviewReport.status=error` is preserved as review evidence and does not
 trigger infra fallback.
 
+Runtime startup now performs lease reconciliation before queue/proposal dispatch.
+It classifies relevant runner leases as alive/stale/completed/failed using lease
+status/effective status, heartbeat/expiry, pid liveness, and runner-subprocess
+result manifests. Reconciliation writes startup audit recovery decisions, imports
+completed `phase=code_review` subprocess reports as durable review evidence, and
+converges stale/failed/completed ghost runners into existing retryable review,
+verification, or terminal failure paths.
+
 Still follow-up work:
 
 - Planner/Worker subprocess handoff
-- runtime-startup lease reconciliation across alive/stale/completed runners
 
 ## Quick Start
 
