@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type {
+  ActivitySummaryItem,
+  ActivitySummaryPayload,
   AllowedProposalAction,
   AllowedRunAction,
   AllowedTaskAction,
@@ -1109,6 +1111,10 @@ function RunDetail({
         <h2>阶段耗时</h2>
         <PhaseTimingPanel run={run} />
       </section>
+      <section className="section">
+        <h2>最新活动</h2>
+        <ActivitySummaryPanel summary={payload.activity_summary} run={run} />
+      </section>
 
       <div className="detailGrid">
         <section className="section">
@@ -1157,18 +1163,127 @@ function RunDetail({
           </Collapsible>
         </section>
         <section className="section">
-          <h2>Worker 活动</h2>
-          <ActivityList items={payload.worker_activity} />
+          <h2>原始 Session 活动</h2>
+          <Collapsible title="Worker session 活动（兼容字段）">
+            <ActivityList items={payload.worker_activity} />
+          </Collapsible>
         </section>
         <section className="section">
           <h2>复核记录</h2>
-          <ReviewAttempts attempts={manifest.review_attempts} />
+          <Collapsible title={`复核记录（${manifest.review_attempts.length}）`}>
+            <ReviewAttempts attempts={manifest.review_attempts} />
+          </Collapsible>
         </section>
         <section className="section">
           <h2>运行时间线</h2>
-          <Timeline events={payload.events} />
+          <Collapsible title={`完整事件（${payload.events.length}）`}>
+            <Timeline events={payload.events} />
+          </Collapsible>
         </section>
       </div>
+    </div>
+  );
+}
+
+function isActiveReviewInfraFailure(run: RunListItem): boolean {
+  return (
+    run.waiting_for === "planner_review_retry" ||
+    run.can_retry_review ||
+    run.allowed_actions.includes("retry-review")
+  );
+}
+
+function ActivitySummaryPanel({
+  summary,
+  run,
+}: {
+  summary?: ActivitySummaryPayload | null;
+  run: RunListItem;
+}) {
+  if (!summary) return <p className="meta">暂无结构化活动摘要。</p>;
+  const latestItems = summary.items.slice(0, 12);
+  const latestReviewFailure = summary.latest_review_failure;
+  const showReviewFailure = Boolean(latestReviewFailure) && isActiveReviewInfraFailure(run);
+  return (
+    <div className="activitySummaryPanel">
+      <div className="activitySummaryStrip">
+        <div className="summaryCell">
+          <span className="label">current_phase</span>
+          <strong>{displayValue(summary.current_phase.label)}</strong>
+          <span className="meta">
+            {displayValue(summary.current_phase.status)} / {displayValue(summary.current_phase.waiting_for)}
+          </span>
+        </div>
+        <ActivityDigestCard title="latest_activity" item={summary.latest_activity} />
+        <ActivityDigestCard title="latest_verification" item={summary.latest_verification} />
+        <ActivityDigestCard title="latest_tool" item={summary.latest_tool} />
+      </div>
+      {summary.latest_revision_request ? (
+        <div className="summaryNote revisionNote">
+          <span className="label">最近打回</span>
+          <strong>
+            {displayValue(
+              summary.latest_revision_request.summary ?? summary.latest_revision_request.reason,
+            )}
+          </strong>
+          {summary.latest_revision_request.review_attempt_id ? (
+            <span className="meta mono">attempt: {summary.latest_revision_request.review_attempt_id}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {showReviewFailure ? (
+        <div className="summaryNote failureNote">
+          <span className="label">最近 review 基础设施失败</span>
+          <strong>
+            {displayValue(
+              latestReviewFailure?.summary ??
+                latestReviewFailure?.error ??
+                latestReviewFailure?.reason,
+            )}
+          </strong>
+          {latestReviewFailure?.review_attempt_id ? (
+            <span className="meta mono">attempt: {latestReviewFailure.review_attempt_id}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {latestItems.length ? (
+        <ul className="timeline">
+          {latestItems.map((item, index) => (
+            <li key={`${item.timestamp ?? "activity"}-${item.source ?? "source"}-${index}`} className="timelineItem">
+              <div className="timelineTop">
+                <span className="mono">{displayValue(item.timestamp)}</span>
+                <StatusBadge status={item.kind ?? item.label ?? "-"} />
+              </div>
+              <p>{displayValue(item.summary ?? item.label)}</p>
+              <p className="meta">
+                {displayValue(item.role)} · {displayValue(item.source)}
+                {item.source_id ? ` · ${item.source_id}` : ""}
+              </p>
+              {item.detail ? <p className="meta">{item.detail}</p> : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="meta">暂无活动摘要。</p>
+      )}
+    </div>
+  );
+}
+
+function ActivityDigestCard({ title, item }: { title: string; item: ActivitySummaryItem | null }) {
+  return (
+    <div className="summaryCell">
+      <span className="label">{title}</span>
+      {item ? (
+        <>
+          <strong>{displayValue(item.summary ?? item.label)}</strong>
+          <span className="meta">
+            {displayValue(item.timestamp)} · {displayValue(item.role)}
+          </span>
+        </>
+      ) : (
+        <strong>-</strong>
+      )}
     </div>
   );
 }
@@ -1176,11 +1291,7 @@ function RunDetail({
 function RunSummaryStrip({ run }: { run: RunListItem }) {
   const latestRevisionSummary =
     run.latest_revision_request?.summary ?? run.latest_revision_request?.reason;
-  const isActiveReviewInfraFailure =
-    run.waiting_for === "planner_review_retry" ||
-    run.can_retry_review ||
-    run.allowed_actions.includes("retry-review");
-  const showReviewFailure = Boolean(run.latest_review_failure) && isActiveReviewInfraFailure;
+  const showReviewFailure = Boolean(run.latest_review_failure) && isActiveReviewInfraFailure(run);
   const reviewRetryCount = run.review_retry_count ?? 0;
   return (
     <section className="runSummaryStrip">

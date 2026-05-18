@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from c_orch import dashboard_payloads
@@ -359,6 +361,328 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertEqual(tiers["worker"], "flex")
             self.assertEqual(tiers["reviewer"], "flex")
             self.assertEqual(tiers["reviewer_source"], "review_attempt")
+
+    def test_run_payload_activity_summary_for_working_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions_root = root / "sessions"
+            review_output = root / "codex-review-output.txt"
+            review_output.write_text("Codex review clean.\nNo findings.", encoding="utf-8")
+            verification_output = root / "verification-output.txt"
+            verification_output.write_text("pytest passed.\n2 tests.", encoding="utf-8")
+
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORKING"
+            manifest.planner.thread_id = "planner-thread"
+            manifest.workers[0].thread_id = "worker-thread"
+            manifest.workers[0].evidence_files = [str(verification_output)]
+            manifest.review = ReviewRecord(evidence_files=[str(review_output)])
+            store.save(manifest)
+            store.append_event(manifest.run_id, "worker_started", "Worker started")
+            store.append_event(
+                manifest.run_id,
+                "verification_finished",
+                "Verification finished",
+                summary="All verification commands passed.",
+            )
+            _write_jsonl(
+                sessions_root / "2026" / "05" / "19" / "rollout-worker-thread.jsonl",
+                [
+                    _session_meta("2026-05-19T10:00:00Z", "worker-thread"),
+                    _session_tool_call("2026-05-19T10:00:05Z", "exec_command", "pytest -q"),
+                ],
+            )
+            _write_jsonl(
+                sessions_root / "2026" / "05" / "19" / "rollout-planner-thread.jsonl",
+                [
+                    _session_meta("2026-05-19T10:00:01Z", "planner-thread"),
+                    _session_tool_output("2026-05-19T10:00:06Z", '{"status":"ok"}'),
+                ],
+            )
+
+            payload = dashboard_payloads.build_run_payload(
+                root / "runs",
+                manifest.run_id,
+                session_logs_root=sessions_root,
+            )
+
+            assert payload is not None
+            summary = payload["activity_summary"]
+            self.assertEqual(summary["current_phase"]["status"], "WORKING")
+            self.assertIsNotNone(summary["latest_activity"])
+            self.assertEqual(summary["latest_verification"]["kind"], "verification")
+            self.assertIn(summary["latest_tool"]["kind"], {"tool_call", "tool_output"})
+            self.assertGreaterEqual(len(summary["items"]), 4)
+            self.assertEqual(summary["items"][0]["source"], "session_log")
+
+    def test_run_payload_activity_summary_for_failed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "FAILED"
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "verification_gate_failed",
+                "Verification failed",
+                summary="1 command failed",
+                reason="verification_failed",
+            )
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            summary = payload["activity_summary"]
+            self.assertEqual(summary["current_phase"]["status"], "FAILED")
+            self.assertEqual(summary["latest_activity"]["kind"], "verification")
+            self.assertEqual(summary["latest_activity"]["severity"], "error")
+            self.assertEqual(summary["latest_verification"]["kind"], "verification")
+
+    def test_run_payload_activity_summary_for_revision_requested_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "REVISION_REQUESTED"
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="REVISION_REQUESTED",
+                    started_at="2026-05-19T10:10:00+00:00",
+                    completed_at="2026-05-19T10:11:00+00:00",
+                    decision="revision_requested",
+                    reason="Need missing failure-path tests.",
+                    summary="Need missing failure-path tests.",
+                    worker_attempt=1,
+                )
+            ]
+            manifest.review = ReviewRecord(
+                decision="revision_requested",
+                reason="Need missing failure-path tests.",
+                summary="Need missing failure-path tests.",
+            )
+            store.save(manifest)
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            summary = payload["activity_summary"]
+            self.assertEqual(summary["current_phase"]["status"], "REVISION_REQUESTED")
+            self.assertEqual(
+                summary["latest_revision_request"]["summary"],
+                "Need missing failure-path tests.",
+            )
+            self.assertTrue(any(item["kind"] == "revision" for item in summary["items"]))
+
+    def test_run_payload_activity_summary_for_approved_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            verification_output = root / "verification-output.txt"
+            verification_output.write_text("all checks passed", encoding="utf-8")
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "APPROVED"
+            manifest.workers[0].evidence_files = [str(verification_output)]
+            store.save(manifest)
+            store.append_event(manifest.run_id, "apply_completed", "Apply completed", applied=True)
+            store.append_event(
+                manifest.run_id,
+                "git_commit_completed",
+                "Git commit completed",
+                summary="Committed applied changes.",
+            )
+            store.append_event(
+                manifest.run_id,
+                "run_terminal_status",
+                "Run finished with APPROVED",
+                status="APPROVED",
+            )
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            summary = payload["activity_summary"]
+            self.assertEqual(summary["current_phase"]["status"], "APPROVED")
+            self.assertEqual(summary["current_phase"]["waiting_for"], "done")
+            self.assertIsNotNone(summary["latest_activity"])
+            self.assertEqual(summary["latest_verification"]["kind"], "verification")
+            self.assertTrue(
+                any(item["kind"] in {"apply", "commit"} for item in summary["items"]),
+            )
+
+    def test_run_payload_activity_summary_keeps_latest_verification_when_session_items_exceed_display_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions_root = root / "sessions"
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORKING"
+            manifest.planner.thread_id = "planner-thread"
+            manifest.workers[0].thread_id = "worker-thread"
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "verification_finished",
+                "Verification finished",
+                summary="Verification completed successfully.",
+            )
+            planner_records = [_session_meta(_iso_timestamp(0), "planner-thread")]
+            worker_records = [_session_meta(_iso_timestamp(0), "worker-thread")]
+            for index in range(40):
+                planner_records.append(
+                    _session_tool_call(
+                        _iso_timestamp(1 + index),
+                        f"planner_tool_{index}",
+                        "{}",
+                    )
+                )
+                worker_records.append(
+                    _session_tool_call(
+                        _iso_timestamp(41 + index),
+                        f"worker_tool_{index}",
+                        "{}",
+                    )
+                )
+            _write_jsonl(
+                sessions_root / "2026" / "05" / "19" / "rollout-planner-thread.jsonl",
+                planner_records,
+            )
+            _write_jsonl(
+                sessions_root / "2026" / "05" / "19" / "rollout-worker-thread.jsonl",
+                worker_records,
+            )
+
+            payload = dashboard_payloads.build_run_payload(
+                root / "runs",
+                manifest.run_id,
+                session_logs_root=sessions_root,
+            )
+
+            assert payload is not None
+            summary = payload["activity_summary"]
+            self.assertEqual(len(summary["items"]), 80)
+            self.assertIsNotNone(summary["latest_verification"])
+            self.assertEqual(summary["latest_verification"]["kind"], "verification")
+
+    def test_run_payload_approved_run_with_historical_review_failure_keeps_history_but_not_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "APPROVED"
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-19T10:00:00+00:00",
+                    completed_at="2026-05-19T10:01:00+00:00",
+                    reason="code_review_error",
+                    error="review timeout",
+                ),
+                ReviewAttemptRecord(
+                    id="review-2",
+                    worker_id="worker-1",
+                    status="APPROVED",
+                    started_at="2026-05-19T10:02:00+00:00",
+                    completed_at="2026-05-19T10:03:00+00:00",
+                    decision="accepted",
+                ),
+            ]
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="Looks good.",
+            )
+            store.save(manifest)
+
+            payload = dashboard_payloads.build_run_payload(root / "runs", manifest.run_id)
+
+            assert payload is not None
+            run = payload["run"]
+            self.assertFalse(run["can_retry_review"])
+            self.assertEqual(run["allowed_actions"], [])
+            self.assertIsNotNone(payload["activity_summary"]["latest_review_failure"])
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _session_meta(timestamp: str, thread_id: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "cwd": "/repo",
+            "source": "mcp",
+        },
+    }
+
+
+def _session_tool_call(timestamp: str, name: str, arguments: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "name": name,
+            "arguments": arguments,
+        },
+    }
+
+
+def _session_tool_output(timestamp: str, output: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "output": output,
+        },
+    }
+
+
+def _iso_timestamp(minutes: int) -> str:
+    base = datetime(2099, 1, 1, 0, 0, tzinfo=timezone.utc)
+    return (base + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
 
 
 if __name__ == "__main__":

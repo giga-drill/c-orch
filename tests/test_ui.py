@@ -1144,6 +1144,18 @@ class UiTests(unittest.TestCase):
         self.assertIn("formatShortTime", app_source)
         self.assertIn("runtimeBusy", app_source)
         self.assertIn("RunSummaryStrip", app_source)
+        self.assertIn("function isActiveReviewInfraFailure(run: RunListItem): boolean", app_source)
+        self.assertIn(
+            "const showReviewFailure = Boolean(latestReviewFailure) && isActiveReviewInfraFailure(run);",
+            app_source,
+        )
+        self.assertIn(
+            "const showReviewFailure = Boolean(run.latest_review_failure) && isActiveReviewInfraFailure(run);",
+            app_source,
+        )
+        self.assertIn("run.waiting_for === \"planner_review_retry\"", app_source)
+        self.assertIn("run.can_retry_review", app_source)
+        self.assertIn("run.allowed_actions.includes(\"retry-review\")", app_source)
         self.assertIn("runSummaryStrip", app_source)
         self.assertIn("证据文件（${payload.evidence_files.length}）", app_source)
         self.assertIn("<Collapsible title={`证据文件（${payload.evidence_files.length}）`}>", app_source)

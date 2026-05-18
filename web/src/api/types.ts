@@ -344,11 +344,43 @@ export interface WorkerActivity {
   detail?: string;
 }
 
+export interface ActivitySummaryPhase {
+  status: string;
+  waiting_for: string;
+  label: string;
+  started_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ActivitySummaryItem {
+  timestamp?: string | null;
+  role?: string;
+  kind?: string;
+  label?: string;
+  summary?: string | null;
+  detail?: string | null;
+  source?: string;
+  source_id?: string | null;
+  severity?: string;
+  raw_available?: boolean;
+}
+
+export interface ActivitySummaryPayload {
+  current_phase: ActivitySummaryPhase;
+  latest_activity: ActivitySummaryItem | null;
+  latest_revision_request: LatestRevisionRequestSummary | null;
+  latest_review_failure: LatestReviewFailureSummary | null;
+  latest_verification: ActivitySummaryItem | null;
+  latest_tool: ActivitySummaryItem | null;
+  items: ActivitySummaryItem[];
+}
+
 export interface RunPayload {
   run: RunListItem;
   manifest: ManifestRecord;
   evidence_files: EvidenceFile[];
   events: RunEvent[];
+  activity_summary?: ActivitySummaryPayload | null;
   worker_activity: WorkerActivity[];
   transition?: TransitionResult;
 }

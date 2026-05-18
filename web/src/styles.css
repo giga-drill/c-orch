@@ -458,6 +458,17 @@ input {
   gap: 8px;
 }
 
+.activitySummaryPanel {
+  display: grid;
+  gap: 8px;
+}
+
+.activitySummaryStrip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .timingSummary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -675,6 +686,10 @@ details > div {
 
   .timingSummary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .activitySummaryStrip {
+    grid-template-columns: 1fr;
   }
 
   .timingHeader {

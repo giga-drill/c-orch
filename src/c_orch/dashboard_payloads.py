@@ -269,7 +269,12 @@ def build_queue_payload(
     }
 
 
-def build_run_payload(runs_dir: Pathish, run_id: str) -> Optional[Dict[str, Any]]:
+def build_run_payload(
+    runs_dir: Pathish,
+    run_id: str,
+    *,
+    session_logs_root: Optional[Pathish] = None,
+) -> Optional[Dict[str, Any]]:
     runs_path = Path(runs_dir).expanduser().resolve()
     if not _valid_run_id(run_id):
         return None
@@ -278,12 +283,21 @@ def build_run_payload(runs_dir: Pathish, run_id: str) -> Optional[Dict[str, Any]
     if manifest is None:
         return None
     events = RunStore(runs_path).load_events(run_id)
+    run_summary = _summarize_manifest(manifest, events=events)
+    evidence_files = _evidence_details(manifest)
     return {
-        "run": _summarize_manifest(manifest, events=events),
+        "run": run_summary,
         "manifest": manifest,
-        "evidence_files": _evidence_details(manifest),
+        "evidence_files": evidence_files,
         "events": events,
-        "worker_activity": _worker_activity(manifest),
+        "activity_summary": _activity_summary(
+            manifest,
+            run_summary=run_summary,
+            events=events,
+            evidence_files=evidence_files,
+            session_logs_root=session_logs_root,
+        ),
+        "worker_activity": _worker_activity(manifest, session_logs_root=session_logs_root),
     }
 
 
@@ -1104,8 +1118,319 @@ def _text_preview(path: Path, *, size: Optional[int]) -> Optional[str]:
         return None
 
 
-def _worker_activity(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
-    store = CodexSessionLogStore()
+def _activity_summary(
+    manifest: Dict[str, Any],
+    *,
+    run_summary: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    evidence_files: List[Dict[str, Any]],
+    session_logs_root: Optional[Pathish] = None,
+) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    for event in events:
+        event_item = _event_activity_item(event)
+        if event_item is not None:
+            items.append(event_item)
+
+    revision = _dict_value(run_summary.get("latest_revision_request"))
+    if revision:
+        items.append(
+            {
+                "timestamp": revision.get("completed_at") or run_summary.get("updated_at"),
+                "role": "planner",
+                "kind": "revision",
+                "label": "Planner requested revision",
+                "summary": _first_non_empty(
+                    _string_or_none(revision.get("summary")),
+                    _first_sentence(_string_or_none(revision.get("reason"))),
+                ),
+                "detail": _string_or_none(revision.get("reason")),
+                "source": "review",
+                "source_id": revision.get("review_attempt_id"),
+                "severity": "warning",
+                "raw_available": True,
+            }
+        )
+
+    review_failure = _dict_value(run_summary.get("latest_review_failure"))
+    if review_failure:
+        items.append(
+            {
+                "timestamp": review_failure.get("completed_at") or run_summary.get("updated_at"),
+                "role": "planner",
+                "kind": "review_failure",
+                "label": "Planner review infra failure",
+                "summary": _first_non_empty(
+                    _string_or_none(review_failure.get("summary")),
+                    _first_sentence(_string_or_none(review_failure.get("error"))),
+                    _first_sentence(_string_or_none(review_failure.get("reason"))),
+                ),
+                "detail": _string_or_none(review_failure.get("error")),
+                "source": "review",
+                "source_id": review_failure.get("review_attempt_id"),
+                "severity": "error",
+                "raw_available": True,
+            }
+        )
+
+    for evidence_item in _evidence_activity_items(evidence_files):
+        items.append(evidence_item)
+
+    for session_item in _session_activity_items(manifest, session_logs_root=session_logs_root):
+        items.append(session_item)
+
+    sorted_items = _sort_activity_items_desc(items)
+    latest_activity = sorted_items[0] if sorted_items else None
+    current_phase = _current_phase_summary(run_summary)
+    return {
+        "current_phase": current_phase,
+        "latest_activity": latest_activity,
+        "latest_revision_request": run_summary.get("latest_revision_request"),
+        "latest_review_failure": run_summary.get("latest_review_failure"),
+        "latest_verification": _latest_activity_by_kind(sorted_items, {"verification"}),
+        "latest_tool": _latest_activity_by_kind(sorted_items, {"tool_call", "tool_output"}),
+        "items": sorted_items[:80],
+    }
+
+
+def _event_activity_item(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    event_type = _string_or_none(event.get("type"))
+    if not event_type:
+        return None
+    kind = "event"
+    role = "system"
+    severity = "info"
+    if "verification" in event_type:
+        kind = "verification"
+        role = "worker"
+    elif "review" in event_type:
+        kind = "review"
+        role = "planner"
+    elif "apply" in event_type:
+        kind = "apply"
+        role = "worker"
+    elif "git_commit" in event_type:
+        kind = "commit"
+        role = "worker"
+    elif event_type.endswith("_failed"):
+        kind = "failure"
+        severity = "error"
+    elif "worker" in event_type:
+        role = "worker"
+    elif "planner" in event_type:
+        role = "planner"
+
+    if event_type.endswith("_failed") or event.get("applied") is False:
+        severity = "error"
+    elif "requested" in event_type or "retry" in event_type:
+        severity = "warning"
+
+    summary = _first_non_empty(
+        _string_or_none(event.get("summary")),
+        _first_sentence(_string_or_none(event.get("message"))),
+        _first_sentence(_string_or_none(event.get("reason"))),
+    )
+    return {
+        "timestamp": event.get("timestamp"),
+        "role": role,
+        "kind": kind,
+        "label": event_type,
+        "summary": summary,
+        "detail": _string_or_none(event.get("message")),
+        "source": "run_event",
+        "source_id": event_type,
+        "severity": severity,
+        "raw_available": True,
+    }
+
+
+def _evidence_activity_items(evidence_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for file_info in evidence_files:
+        name = _string_or_none(file_info.get("name"))
+        if name not in {"verification-output.txt", "codex-review-result.json", "codex-review-output.txt"}:
+            continue
+        summary = _first_sentence(_text_or_none(file_info.get("preview")))
+        if not summary:
+            continue
+        kind = "verification" if "verification" in name else "review"
+        items.append(
+            {
+                "timestamp": None,
+                "role": "worker" if kind == "verification" else "planner",
+                "kind": kind,
+                "label": f"Evidence: {name}",
+                "summary": _truncate_summary(summary, max_chars=200),
+                "detail": None,
+                "source": "evidence",
+                "source_id": file_info.get("path"),
+                "severity": "info",
+                "raw_available": True,
+            }
+        )
+    return items
+
+
+def _session_activity_items(
+    manifest: Dict[str, Any],
+    *,
+    session_logs_root: Optional[Pathish] = None,
+) -> List[Dict[str, Any]]:
+    store = CodexSessionLogStore(session_logs_root)
+    items: List[Dict[str, Any]] = []
+    planner = _dict_value(manifest.get("planner"))
+    planner_thread = planner.get("thread_id")
+    if isinstance(planner_thread, str) and planner_thread:
+        for activity in store.load_recent_activity(thread_id=planner_thread, limit=40):
+            items.append(
+                _activity_item_from_session_log(
+                    role="planner",
+                    thread_id=planner_thread,
+                    activity=activity.to_dict(),
+                )
+            )
+    for worker in _list_value(manifest.get("workers")):
+        data = _dict_value(worker)
+        worker_id = _string_or_none(data.get("id")) or "worker"
+        thread_id = data.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            continue
+        for activity in store.load_recent_activity(thread_id=thread_id, limit=40):
+            item = _activity_item_from_session_log(
+                role="worker",
+                thread_id=thread_id,
+                activity=activity.to_dict(),
+            )
+            item["source_id"] = worker_id
+            items.append(item)
+    return items
+
+
+def _activity_item_from_session_log(
+    *,
+    role: str,
+    thread_id: str,
+    activity: Dict[str, Any],
+) -> Dict[str, Any]:
+    kind = _string_or_none(activity.get("kind")) or "message"
+    label = _string_or_none(activity.get("label")) or kind
+    detail = _text_or_none(activity.get("detail"))
+    summary = _first_non_empty(
+        _first_sentence(detail),
+        label,
+    )
+    severity = "warning" if kind == "aborted" else "info"
+    return {
+        "timestamp": activity.get("timestamp"),
+        "role": role,
+        "kind": kind,
+        "label": label,
+        "summary": _truncate_summary(summary, max_chars=200),
+        "detail": _truncate_summary(detail, max_chars=600),
+        "source": "session_log",
+        "source_id": thread_id,
+        "severity": severity,
+        "raw_available": True,
+    }
+
+
+def _current_phase_summary(run_summary: Dict[str, Any]) -> Dict[str, Any]:
+    status = _string_or_none(run_summary.get("status")) or "UNKNOWN"
+    waiting_for = _string_or_none(run_summary.get("waiting_for")) or "planner"
+    started_at: Optional[str] = None
+    updated_at = _string_or_none(run_summary.get("updated_at"))
+    timing = _dict_value(run_summary.get("timing"))
+    phases = [phase for phase in _list_value(timing.get("phases")) if isinstance(phase, dict)]
+    active_phase = next((phase for phase in phases if phase.get("status") == "active"), None)
+    if active_phase is None:
+        for phase in reversed(phases):
+            if phase.get("started_at"):
+                active_phase = phase
+                break
+    if isinstance(active_phase, dict):
+        started_at = _string_or_none(active_phase.get("started_at"))
+        updated_at = _string_or_none(active_phase.get("completed_at")) or updated_at
+    return {
+        "status": status,
+        "waiting_for": waiting_for,
+        "label": _current_phase_label(status=status, waiting_for=waiting_for),
+        "started_at": started_at,
+        "updated_at": updated_at,
+    }
+
+
+def _current_phase_label(*, status: str, waiting_for: str) -> str:
+    waiting_map = {
+        "human_plan_review": "Waiting human plan review",
+        "planner": "Planner planning",
+        "planner_review": "Planner reviewing",
+        "planner_review_retry": "Planner review retry",
+        "worker": "Worker executing",
+        "worker_rework": "Worker reworking",
+        "verification": "Verification running",
+        "restart": "Waiting runtime restart",
+        "done": "Run completed",
+        "failed": "Run failed",
+    }
+    if waiting_for in waiting_map:
+        return waiting_map[waiting_for]
+    return f"{status} ({waiting_for})"
+
+
+def _latest_activity_by_kind(items: List[Dict[str, Any]], kinds: set[str]) -> Optional[Dict[str, Any]]:
+    for item in items:
+        if _string_or_none(item.get("kind")) in kinds:
+            return item
+    return None
+
+
+def _sort_activity_items_desc(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    indexed = list(enumerate(items))
+    indexed.sort(
+        key=lambda entry: (
+            _timestamp_seconds(entry[1].get("timestamp")) is not None,
+            _timestamp_seconds(entry[1].get("timestamp")) or 0.0,
+            entry[0],
+        ),
+        reverse=True,
+    )
+    return [item for _, item in indexed]
+
+
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _truncate_summary(value: Optional[str], *, max_chars: int) -> Optional[str]:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return _string_or_none(str(value))
+
+
+def _worker_activity(
+    manifest: Dict[str, Any],
+    *,
+    session_logs_root: Optional[Pathish] = None,
+) -> List[Dict[str, Any]]:
+    store = CodexSessionLogStore(session_logs_root)
     activities: List[Dict[str, Any]] = []
     for worker in _list_value(manifest.get("workers")):
         data = _dict_value(worker)
