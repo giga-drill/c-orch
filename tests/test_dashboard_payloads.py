@@ -714,6 +714,13 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
 
             self.assertIn("telemetry", payload)
             self.assertEqual(payload["telemetry"]["summary"]["total_runs"], 1)
+            self.assertIn("retrospective", payload["telemetry"])
+            self.assertIn("recent_bottlenecks", payload["telemetry"])
+            self.assertEqual(payload["telemetry"]["retrospective"]["recent_limit"], 5)
+            self.assertEqual(
+                payload["telemetry"]["recent_bottlenecks"],
+                payload["telemetry"]["retrospective"]["top_bottlenecks"],
+            )
 
             after = {
                 "queue": (root / "queue.json").stat().st_mtime_ns,

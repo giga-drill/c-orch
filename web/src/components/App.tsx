@@ -613,6 +613,8 @@ function SystemStatus({
 function RetrospectivePanel({ telemetry }: { telemetry?: ProjectTelemetryPayload | null }) {
   if (!telemetry) return null;
   const summary = telemetry.summary;
+  const retrospective = telemetry.retrospective;
+  const recentBottlenecks = retrospective?.top_bottlenecks ?? telemetry.recent_bottlenecks ?? [];
   const stageMap = telemetry.stages.reduce<Record<string, ProjectTelemetryPayload["stages"][number]>>(
     (acc, stage) => {
       acc[stage.category] = stage;
@@ -693,6 +695,67 @@ function RetrospectivePanel({ telemetry }: { telemetry?: ProjectTelemetryPayload
             {telemetry.limitations.slice(0, 4).map((item) => (
               <span className="meta" key={item}>{item}</span>
             ))}
+          </div>
+        ) : null}
+        {retrospective ? (
+          <div className="laneItem">
+            <strong>最近 {retrospective.recent_limit} 个任务最慢的环节</strong>
+            <span className="meta">
+              样本 terminal runs: {retrospective.sampled_terminal_runs}/{retrospective.total_terminal_runs}（忽略 non-terminal {retrospective.non_terminal_runs_ignored}）
+            </span>
+            <span className="meta">样本总耗时: {formatDurationSeconds(retrospective.total_sample_duration_seconds)}</span>
+            {retrospective.sample_run_ids.length ? (
+              <span className="meta mono">runs: {retrospective.sample_run_ids.join(", ")}</span>
+            ) : null}
+            {recentBottlenecks.length ? (
+              <div className="retroBottleneckList">
+                {recentBottlenecks.map((item) => (
+                  <div className="retroBottleneckItem" key={`${item.phase}-${item.category}`}>
+                    <strong>{item.label}</strong>
+                    <span className="meta">
+                      {formatDurationSeconds(item.total_duration_seconds)} · avg{" "}
+                      {item.avg_duration_seconds === null ? "-" : formatDurationSeconds(item.avg_duration_seconds)} · count{" "}
+                      {item.count} · runs {item.run_count} · share{" "}
+                      {formatPercent((item.share_of_sample_duration ?? 0) * 100)}
+                    </span>
+                    <span className="meta">
+                      status {formatStatus(item.status)} · coverage {item.coverage.exact_runs}/
+                      {item.coverage.total_runs} · source {Object.keys(item.sources).join(", ") || "-"}
+                    </span>
+                    {item.evidence_runs.length ? (
+                      <div className="retroEvidenceList">
+                        {item.evidence_runs.map((evidence) => (
+                          <div
+                            key={`${item.category}-${evidence.run_id}-${evidence.updated_at ?? "na"}`}
+                            className="retroEvidenceItem"
+                          >
+                            <span className="meta mono">
+                              {evidence.run_id} · {formatStatus(evidence.status)} ·{" "}
+                              {formatDurationSeconds(evidence.duration_seconds)} · count {evidence.count}
+                            </span>
+                            <span className="meta">
+                              coverage {formatStatus(evidence.coverage)} · source {displayValue(evidence.source)} · updated{" "}
+                              {displayValue(evidence.updated_at)}
+                            </span>
+                            <span className="meta">
+                              rework {evidence.rework_count} · revision {evidence.revision_requested_count} · review_retry{" "}
+                              {evidence.review_retryable_count} · recovery {evidence.recovery_decision_count}
+                            </span>
+                            {evidence.reason_summaries.length ? (
+                              <span className="meta">reasons: {evidence.reason_summaries.join(" | ")}</span>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="meta">暂无 evidence runs。</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <span className="meta">最近样本暂无可用瓶颈数据。</span>
+            )}
           </div>
         ) : null}
       </div>

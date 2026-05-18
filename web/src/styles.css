@@ -218,6 +218,30 @@ pre {
   white-space: nowrap;
 }
 
+.retroBottleneckList,
+.retroEvidenceList {
+  display: grid;
+  gap: 6px;
+}
+
+.retroBottleneckItem,
+.retroEvidenceItem {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid #e7ece3;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.retroBottleneckItem .meta,
+.retroEvidenceItem .meta,
+.retroEvidenceItem .mono {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .queueDisplayMeta {
   margin-top: 8px;
   display: flex;

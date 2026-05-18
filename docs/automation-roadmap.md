@@ -105,6 +105,33 @@ Status (phase 1 delivered):
 - usage-attribution is used only for phase-duration attribution, not token or
   usage accounting.
 
+Run-history performance telemetry (phase 1 detail delivered):
+
+- Backend now builds a deterministic retrospective sample from the most recent
+  N terminal runs (default `N=5`), ordered by run `updated_at`, falling back to
+  `created_at` when `updated_at` is missing.
+- Active/non-terminal runs are excluded from retrospective bottleneck samples.
+- Payload now includes top bottleneck phases with deterministic stats:
+  `total_duration_seconds`, `avg_duration_seconds`, `count`, `run_count`,
+  `share_of_sample_duration`, `status`, `coverage`, `sources`, and
+  `evidence_runs`.
+- `share_of_sample_duration` is based on sampled terminal runs'
+  run-level timing totals (wall-clock basis). When run-level total is missing,
+  backend falls back to non-overlapping phase totals and marks the fallback in
+  retrospective limitations.
+- Each `evidence_runs` item includes run identity plus phase evidence quality:
+  `run_id`, `status`, `updated_at`, `duration_seconds`, `count`, `coverage`,
+  `source`, and fallback limitations.
+- Retrospective evidence also includes retry/rework/review context summaries
+  (`revision_requested`, `FAILED_RETRYABLE`, rework count, recovery decisions)
+  with short reason excerpts for deterministic auditing.
+
+Out of scope in this phase:
+
+- no LLM-generated optimization proposals
+- no automatic patch generation
+- no automatic code edits based on retrospective telemetry
+
 After enough runs, c-orch should produce retrospective suggestions such as:
 
 - which phases dominate wall-clock time

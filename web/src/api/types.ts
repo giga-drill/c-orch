@@ -562,13 +562,54 @@ export interface TelemetryStage {
 }
 
 export interface TelemetryBottleneck {
+  phase?: string;
   category: string;
   label: string;
   status: "complete" | "partial" | "unavailable";
+  coverage?: TelemetryCoverage;
+  sources?: Record<string, number>;
   total_duration_seconds: number;
   avg_duration_seconds: number | null;
   count: number;
   run_count: number;
+  share_of_sample_duration?: number;
+  limitations?: string[];
+}
+
+export interface TelemetryEvidenceRun {
+  run_id: string;
+  status: string;
+  updated_at: string | null;
+  duration_seconds: number;
+  count: number;
+  coverage: "exact" | "partial" | "unavailable";
+  source: string;
+  limitations: string[];
+  revision_requested_count: number;
+  review_retryable_count: number;
+  rework_count: number;
+  recovery_decision_count: number;
+  reason_summaries: string[];
+}
+
+export interface TelemetryRetrospectiveBottleneck extends TelemetryBottleneck {
+  phase: string;
+  coverage: TelemetryCoverage;
+  sources: Record<string, number>;
+  share_of_sample_duration: number;
+  limitations: string[];
+  evidence_runs: TelemetryEvidenceRun[];
+}
+
+export interface TelemetryRetrospective {
+  recent_limit: number;
+  sample_size: number;
+  sampled_terminal_runs: number;
+  total_terminal_runs: number;
+  non_terminal_runs_ignored: number;
+  sample_run_ids: string[];
+  total_sample_duration_seconds: number;
+  top_bottlenecks: TelemetryRetrospectiveBottleneck[];
 }
 
 export interface ProjectTelemetryPayload {
@@ -584,6 +625,8 @@ export interface ProjectTelemetryPayload {
   };
   stages: TelemetryStage[];
   bottlenecks: TelemetryBottleneck[];
+  recent_bottlenecks?: TelemetryRetrospectiveBottleneck[];
+  retrospective?: TelemetryRetrospective;
   limitations: string[];
 }
 

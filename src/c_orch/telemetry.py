@@ -4,9 +4,19 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from .phase_timing import PHASE_PLANNING, PHASE_WORKER_EXECUTION, PHASE_PLANNER_REVIEW, build_timing_summary
+from .phase_timing import (
+    PHASE_HUMAN_PLAN_REVIEW_WAIT,
+    PHASE_PLANNER_REVIEW,
+    PHASE_PLAN_REVISION,
+    PHASE_PLANNING,
+    PHASE_REVISION_WAIT,
+    PHASE_WORK_DONE_WAIT,
+    PHASE_WORKER_EXECUTION,
+    build_timing_summary,
+)
 from .run_store import RunManifest, RunStore
 from .states import TERMINAL_RUN_STATUSES
 
@@ -22,6 +32,9 @@ CATEGORY_REWORK = "rework"
 CATEGORY_APPLY_COMMIT = "apply_commit"
 CATEGORY_RECOVERY = "recovery"
 CATEGORY_UNKNOWN = "unknown"
+DEFAULT_RECENT_RUN_LIMIT = 5
+
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？]|[.?!](?=\s|$)|(?:\r?\n)")
 
 _CATEGORIES = [
     (CATEGORY_PLANNING, "Proposal planning"),
@@ -46,7 +59,7 @@ class StageMetric:
     limitations: List[str]
 
 
-def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
+def build_project_telemetry(runs_dir: Pathish, recent_limit: Optional[int] = None) -> Dict[str, Any]:
     runs_path = Path(runs_dir).expanduser().resolve()
     run_store = RunStore(runs_path)
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -74,8 +87,9 @@ def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
     terminal_runs = 0
     rework_count = 0
     review_retry_count = 0
+    run_samples: List[Dict[str, Any]] = []
 
-    for manifest in manifests:
+    for index, manifest in enumerate(manifests):
         status = str(manifest.get("status", ""))
         if status == "APPROVED":
             approved_runs += 1
@@ -94,18 +108,25 @@ def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
             usage_records=usage_records,
             timing=timing,
         )
+        review_rework_evidence = _run_review_rework_evidence(
+            manifest=manifest,
+            events=events,
+            usage_records=usage_records,
+            timing=timing,
+        )
 
-        run_rework_count = max(0, _phase_count(timing, PHASE_WORKER_EXECUTION) - 1)
-        if run_rework_count == 0:
-            run_rework_count = sum(1 for record in usage_records if _usage_match(record, role="worker", phase="rework"))
+        run_rework_count = int(review_rework_evidence.get("rework_count", 0) or 0)
         rework_count += run_rework_count
 
         review_attempts = _list_value(manifest.get("review_attempts"))
-        review_retry_count += sum(
+        run_review_retry_count = sum(
             1
             for attempt in review_attempts
             if _string_value(_dict_value(attempt).get("status")) == "FAILED_RETRYABLE"
         )
+        if run_review_retry_count == 0:
+            run_review_retry_count = int(review_rework_evidence.get("review_retryable_count", 0) or 0)
+        review_retry_count += run_review_retry_count
 
         for metric in metrics:
             aggregate = stage_aggregates[metric.category]
@@ -119,6 +140,18 @@ def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
             aggregate["sources"] = sources
             if metric.limitations:
                 _extend_unique(aggregate["limitations"], metric.limitations)
+
+        run_samples.append(
+            {
+                "index": index,
+                "manifest": manifest,
+                "events": events,
+                "usage_records": usage_records,
+                "timing": timing,
+                "metrics": metrics,
+                "review_rework_evidence": review_rework_evidence,
+            }
+        )
 
     stages = [_finalize_stage(stage_aggregates[category], total_runs) for category, _ in _CATEGORIES]
 
@@ -146,6 +179,10 @@ def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
     )
 
     limitations = _project_limitations(stages)
+    retrospective = _build_recent_terminal_retrospective(
+        run_samples=run_samples,
+        recent_limit=recent_limit,
+    )
     return {
         "runs_dir": str(runs_path),
         "generated_at": now_iso,
@@ -159,6 +196,8 @@ def build_project_telemetry(runs_dir: Pathish) -> Dict[str, Any]:
         },
         "stages": stages,
         "bottlenecks": bottlenecks,
+        "recent_bottlenecks": list(retrospective.get("top_bottlenecks", [])),
+        "retrospective": retrospective,
         "limitations": limitations,
     }
 
@@ -215,6 +254,8 @@ def _planning_metric(*, timing: Dict[str, Any], usage_records: Sequence[Dict[str
                 "Planning duration is inferred from events/created_at/updated_at for legacy runs, "
                 "not from persisted manifest timing."
             )
+            if status == "exact":
+                status = "partial"
         limitations = []
         if status != "exact":
             limitations.append(base_limitation)
@@ -257,6 +298,8 @@ def _worker_metric(*, timing: Dict[str, Any], usage_records: Sequence[Dict[str, 
                 "Worker execution duration is inferred from events/created_at/updated_at for legacy runs, "
                 "not from persisted manifest timing."
             )
+            if status == "exact":
+                status = "partial"
         limitations = []
         if status != "exact":
             limitations.append(base_limitation)
@@ -723,6 +766,341 @@ def _project_limitations(stages: Sequence[Dict[str, Any]]) -> List[str]:
     return limitations
 
 
+def _build_recent_terminal_retrospective(
+    *,
+    run_samples: Sequence[Dict[str, Any]],
+    recent_limit: Optional[int],
+) -> Dict[str, Any]:
+    normalized_limit = max(1, int(recent_limit or DEFAULT_RECENT_RUN_LIMIT))
+    terminal_samples = [
+        sample
+        for sample in run_samples
+        if _string_value(_dict_value(sample.get("manifest")).get("status")) in TERMINAL_RUN_STATUSES
+    ]
+    ordered_samples = sorted(terminal_samples, key=_terminal_sample_sort_key, reverse=True)
+    selected_samples = ordered_samples[:normalized_limit]
+    sample_size = len(selected_samples)
+
+    stage_rows: Dict[str, Dict[str, Any]] = {
+        category: {
+            "category": category,
+            "phase": category,
+            "label": label,
+            "total_duration_seconds": 0.0,
+            "count": 0,
+            "run_count": 0,
+            "coverage": {"exact_runs": 0, "partial_runs": 0, "unavailable_runs": 0, "total_runs": sample_size},
+            "sources": {},
+            "limitations": [],
+            "status": "unavailable",
+            "evidence_runs": [],
+        }
+        for category, label in _CATEGORIES
+    }
+
+    for sample in selected_samples:
+        manifest = _dict_value(sample.get("manifest"))
+        status = _string_value(manifest.get("status"))
+        run_id = _string_value(manifest.get("run_id"))
+        updated_at = _string_value(manifest.get("updated_at")) or _string_value(manifest.get("created_at"))
+        review_rework_evidence = _dict_value(sample.get("review_rework_evidence"))
+        metrics = sample.get("metrics")
+        for metric in metrics if isinstance(metrics, list) else []:
+            if not isinstance(metric, StageMetric):
+                continue
+            row = stage_rows[metric.category]
+            row["total_duration_seconds"] += max(0.0, metric.duration_seconds)
+            row["count"] += max(0, metric.count)
+            if metric.coverage != "unavailable" and metric.count > 0:
+                row["run_count"] += 1
+            coverage = _dict_value(row.get("coverage"))
+            coverage_key = f"{metric.coverage}_runs"
+            coverage[coverage_key] = int(coverage.get(coverage_key, 0)) + 1
+            row["coverage"] = coverage
+            sources = _dict_value(row.get("sources"))
+            sources[metric.source] = int(sources.get(metric.source, 0)) + 1
+            row["sources"] = sources
+            if metric.limitations:
+                _extend_unique(row["limitations"], metric.limitations)
+
+            if metric.coverage == "unavailable" and metric.count <= 0:
+                continue
+            row["evidence_runs"].append(
+                {
+                    "run_id": run_id,
+                    "status": status,
+                    "updated_at": updated_at,
+                    "duration_seconds": max(0.0, metric.duration_seconds),
+                    "count": max(0, metric.count),
+                    "coverage": metric.coverage,
+                    "source": metric.source,
+                    "limitations": list(metric.limitations),
+                    "revision_requested_count": int(review_rework_evidence.get("revision_requested_count", 0) or 0),
+                    "review_retryable_count": int(review_rework_evidence.get("review_retryable_count", 0) or 0),
+                    "rework_count": int(review_rework_evidence.get("rework_count", 0) or 0),
+                    "recovery_decision_count": int(review_rework_evidence.get("recovery_decision_count", 0) or 0),
+                    "reason_summaries": _list_value(review_rework_evidence.get("reason_summaries")),
+                }
+            )
+
+    denominator_limitations: List[str] = []
+    measurable_total_duration = 0.0
+    for sample in selected_samples:
+        wall_clock, source = _sample_wall_clock_duration_seconds(sample)
+        measurable_total_duration += wall_clock
+        if source != "timing_total":
+            _append_unique(
+                denominator_limitations,
+                (
+                    "Some retrospective share denominator rows fallback to non-overlapping phase totals "
+                    "because run-level timing total is missing."
+                ),
+            )
+
+    top_bottlenecks: List[Dict[str, Any]] = []
+    for category, _label in _CATEGORIES:
+        row = stage_rows[category]
+        count = int(_number_value(row.get("count")))
+        total_duration = float(_number_value(row.get("total_duration_seconds")))
+        avg_duration = total_duration / count if count > 0 else None
+        status = _coverage_status(_dict_value(row.get("coverage")), sample_size)
+        row["status"] = status
+        row["avg_duration_seconds"] = avg_duration
+        row["share_of_sample_duration"] = (
+            total_duration / measurable_total_duration if measurable_total_duration > 0 else 0.0
+        )
+        row["evidence_runs"] = sorted(
+            _list_value(row.get("evidence_runs")),
+            key=_evidence_sort_key,
+            reverse=True,
+        )
+        if (
+            category != CATEGORY_UNKNOWN
+            and status != "unavailable"
+            and count > 0
+            and int(_number_value(row.get("run_count"))) > 0
+        ):
+            top_bottlenecks.append(
+                {
+                    "phase": category,
+                    "category": category,
+                    "label": row.get("label"),
+                    "status": status,
+                    "coverage": _dict_value(row.get("coverage")),
+                    "sources": _dict_value(row.get("sources")),
+                    "total_duration_seconds": total_duration,
+                    "avg_duration_seconds": avg_duration,
+                    "count": count,
+                    "run_count": int(_number_value(row.get("run_count"))),
+                    "share_of_sample_duration": row["share_of_sample_duration"],
+                    "limitations": list(row.get("limitations", [])),
+                    "evidence_runs": _list_value(row.get("evidence_runs")),
+                }
+            )
+
+    top_bottlenecks.sort(
+        key=lambda item: (
+            float(_number_value(item.get("total_duration_seconds"))),
+            int(_number_value(item.get("count"))),
+            _string_value(item.get("category")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "recent_limit": normalized_limit,
+        "sample_size": sample_size,
+        "sampled_terminal_runs": sample_size,
+        "total_terminal_runs": len(terminal_samples),
+        "non_terminal_runs_ignored": max(0, len(run_samples) - len(terminal_samples)),
+        "share_basis": "sample_run_total",
+        "limitations": denominator_limitations,
+        "sample_run_ids": [
+            _string_value(_dict_value(sample.get("manifest")).get("run_id"))
+            for sample in selected_samples
+            if _string_value(_dict_value(sample.get("manifest")).get("run_id"))
+        ],
+        "total_sample_duration_seconds": measurable_total_duration,
+        "top_bottlenecks": top_bottlenecks[:5],
+    }
+
+
+def _sample_wall_clock_duration_seconds(sample: Dict[str, Any]) -> Tuple[float, str]:
+    timing = _dict_value(sample.get("timing"))
+    total = _timing_total_duration_seconds(timing)
+    if total is not None:
+        return total, "timing_total"
+    return _non_overlapping_phase_total_duration_seconds(timing), "phase_fallback"
+
+
+def _timing_total_duration_seconds(timing: Dict[str, Any]) -> Optional[float]:
+    total = _dict_value(timing.get("total"))
+    if not total:
+        return None
+    for key in ("total_duration_seconds", "duration_seconds"):
+        raw = total.get(key)
+        if isinstance(raw, (int, float)):
+            return max(0.0, float(raw))
+        if isinstance(raw, str):
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                continue
+    return None
+
+
+def _non_overlapping_phase_total_duration_seconds(timing: Dict[str, Any]) -> float:
+    target_phases = {
+        PHASE_PLANNING,
+        PHASE_HUMAN_PLAN_REVIEW_WAIT,
+        PHASE_PLAN_REVISION,
+        PHASE_WORKER_EXECUTION,
+        PHASE_WORK_DONE_WAIT,
+        PHASE_PLANNER_REVIEW,
+        PHASE_REVISION_WAIT,
+    }
+    total = 0.0
+    for phase in _list_value(timing.get("phases")):
+        phase_dict = _dict_value(phase)
+        phase_name = _string_value(phase_dict.get("phase"))
+        if phase_name not in target_phases:
+            continue
+        if _string_value(phase_dict.get("status")) == "missing":
+            continue
+        duration = _number_value(phase_dict.get("total_duration_seconds") or phase_dict.get("duration_seconds"))
+        total += max(0.0, duration)
+    return total
+
+
+def _terminal_sample_sort_key(sample: Dict[str, Any]) -> Tuple[int, float, int, str]:
+    manifest = _dict_value(sample.get("manifest"))
+    updated = _parse_iso(_string_value(manifest.get("updated_at")))
+    created = _parse_iso(_string_value(manifest.get("created_at")))
+    effective = updated or created
+    index = int(_number_value(sample.get("index")))
+    effective_key = effective.timestamp() if effective is not None else 0.0
+    run_id = _string_value(manifest.get("run_id"))
+    return (
+        1 if effective is not None else 0,
+        effective_key,
+        index,
+        run_id,
+    )
+
+
+def _evidence_sort_key(item: Any) -> Tuple[float, float, str]:
+    payload = _dict_value(item)
+    duration = float(_number_value(payload.get("duration_seconds")))
+    updated_at = _parse_iso(_string_value(payload.get("updated_at")))
+    updated_ts = updated_at.timestamp() if updated_at is not None else 0.0
+    run_id = _string_value(payload.get("run_id"))
+    return duration, updated_ts, run_id
+
+
+def _run_review_rework_evidence(
+    *,
+    manifest: Dict[str, Any],
+    events: Sequence[Dict[str, Any]],
+    usage_records: Sequence[Dict[str, Any]],
+    timing: Dict[str, Any],
+) -> Dict[str, Any]:
+    review = _dict_value(manifest.get("review"))
+    review_attempts = [_dict_value(item) for item in _list_value(manifest.get("review_attempts"))]
+    revision_attempts = [
+        attempt
+        for attempt in review_attempts
+        if _string_value(attempt.get("decision")) == "revision_requested"
+        or _string_value(attempt.get("status")) == "REVISION_REQUESTED"
+    ]
+    review_retryable_attempts = [
+        attempt
+        for attempt in review_attempts
+        if _string_value(attempt.get("status")) == "FAILED_RETRYABLE"
+    ]
+
+    revision_requested_count = len(revision_attempts)
+    if revision_requested_count == 0 and _string_value(review.get("decision")) == "revision_requested":
+        revision_requested_count = 1
+
+    review_retryable_count = len(review_retryable_attempts)
+    if review_retryable_count == 0:
+        review_retryable_count = sum(
+            1
+            for event in events
+            if _string_value(event.get("type")) in {"code_review_failed", "planner_review_failed"}
+        )
+
+    rework_count = _derive_run_rework_count(timing=timing, usage_records=usage_records)
+    recovery_events = [
+        _dict_value(event)
+        for event in events
+        if _string_value(_dict_value(event).get("type")) == "recovery_decision_recorded"
+    ]
+    recovery_decision_count = len(recovery_events)
+
+    reason_summaries: List[str] = []
+    for attempt in revision_attempts:
+        summary = _first_non_empty(
+            _string_or_none(attempt.get("summary")),
+            _first_sentence(_string_or_none(attempt.get("reason"))),
+            _first_sentence(_string_or_none(attempt.get("error"))),
+        )
+        if summary:
+            _append_unique(reason_summaries, f"revision_requested: {summary}")
+    if revision_requested_count and not revision_attempts:
+        summary = _first_non_empty(
+            _string_or_none(review.get("summary")),
+            _first_sentence(_string_or_none(review.get("reason"))),
+        )
+        if summary:
+            _append_unique(reason_summaries, f"revision_requested: {summary}")
+
+    for attempt in review_retryable_attempts:
+        summary = _first_non_empty(
+            _string_or_none(attempt.get("summary")),
+            _first_sentence(_string_or_none(attempt.get("error"))),
+            _first_sentence(_string_or_none(attempt.get("reason"))),
+        )
+        if summary:
+            _append_unique(reason_summaries, f"review_retryable: {summary}")
+
+    for event in recovery_events:
+        summary = _first_non_empty(
+            _first_sentence(_string_or_none(event.get("summary"))),
+            _first_sentence(_string_or_none(event.get("reason"))),
+            _first_sentence(_string_or_none(event.get("message"))),
+            _first_sentence(_string_or_none(event.get("recovery_action"))),
+            _first_sentence(_string_or_none(event.get("category"))),
+        )
+        if summary:
+            _append_unique(reason_summaries, f"recovery: {summary}")
+
+    return {
+        "revision_requested_count": revision_requested_count,
+        "review_retryable_count": review_retryable_count,
+        "rework_count": rework_count,
+        "recovery_decision_count": recovery_decision_count,
+        "reason_summaries": reason_summaries[:6],
+    }
+
+
+def _derive_run_rework_count(*, timing: Dict[str, Any], usage_records: Sequence[Dict[str, Any]]) -> int:
+    run_rework_count = max(0, _phase_count(timing, PHASE_WORKER_EXECUTION) - 1)
+    if run_rework_count == 0:
+        run_rework_count = sum(1 for record in usage_records if _usage_match(record, role="worker", phase="rework"))
+    return run_rework_count
+
+
+def _coverage_status(coverage: Dict[str, Any], total_runs: int) -> str:
+    exact = int(_number_value(coverage.get("exact_runs")))
+    partial = int(_number_value(coverage.get("partial_runs")))
+    if total_runs > 0 and exact == total_runs:
+        return "complete"
+    if exact > 0 or partial > 0:
+        return "partial"
+    return "unavailable"
+
+
 def _load_manifests(runs_dir: Path) -> List[Dict[str, Any]]:
     manifests: List[Dict[str, Any]] = []
     if not runs_dir.exists():
@@ -756,6 +1134,32 @@ def _number_value(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _first_sentence(value: Optional[str]) -> Optional[str]:
+    text = _string_or_none(value)
+    if not text:
+        return None
+    match = _SENTENCE_BOUNDARY_PATTERN.search(text)
+    if match is None:
+        return text
+    sentence = text[: match.end()].strip()
+    return sentence or text
+
+
+def _first_non_empty(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        text = _string_or_none(value)
+        if text:
+            return text
+    return None
 
 
 def _dict_value(value: Any) -> Dict[str, Any]:
