@@ -62,6 +62,7 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                     decision="revision_requested",
                     reason="旧打回原因。需要补日志。",
                     worker_attempt=1,
+                    service_tier="fast",
                 ),
                 ReviewAttemptRecord(
                     id="review-2",
@@ -72,6 +73,7 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                     reason="code_review_error",
                     error="status=error returncode=None summary=Codex review timed out after 900s.",
                     worker_attempt=2,
+                    service_tier="fast",
                 ),
                 ReviewAttemptRecord(
                     id="review-3",
@@ -83,6 +85,7 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                     summary="最新核心打回：缺少失败路径测试。",
                     reason="最新核心打回：缺少失败路径测试。另外需要补边界条件。",
                     worker_attempt=3,
+                    service_tier="flex",
                 ),
             ]
             manifest.review = ReviewRecord(
@@ -99,6 +102,7 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertEqual(run["review_retry_count"], 1)
             self.assertEqual(run["last_review_attempt"]["id"], "review-3")
             self.assertEqual(run["last_review_attempt"]["summary"], "最新核心打回：缺少失败路径测试。")
+            self.assertEqual(run["last_review_attempt"]["service_tier"], "flex")
             self.assertEqual(run["latest_revision_request"]["review_attempt_id"], "review-3")
             self.assertEqual(
                 run["latest_revision_request"]["summary"],

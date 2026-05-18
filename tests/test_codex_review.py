@@ -138,6 +138,37 @@ class CodexReviewTests(unittest.TestCase):
             self.assertEqual(payload["status"], "passed")
             self.assertEqual(payload["returncode"], 0)
             self.assertEqual(payload["command"][1:], ["review", "--uncommitted"])
+            self.assertIsNone(payload["service_tier"])
+
+    def test_run_codex_uncommitted_review_includes_service_tier_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_path = root / "codex"
+            bin_path.write_text(
+                "#!/bin/sh\n"
+                "printf 'fake review with flex\\n'\n",
+                encoding="utf-8",
+            )
+            bin_path.chmod(0o755)
+
+            report = run_codex_uncommitted_review(
+                cwd=root,
+                evidence_dir=root / "evidence",
+                codex_binary_path=str(bin_path),
+                service_tier="flex",
+            )
+
+            self.assertEqual(report.status, "passed")
+            self.assertEqual(report.service_tier, "flex")
+            payload = json.loads(report.result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["service_tier"], "flex")
+            self.assertEqual(
+                payload["command"],
+                [str(bin_path), "review", "--uncommitted", "-c", "service_tier=flex"],
+            )
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("-c service_tier=flex", output)
+            self.assertIn("service_tier: flex", output)
 
     def test_run_codex_uncommitted_review_records_missing_binary_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

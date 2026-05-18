@@ -65,6 +65,7 @@ class SchedulerConfig:
     worker_reasoning_effort: Optional[str] = None
     planner_service_tier: Optional[str] = None
     worker_service_tier: Optional[str] = None
+    reviewer_service_tier: Optional[str] = None
     max_tasks: Optional[int] = None
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
     require_proposal_plan_review: bool = False
@@ -271,6 +272,7 @@ class TaskScheduler:
                     worker_reasoning_effort=self.config.worker_reasoning_effort,
                     planner_service_tier=self.config.planner_service_tier,
                     worker_service_tier=self.config.worker_service_tier,
+                    reviewer_service_tier=self.config.reviewer_service_tier,
                     task_id=task.task_id,
                     workspace_id=str(task_cwd),
                 )
@@ -339,6 +341,7 @@ class TaskScheduler:
                 sandbox=self.config.sandbox,
                 approval_policy=self.config.approval_policy,
                 max_attempts=self.config.max_attempts,
+                reviewer_service_tier=self.config.reviewer_service_tier,
                 require_plan_approval=True,
                 approve_plan=True,
                 controller_repo_path=str(self.config.cwd),

@@ -96,6 +96,12 @@ Planner and Worker own semantic work:
   (`/Applications/Codex.app/Contents/Resources/codex review --uncommitted`) by
   default. It is not a named Skill that Planner/Worker discover dynamically.
   A configured Codex binary may override this, and `PATH` is only a fallback.
+- Optional `[run].low_cost_mode=true` is a narrow execution override: for new
+  run/proposal/queue dispatch paths, Planner, Worker, and the code review gate
+  use `service_tier=flex`. This does not change model selection,
+  `reasoning_effort`, review loop behavior, business state transitions, or
+  failure recovery policy. It is not a guarantee that total usage will be
+  lower.
 
 The task workspace is currently implemented as the single Worker's git
 worktree. Planner sessions must start in the same workspace before planning, and

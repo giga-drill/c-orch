@@ -1149,6 +1149,88 @@ class UiTests(unittest.TestCase):
             self.assertEqual(orchestrator.revise_plan.call_args.args[1], "Please update the plan")
             driver_cls.assert_called_once()
 
+    def test_run_action_approve_plan_passes_reviewer_service_tier_to_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/bin/codex",
+                reviewer_service_tier="flex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.planner.status = "PLAN_REVIEW_REQUIRED"
+            manifest.plan = PlanRecord(summary="Plan", worker_prompt="Prompt")
+            store.save(manifest)
+
+            with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls, mock.patch(
+                "c_orch.orchestrator.RunOrchestrator"
+            ) as orchestrator_cls:
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.run.return_value = manifest
+                status, _payload = run_action(
+                    root / "runs",
+                    manifest.run_id,
+                    "approve-plan",
+                    reviewer_service_tier="flex",
+                )
+
+            self.assertEqual(int(status), 200)
+            config = orchestrator_cls.call_args.kwargs["config"]
+            self.assertEqual(config.reviewer_service_tier, "flex")
+            driver_cls.assert_called_once()
+
+    def test_run_action_retry_review_passes_reviewer_service_tier_to_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Task",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+                codex_binary_path="/bin/codex",
+                reviewer_service_tier="flex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(evidence_files=["runs/example/evidence/git-diff.patch"])
+            manifest.review_attempts = [
+                ReviewAttemptRecord(
+                    id="review-1",
+                    worker_id="worker-1",
+                    status="FAILED_RETRYABLE",
+                    started_at="2026-05-12T09:01:00+08:00",
+                    completed_at="2026-05-12T09:02:00+08:00",
+                    worker_attempt=1,
+                    workspace_path="/tmp/workspace",
+                    reason="planner_review_failed",
+                    error="session not found",
+                    evidence_files=["runs/example/evidence/git-diff.patch"],
+                )
+            ]
+            store.save(manifest)
+
+            with mock.patch("c_orch.mcp_driver.McpCodexDriver") as driver_cls, mock.patch(
+                "c_orch.orchestrator.RunOrchestrator"
+            ) as orchestrator_cls:
+                orchestrator = orchestrator_cls.return_value
+                orchestrator.retry_review.return_value = manifest
+                status, _payload = run_action(
+                    root / "runs",
+                    manifest.run_id,
+                    "retry-review",
+                    reviewer_service_tier="flex",
+                )
+
+            self.assertEqual(int(status), 200)
+            config = orchestrator_cls.call_args.kwargs["config"]
+            self.assertEqual(config.reviewer_service_tier, "flex")
+            self.assertEqual(orchestrator.retry_review.call_count, 1)
+            driver_cls.assert_called_once()
+
     def test_run_action_rejects_approve_plan_outside_plan_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

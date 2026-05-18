@@ -853,6 +853,7 @@ def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
         "status": attempt.get("status"),
         "worker_attempt": attempt.get("worker_attempt"),
         "workspace_path": attempt.get("workspace_path"),
+        "service_tier": attempt.get("service_tier"),
         "evidence_count": len(_list_value(attempt.get("evidence_files"))),
         "decision": attempt.get("decision"),
         "reason": attempt.get("reason"),

@@ -186,6 +186,59 @@ approval_policy = "on-request"
             self.assertEqual(manifest.workers[0].reasoning_effort, "medium")
             self.assertEqual(manifest.workers[0].service_tier, "flex")
 
+    def test_run_prepare_only_low_cost_mode_forces_flex_service_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            (cwd / ".c-orch.toml").write_text(
+                """
+[planner]
+service_tier = "fast"
+
+[worker]
+service_tier = "fast"
+
+[run]
+low_cost_mode = true
+""".strip(),
+                encoding="utf-8",
+            )
+            worktree_path = root / "worktrees" / "run" / "worker-1"
+            report = CodexEnvironmentReport(
+                candidates=(),
+                selected=CodexCandidateReport(
+                    path="/Applications/Codex.app/Contents/Resources/codex",
+                    source="macos_app",
+                    version="codex-cli test",
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    usable=True,
+                ),
+            )
+
+            with mock.patch(
+                "c_orch.codex_discovery.inspect_codex_environment",
+                return_value=report,
+            ), mock.patch(
+                "c_orch.worktrees.create_worker_worktree",
+                return_value=worktree_path,
+            ), redirect_stdout(StringIO()):
+                exit_code = main(
+                    [
+                        "run",
+                        "--prepare-only",
+                        "--cwd",
+                        str(cwd),
+                        "Implement feature X",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            run_ids = [path.name for path in (cwd / "runs").iterdir()]
+            manifest = RunStore(cwd / "runs").load(run_ids[0])
+            self.assertEqual(manifest.planner.service_tier, "flex")
+            self.assertEqual(manifest.workers[0].service_tier, "flex")
+
     def test_run_executes_single_worker_with_mcp_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -253,12 +306,75 @@ approval_policy = "on-request"
             self.assertEqual(fake_run_single_worker.kwargs["max_attempts"], 2)
             self.assertEqual(fake_run_single_worker.kwargs["sandbox"], "read-only")
             self.assertEqual(fake_run_single_worker.kwargs["approval_policy"], "never")
+            self.assertIsNone(fake_run_single_worker.kwargs["reviewer_service_tier"])
             self.assertTrue(fake_run_single_worker.kwargs["require_plan_approval"])
             output = stdout.getvalue()
             self.assertIn("status: APPROVED", output)
             self.assertIn("planner_service_tier: fast", output)
             self.assertIn("planner_thread: planner-thread", output)
             self.assertIn("worker_thread: worker-thread", output)
+
+    def test_run_low_cost_mode_passes_flex_to_planner_worker_and_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "repo"
+            cwd.mkdir()
+            (cwd / ".c-orch.toml").write_text(
+                """
+[run]
+low_cost_mode = true
+""".strip(),
+                encoding="utf-8",
+            )
+            runs_dir = root / "runs"
+            worktree_path = root / "worktrees" / "run" / "worker-1"
+            report = CodexEnvironmentReport(
+                candidates=(),
+                selected=CodexCandidateReport(
+                    path="/Applications/Codex.app/Contents/Resources/codex",
+                    source="macos_app",
+                    version="codex-cli test",
+                    interesting_models=("gpt-5.5", "gpt-5.3-codex"),
+                    usable=True,
+                ),
+            )
+            driver = FakeDriver()
+
+            def fake_run_single_worker(**kwargs):
+                fake_run_single_worker.kwargs = kwargs
+                return kwargs["manifest"]
+
+            fake_run_single_worker.kwargs = {}
+
+            with mock.patch(
+                "c_orch.codex_discovery.inspect_codex_environment",
+                return_value=report,
+            ), mock.patch(
+                "c_orch.worktrees.create_worker_worktree",
+                return_value=worktree_path,
+            ), mock.patch(
+                "c_orch.mcp_driver.McpCodexDriver",
+                return_value=driver,
+            ), mock.patch(
+                "c_orch.orchestrator.run_single_worker",
+                side_effect=fake_run_single_worker,
+            ), redirect_stdout(StringIO()):
+                exit_code = main(
+                    [
+                        "run",
+                        "--cwd",
+                        str(cwd),
+                        "--runs-dir",
+                        str(runs_dir),
+                        "Implement feature X",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            manifest = fake_run_single_worker.kwargs["manifest"]
+            self.assertEqual(manifest.planner.service_tier, "flex")
+            self.assertEqual(manifest.workers[0].service_tier, "flex")
+            self.assertEqual(fake_run_single_worker.kwargs["reviewer_service_tier"], "flex")
 
     def test_run_failure_prints_manifest_and_returns_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

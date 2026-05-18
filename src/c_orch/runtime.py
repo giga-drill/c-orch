@@ -191,6 +191,11 @@ class COrchRuntime:
                 action,
                 feedback,
                 driver_factory=self._driver_context,
+                reviewer_service_tier=(
+                    self._scheduler_config.reviewer_service_tier
+                    if self._scheduler_config is not None
+                    else None
+                ),
             )
             if self.queue_path is not None:
                 reconcile_queue_file(queue_path=self.queue_path, runs_dir=self.runs_dir)
@@ -625,6 +630,7 @@ class COrchRuntime:
                         worker_reasoning_effort=self._scheduler_config.worker_reasoning_effort,
                         planner_service_tier=self._scheduler_config.planner_service_tier,
                         worker_service_tier=self._scheduler_config.worker_service_tier,
+                        reviewer_service_tier=self._scheduler_config.reviewer_service_tier,
                         task_id=task.task_id,
                         workspace_id=str(task_cwd),
                     )
@@ -731,6 +737,7 @@ class COrchRuntime:
                 sandbox=self._scheduler_config.sandbox,
                 approval_policy=self._scheduler_config.approval_policy,
                 max_attempts=self._scheduler_config.max_attempts,
+                reviewer_service_tier=self._scheduler_config.reviewer_service_tier,
                 require_plan_approval=True,
                 approve_plan=True,
                 controller_repo_path=str(self._scheduler_config.cwd),
@@ -1067,6 +1074,7 @@ class COrchRuntime:
                 sandbox=self._scheduler_config.sandbox,
                 approval_policy=self._scheduler_config.approval_policy,
                 max_attempts=self._scheduler_config.max_attempts,
+                reviewer_service_tier=self._scheduler_config.reviewer_service_tier,
                 require_plan_approval=True,
                 approve_plan=False,
                 controller_repo_path=str(self._scheduler_config.cwd),
@@ -1234,6 +1242,7 @@ def run_action(
     feedback: Any = None,
     *,
     driver_factory: Optional[DriverFactory] = None,
+    reviewer_service_tier: Optional[str] = None,
 ) -> RunActionResponse:
     runs_path = Path(runs_dir).expanduser().resolve()
     if not _valid_run_id(run_id):
@@ -1292,6 +1301,7 @@ def run_action(
                     driver=driver,
                     config=OrchestratorConfig(
                         require_plan_approval=True,
+                        reviewer_service_tier=reviewer_service_tier,
                         approve_plan=action == "approve-plan",
                     ),
                 )
@@ -2037,6 +2047,7 @@ def _create_preflight_run(
         worker_reasoning_effort=config.worker_reasoning_effort,
         planner_service_tier=config.planner_service_tier,
         worker_service_tier=config.worker_service_tier,
+        reviewer_service_tier=config.reviewer_service_tier,
         task_id=task_id,
         proposal_id=proposal_id,
         workspace_id=workspace_id,

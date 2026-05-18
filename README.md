@@ -190,6 +190,7 @@ approval_policy = "never"
 runs_dir = "runs"
 worktrees_dir = ".c-orch/worktrees"
 require_proposal_plan_review = false
+low_cost_mode = false
 
 [ui]
 # Optional. Omit these to use built-in defaults.
@@ -198,6 +199,14 @@ require_proposal_plan_review = false
 # dev_host controls the Vite bind host.
 # dev_port controls the Vite dev UI port.
 ```
+
+`[run].low_cost_mode = true` forces Planner, Worker, and the Codex review gate
+to use `service_tier=flex` for new run/proposal/queue dispatch paths. The
+review gate forwards this as `codex review -c service_tier=flex --uncommitted`.
+This only overrides `service_tier`; it does not change model selection,
+`reasoning_effort`, review loops, state transitions, or failure recovery policy.
+It is a cost-control hint, not a hard usage cap: retries, output length, and
+model choices can still increase total usage.
 
 ## Codex Binary Selection
 

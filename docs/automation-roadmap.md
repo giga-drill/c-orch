@@ -342,6 +342,37 @@ Status (Phase 1 delivered):
 - Still out of scope in this phase: runner lease ownership metadata, external
   runner subprocess handoff, and same-repo parallel conflict auto-rebase.
 
+Next recovery slice:
+
+- Detect stalled active Worker attempts by comparing the run event log,
+  Worker transcript mtime, and runner/driver heartbeat against a configurable
+  timeout.
+- Add an explicit backend action such as `abort-worker-attempt` or
+  `mark-worker-stalled` that records `worker_stalled`, marks the active Worker
+  attempt failed, updates the run/task to a retryable failed state, and exposes
+  normal `retry-task` handling.
+- Preserve the stalled worktree and partial evidence instead of deleting it, so
+  the next Worker or a human can inspect what happened.
+- Let the scheduler apply retry budget plus backoff to stalled Workers, rather
+  than requiring manual state repair.
+- Keep this separate from business review states: a stalled Worker is an
+  infrastructure/recovery event, not a Planner review outcome.
+
+Accepted-review terminalization recovery:
+
+- Add an idempotent reconciliation step for runs where Planner review has
+  durably recorded `accepted`, but the run/task is still `REVIEWING` or the
+  apply/commit terminal events are missing.
+- On runtime startup and scheduler wakeup, detect this state and continue from
+  the next missing boundary: collect or confirm the patch, apply if needed,
+  commit if needed, then mark the run/task terminal.
+- Persist each boundary before starting the next side effect, so a restart
+  after review acceptance cannot leave UI state permanently stuck in
+  Planner-reviewing.
+- If reconciliation cannot prove whether apply or commit happened, surface a
+  manual recovery action with the current diff, commit status, and run evidence
+  instead of pretending Planner review is still running.
+
 ## 3. Self-Bootstrap Restart Protocol
 
 ### Goal

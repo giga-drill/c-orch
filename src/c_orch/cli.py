@@ -470,6 +470,21 @@ def _resolve_execution_config(
             f"Worker model {worker_model!r} was not found in selected Codex binary: {report.selected.path}"
         )
 
+    planner_service_tier = _first_value(
+        getattr(args, "planner_service_tier", None),
+        project_config.planner.service_tier,
+    )
+    worker_service_tier = _first_value(
+        getattr(args, "worker_service_tier", None),
+        project_config.worker.service_tier,
+        DEFAULT_WORKER_SERVICE_TIER,
+    )
+    reviewer_service_tier: Optional[str] = None
+    if project_config.run.low_cost_mode:
+        planner_service_tier = "flex"
+        worker_service_tier = "flex"
+        reviewer_service_tier = "flex"
+
     return {
         "project_config": project_config,
         "codex_path": report.selected.path,
@@ -493,18 +508,13 @@ def _resolve_execution_config(
             project_config.worker.reasoning_effort,
             DEFAULT_WORKER_REASONING_EFFORT,
         ),
-        "planner_service_tier": _first_value(
-            getattr(args, "planner_service_tier", None),
-            project_config.planner.service_tier,
-        ),
-        "worker_service_tier": _first_value(
-            getattr(args, "worker_service_tier", None),
-            project_config.worker.service_tier,
-            DEFAULT_WORKER_SERVICE_TIER,
-        ),
+        "planner_service_tier": planner_service_tier,
+        "worker_service_tier": worker_service_tier,
+        "reviewer_service_tier": reviewer_service_tier,
         "max_attempts": getattr(args, "max_attempts", None) or project_config.run.max_attempts,
         "max_parallel_workspaces": project_config.run.max_parallel_workspaces,
         "require_proposal_plan_review": project_config.run.require_proposal_plan_review,
+        "low_cost_mode": project_config.run.low_cost_mode,
         "sandbox": getattr(args, "sandbox", None) or project_config.run.sandbox,
         "approval_policy": getattr(args, "approval_policy", None) or project_config.run.approval_policy,
     }
@@ -543,6 +553,7 @@ def run_prepare(args: argparse.Namespace) -> int:
         worker_reasoning_effort=config["worker_reasoning_effort"],
         planner_service_tier=config["planner_service_tier"],
         worker_service_tier=config["worker_service_tier"],
+        reviewer_service_tier=config["reviewer_service_tier"],
     )
     worker = manifest.workers[0]
     worker.worktree_path = str(
@@ -565,6 +576,7 @@ def run_prepare(args: argparse.Namespace) -> int:
                     max_attempts=config["max_attempts"],
                     sandbox=config["sandbox"],
                     approval_policy=config["approval_policy"],
+                    reviewer_service_tier=config["reviewer_service_tier"],
                     require_plan_approval=not args.auto_approve_plan,
                 )
         except Exception as exc:
@@ -700,6 +712,11 @@ def run_resume(args: argparse.Namespace) -> int:
                     max_attempts=args.max_attempts or project_config.run.max_attempts,
                     sandbox=args.sandbox or project_config.run.sandbox,
                     approval_policy=args.approval_policy or project_config.run.approval_policy,
+                    reviewer_service_tier=(
+                        "flex"
+                        if project_config.run.low_cost_mode
+                        else manifest.reviewer_service_tier
+                    ),
                     require_plan_approval=True,
                     approve_plan=args.approve_plan,
                 ),
@@ -886,6 +903,7 @@ def run_queue_run(args: argparse.Namespace) -> int:
         worker_reasoning_effort=config["worker_reasoning_effort"],
         planner_service_tier=config["planner_service_tier"],
         worker_service_tier=config["worker_service_tier"],
+        reviewer_service_tier=config["reviewer_service_tier"],
         max_attempts=config["max_attempts"],
         max_parallel_workspaces=config["max_parallel_workspaces"],
         require_proposal_plan_review=config["require_proposal_plan_review"],
@@ -946,6 +964,7 @@ def run_ui(args: argparse.Namespace) -> int:
                 worker_reasoning_effort=execution_config["worker_reasoning_effort"],
                 planner_service_tier=execution_config["planner_service_tier"],
                 worker_service_tier=execution_config["worker_service_tier"],
+                reviewer_service_tier=execution_config["reviewer_service_tier"],
                 max_attempts=execution_config["max_attempts"],
                 max_parallel_workspaces=execution_config["max_parallel_workspaces"],
                 require_proposal_plan_review=execution_config["require_proposal_plan_review"],

@@ -139,6 +139,7 @@ class ReviewAttemptRecord:
     started_at: str
     worker_attempt: Optional[int] = None
     workspace_path: Optional[str] = None
+    service_tier: Optional[str] = None
     completed_at: Optional[str] = None
     decision: Optional[str] = None
     reason: Optional[str] = None
@@ -155,6 +156,7 @@ class ReviewAttemptRecord:
             "started_at": self.started_at,
             "worker_attempt": self.worker_attempt,
             "workspace_path": self.workspace_path,
+            "service_tier": self.service_tier,
             "completed_at": self.completed_at,
             "decision": self.decision,
             "reason": self.reason,
@@ -175,6 +177,7 @@ class ReviewAttemptRecord:
             if data.get("worker_attempt") is not None
             else None,
             workspace_path=data.get("workspace_path"),
+            service_tier=data.get("service_tier"),
             completed_at=data.get("completed_at"),
             decision=data.get("decision"),
             reason=data.get("reason"),
@@ -271,6 +274,7 @@ class RunManifest:
     task_id: Optional[str] = None
     proposal_id: Optional[str] = None
     workspace_id: Optional[str] = None
+    reviewer_service_tier: Optional[str] = None
     timing: Optional[Dict[str, Any]] = None
     codex_binary_path: Optional[str] = None
     requires_restart: bool = False
@@ -296,6 +300,7 @@ class RunManifest:
             "task_id": self.task_id,
             "proposal_id": self.proposal_id,
             "workspace_id": self.workspace_id,
+            "reviewer_service_tier": self.reviewer_service_tier,
             "timing": dict(self.timing) if isinstance(self.timing, dict) else None,
             "codex_binary_path": self.codex_binary_path,
             "requires_restart": self.requires_restart,
@@ -337,6 +342,7 @@ class RunManifest:
             task_id=data.get("task_id"),
             proposal_id=data.get("proposal_id"),
             workspace_id=data.get("workspace_id"),
+            reviewer_service_tier=data.get("reviewer_service_tier"),
             timing=dict(data.get("timing")) if isinstance(data.get("timing"), dict) else None,
             codex_binary_path=data.get("codex_binary_path"),
             requires_restart=bool(data.get("requires_restart", False)),
@@ -375,6 +381,7 @@ class RunStore:
         worker_reasoning_effort: Optional[str] = None,
         planner_service_tier: Optional[str] = None,
         worker_service_tier: Optional[str] = None,
+        reviewer_service_tier: Optional[str] = None,
         task_id: Optional[str] = None,
         proposal_id: Optional[str] = None,
         workspace_id: Optional[str] = None,
@@ -413,6 +420,7 @@ class RunStore:
             task_id=task_id,
             proposal_id=proposal_id,
             workspace_id=workspace_id,
+            reviewer_service_tier=reviewer_service_tier,
             timing={"version": 1, "segments": []},
             codex_binary_path=codex_path,
         )

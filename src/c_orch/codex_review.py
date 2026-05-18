@@ -24,6 +24,7 @@ class CodexReviewReport:
     status: str
     returncode: Optional[int]
     command: str
+    service_tier: Optional[str] = None
 
     @property
     def evidence_files(self) -> list[str]:
@@ -36,6 +37,7 @@ def run_codex_uncommitted_review(
     evidence_dir: Pathish,
     codex_binary_path: Optional[str] = None,
     patch_path: Optional[Pathish] = None,
+    service_tier: Optional[str] = None,
     timeout_seconds: float = DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS,
 ) -> CodexReviewReport:
     worktree = Path(cwd).expanduser().resolve()
@@ -46,6 +48,8 @@ def run_codex_uncommitted_review(
 
     codex_bin, codex_bin_source = _resolve_codex_review_binary(codex_binary_path)
     command_parts = [codex_bin, "review", "--uncommitted"]
+    if service_tier:
+        command_parts.extend(["-c", f"service_tier={service_tier}"])
     command_text = " ".join(command_parts)
 
     status = "failed"
@@ -133,6 +137,7 @@ def run_codex_uncommitted_review(
             review_workspace_mode=review_workspace_mode,
             prep_summary=prep_summary,
             codex_bin_source=codex_bin_source,
+            service_tier=service_tier,
         ),
         encoding="utf-8",
     )
@@ -149,6 +154,7 @@ def run_codex_uncommitted_review(
         "review_workspace_mode": review_workspace_mode,
         "review_workspace": str(review_workspace),
         "prep_summary": prep_summary,
+        "service_tier": service_tier,
     }
     result_path.write_text(
         json.dumps(result_payload, ensure_ascii=False, indent=2) + "\n",
@@ -162,6 +168,7 @@ def run_codex_uncommitted_review(
         status=status,
         returncode=returncode,
         command=command_text,
+        service_tier=service_tier,
     )
 
 
@@ -205,6 +212,7 @@ def _format_output(
     review_workspace_mode: str,
     prep_summary: str,
     codex_bin_source: str,
+    service_tier: Optional[str],
 ) -> str:
     returncode_text = "n/a" if returncode is None else str(returncode)
     lines = [
@@ -214,6 +222,7 @@ def _format_output(
         f"review_workspace: {review_workspace}",
         f"review_workspace_prep: {prep_summary}",
         f"codex_binary_source: {codex_bin_source}",
+        f"service_tier: {service_tier or '<unset>'}",
         f"status: {status}",
         f"returncode: {returncode_text}",
         f"summary: {summary}",

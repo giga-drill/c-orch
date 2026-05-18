@@ -31,6 +31,7 @@ worktrees_dir = ".custom/worktrees"
 max_attempts = 2
 max_parallel_workspaces = 3
 require_proposal_plan_review = true
+low_cost_mode = true
 sandbox = "read-only"
 approval_policy = "on-request"
 
@@ -56,6 +57,7 @@ dev_port = 6173
             self.assertEqual(config.run.max_attempts, 2)
             self.assertEqual(config.run.max_parallel_workspaces, 3)
             self.assertTrue(config.run.require_proposal_plan_review)
+            self.assertTrue(config.run.low_cost_mode)
             self.assertEqual(config.run.sandbox, "read-only")
             self.assertEqual(config.run.approval_policy, "on-request")
             self.assertEqual(config.ui.host, "0.0.0.0")
@@ -75,6 +77,28 @@ require_proposal_plan_review = "yes"
             )
 
             with self.assertRaisesRegex(ValueError, "run.require_proposal_plan_review"):
+                load_project_config(cwd=cwd)
+
+    def test_run_low_cost_mode_defaults_to_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+
+            config = load_project_config(cwd=cwd)
+
+            self.assertFalse(config.run.low_cost_mode)
+
+    def test_rejects_invalid_low_cost_mode_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".c-orch.toml").write_text(
+                """
+[run]
+low_cost_mode = "true"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "run.low_cost_mode"):
                 load_project_config(cwd=cwd)
 
     def test_rejects_invalid_choice(self) -> None:

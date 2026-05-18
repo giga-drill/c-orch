@@ -192,6 +192,7 @@ class FakeCodeReviewRunner:
         evidence_dir: Path,
         codex_binary_path: Optional[str] = None,
         patch_path: Optional[Path] = None,
+        service_tier: Optional[str] = None,
     ) -> CodexReviewReport:
         evidence_dir = Path(evidence_dir)
         evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +206,7 @@ class FakeCodeReviewRunner:
                 "evidence_dir": evidence_dir,
                 "codex_binary_path": codex_binary_path,
                 "patch_path": Path(patch_path) if patch_path is not None else None,
+                "service_tier": service_tier,
             }
         )
         return CodexReviewReport(
@@ -214,6 +216,7 @@ class FakeCodeReviewRunner:
             status="passed",
             returncode=0,
             command="codex review --uncommitted",
+            service_tier=service_tier,
         )
 
 
@@ -228,6 +231,7 @@ class FakeCodeReviewInfraErrorRunner:
         evidence_dir: Path,
         codex_binary_path: Optional[str] = None,
         patch_path: Optional[Path] = None,
+        service_tier: Optional[str] = None,
     ) -> CodexReviewReport:
         evidence_dir = Path(evidence_dir)
         evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +245,7 @@ class FakeCodeReviewInfraErrorRunner:
                 "evidence_dir": evidence_dir,
                 "codex_binary_path": codex_binary_path,
                 "patch_path": Path(patch_path) if patch_path is not None else None,
+                "service_tier": service_tier,
             }
         )
         return CodexReviewReport(
@@ -250,6 +255,7 @@ class FakeCodeReviewInfraErrorRunner:
             status="error",
             returncode=None,
             command="codex review --uncommitted",
+            service_tier=service_tier,
         )
 
 
@@ -268,6 +274,7 @@ class CheckpointingCodeReviewRunner:
         evidence_dir: Path,
         codex_binary_path: Optional[str] = None,
         patch_path: Optional[Path] = None,
+        service_tier: Optional[str] = None,
     ) -> CodexReviewReport:
         saved = self.store.load(self.run_id)
         self.saved_statuses.append(saved.status)
@@ -279,6 +286,7 @@ class CheckpointingCodeReviewRunner:
                 "evidence_dir": Path(evidence_dir),
                 "codex_binary_path": codex_binary_path,
                 "patch_path": Path(patch_path) if patch_path is not None else None,
+                "service_tier": service_tier,
             }
         )
         evidence_dir = Path(evidence_dir)
@@ -294,6 +302,7 @@ class CheckpointingCodeReviewRunner:
             status="passed",
             returncode=0,
             command="codex review --uncommitted",
+            service_tier=service_tier,
         )
 
 
@@ -869,6 +878,68 @@ class OrchestratorTests(unittest.TestCase):
 
             self.assertEqual(result.status, "APPROVED")
             self.assertEqual(code_review.calls[0]["codex_binary_path"], "/effective/codex")
+
+    def test_code_review_records_reviewer_service_tier_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, worktree = _create_manifest(root)
+            manifest.task_id = "task-001"
+            manifest.workspace_id = str(Path(manifest.cwd).resolve())
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            code_review = FakeCodeReviewRunner()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=code_review,
+                diff_applier=FakeDiffApplier(),
+                config=OrchestratorConfig(reviewer_service_tier="flex"),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(code_review.calls[0]["service_tier"], "flex")
+            self.assertEqual(result.review_attempts[0].service_tier, "flex")
+            attribution = store.load_usage_attribution(manifest.run_id)
+            reviewer_review = next(
+                item for item in attribution if item.get("role") == "reviewer" and item.get("phase") == "review"
+            )
+            self.assertEqual(reviewer_review["service_tier"], "flex")
+            self.assertEqual(reviewer_review["worktree_path"], str(worktree))
+
+    def test_code_review_uses_manifest_reviewer_service_tier_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            manifest.reviewer_service_tier = "flex"
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            code_review = FakeCodeReviewRunner()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=code_review,
+                diff_applier=FakeDiffApplier(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(code_review.calls[0]["service_tier"], "flex")
+            self.assertEqual(result.review_attempts[0].service_tier, "flex")
 
     def test_code_review_error_blocks_planner_review_and_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

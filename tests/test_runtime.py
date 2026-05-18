@@ -174,6 +174,23 @@ class _AutoQueueProposalOrchestrator:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_runtime_run_action_forwards_scheduler_reviewer_service_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                scheduler_config=replace(_scheduler_config(root), reviewer_service_tier="flex"),
+            )
+            with mock.patch(
+                "c_orch.runtime.run_action",
+                return_value=(200, {"transition": {"selected_run_id": "run-1"}}),
+            ) as run_action_mock:
+                status, _payload = runtime.run_action("run-1", "approve-plan")
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(run_action_mock.call_count, 1)
+            self.assertEqual(run_action_mock.call_args.kwargs["reviewer_service_tier"], "flex")
+
     def test_runtime_reuses_cached_driver_until_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
             "c_orch.mcp_driver.McpCodexDriver"

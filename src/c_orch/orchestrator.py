@@ -109,6 +109,7 @@ class CodeReviewRunner(Protocol):
         evidence_dir: Pathish,
         codex_binary_path: Optional[str] = None,
         patch_path: Optional[Pathish] = None,
+        service_tier: Optional[str] = None,
     ) -> CodexReviewReport:
         ...
 
@@ -160,6 +161,7 @@ class OrchestratorConfig:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     require_plan_approval: bool = False
     approve_plan: bool = False
+    reviewer_service_tier: Optional[str] = None
     controller_repo_path: Optional[str] = None
 
 
@@ -761,6 +763,7 @@ class RunOrchestrator:
         manifest.planner.status = RUN_REVIEWING
         workspace_path = _required_worktree_path(worker)
         evidence_files = _append_unique(evidence.evidence_files, verification.evidence_files)
+        reviewer_service_tier = self._effective_reviewer_service_tier(manifest)
         attempt = ReviewAttemptRecord(
             id=f"review-{len(manifest.review_attempts) + 1}",
             worker_id=worker.id,
@@ -768,6 +771,7 @@ class RunOrchestrator:
             started_at=self.store.now_iso(),
             worker_attempt=worker.attempt,
             workspace_path=workspace_path,
+            service_tier=reviewer_service_tier,
             evidence_files=evidence_files,
         )
         manifest.review_attempts.append(attempt)
@@ -1047,11 +1051,13 @@ class RunOrchestrator:
         evidence: DiffEvidence,
     ) -> CodexReviewReport:
         started_at = self.store.now_iso()
+        reviewer_service_tier = self._effective_reviewer_service_tier(manifest)
         report = self.code_review_runner(
             cwd=worktree_path,
             evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
             codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
             patch_path=evidence.patch_path,
+            service_tier=reviewer_service_tier,
         )
         # review CLI currently does not return Codex thread/session ids.
         self._record_usage_attribution(
@@ -1062,7 +1068,7 @@ class RunOrchestrator:
             session_id=None,
             model=None,
             reasoning_effort=None,
-            service_tier=None,
+            service_tier=reviewer_service_tier,
             started_at=started_at,
             updated_at=self.store.now_iso(),
             worktree_path=worktree_path,
@@ -1072,6 +1078,11 @@ class RunOrchestrator:
         worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
         self._save(manifest)
         return report
+
+    def _effective_reviewer_service_tier(self, manifest: RunManifest) -> Optional[str]:
+        if self.config.reviewer_service_tier is not None:
+            return self.config.reviewer_service_tier
+        return manifest.reviewer_service_tier
 
     def _record_review_recovery_event(
         self,
@@ -1548,6 +1559,7 @@ def run_single_worker(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sandbox: str = DEFAULT_SANDBOX,
     approval_policy: str = DEFAULT_APPROVAL_POLICY,
+    reviewer_service_tier: Optional[str] = None,
     require_plan_approval: bool = False,
     approve_plan: bool = False,
 ) -> RunManifest:
@@ -1561,6 +1573,7 @@ def run_single_worker(
             sandbox=sandbox,
             approval_policy=approval_policy,
             max_attempts=max_attempts,
+            reviewer_service_tier=reviewer_service_tier,
             require_plan_approval=require_plan_approval,
             approve_plan=approve_plan,
         ),

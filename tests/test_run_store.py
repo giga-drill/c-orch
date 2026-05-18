@@ -30,6 +30,7 @@ class RunStoreTests(unittest.TestCase):
                 worker_reasoning_effort="medium",
                 planner_service_tier="fast",
                 worker_service_tier="flex",
+                reviewer_service_tier="flex",
             )
 
             manifest_path = root / "runs" / manifest.run_id / "manifest.json"
@@ -53,6 +54,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.workers[0].model, "worker-model")
             self.assertEqual(loaded.workers[0].reasoning_effort, "medium")
             self.assertEqual(loaded.workers[0].service_tier, "flex")
+            self.assertEqual(loaded.reviewer_service_tier, "flex")
             self.assertIsNone(loaded.task_id)
             self.assertIsNone(loaded.proposal_id)
             self.assertIsNone(loaded.workspace_id)
@@ -71,6 +73,28 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(raw["restart_paths"], [])
             self.assertEqual(raw["timing"]["version"], 1)
             self.assertEqual(raw["timing"]["segments"], [])
+
+    def test_load_manifest_without_reviewer_service_tier_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Compat test",
+                planner_model="planner-model",
+                worker_model="worker-model",
+            )
+            manifest_path = root / "runs" / manifest.run_id / "manifest.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data.pop("reviewer_service_tier", None)
+            manifest_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = store.load(manifest.run_id)
+
+            self.assertIsNone(loaded.reviewer_service_tier)
 
     def test_usage_attribution_jsonl_preserves_schema_and_null_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +190,7 @@ class RunStoreTests(unittest.TestCase):
                     started_at="2026-05-12T09:01:00+08:00",
                     worker_attempt=2,
                     workspace_path="/tmp/workspace",
+                    service_tier="flex",
                     completed_at="2026-05-12T09:02:00+08:00",
                     error="Timed out",
                     evidence_files=["runs/example/evidence/git-diff.patch"],
@@ -207,6 +232,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.review_attempts[0].status, "FAILED_RETRYABLE")
             self.assertEqual(loaded.review_attempts[0].worker_attempt, 2)
             self.assertEqual(loaded.review_attempts[0].workspace_path, "/tmp/workspace")
+            self.assertEqual(loaded.review_attempts[0].service_tier, "flex")
             self.assertEqual(loaded.review_attempts[0].error, "Timed out")
             self.assertEqual(loaded.workers[0].result["summary"], "done")
             self.assertIsNotNone(loaded.timing)

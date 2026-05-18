@@ -44,6 +44,7 @@ class RunConfig:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
     require_proposal_plan_review: bool = False
+    low_cost_mode: bool = False
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL_POLICY
 
@@ -149,6 +150,11 @@ def _run_config(data: Mapping[str, Any]) -> RunConfig:
         require_proposal_plan_review=_bool(
             data.get("require_proposal_plan_review"),
             "run.require_proposal_plan_review",
+            False,
+        ),
+        low_cost_mode=_bool(
+            data.get("low_cost_mode"),
+            "run.low_cost_mode",
             False,
         ),
         sandbox=_choice(data.get("sandbox"), "run.sandbox", SANDBOX_CHOICES, DEFAULT_SANDBOX),
