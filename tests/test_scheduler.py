@@ -130,6 +130,9 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].reason, "plan_review_outside_proposal_pool")
             self.assertEqual(loaded.tasks[0].active_run_id, fake.run_ids[0])
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
+            manifest = run_store.load(fake.run_ids[0])
+            self.assertEqual(manifest.task_id, "task-001")
+            self.assertEqual(manifest.workspace_id, str((root / "repo").resolve()))
             self.assertEqual(fake.retry_review_calls, 0)
 
     def test_active_retryable_review_failure_auto_retries_and_approves(self) -> None:

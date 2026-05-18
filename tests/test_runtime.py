@@ -363,6 +363,8 @@ class RuntimeTests(unittest.TestCase):
             assert loaded_manifest.plan is not None
             self.assertEqual(loaded_manifest.plan.approval_status, "approved")
             self.assertEqual(loaded_manifest.plan.approved_by, "c-orch:auto")
+            self.assertEqual(loaded_manifest.task_id, "task-1")
+            self.assertEqual(loaded_manifest.proposal_id, "task-1")
 
     def test_create_proposal_auto_queue_waits_for_queue_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -736,6 +738,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(fake.input_statuses, [RUN_PLAN_APPROVED])
             self.assertEqual(fake.run_calls, 1)
             self.assertEqual(fake.run_ids, [manifest.run_id])
+            self.assertEqual(loaded_manifest.task_id, proposal.proposal_id)
+            self.assertEqual(loaded_manifest.proposal_id, proposal.proposal_id)
 
             loaded_pool = proposal_store.load()
             self.assertEqual(loaded_pool.proposals, [])
@@ -1090,6 +1094,8 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(Path(proposal.cwd or "").resolve(), target_repo.resolve())
             self.assertEqual(Path(manifest.cwd).resolve(), target_repo.resolve())
+            self.assertEqual(manifest.proposal_id, proposal.proposal_id)
+            self.assertEqual(manifest.workspace_id, str(target_repo.resolve()))
             self.assertEqual([path.resolve() for path in worktree_repo_paths], [target_repo.resolve()])
 
     def test_create_proposal_rejects_invalid_task_cwd(self) -> None:

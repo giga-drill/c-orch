@@ -431,6 +431,11 @@ class FakeGitCommitter:
         )
 
 
+class UsageAttributionFailingRunStore(RunStore):
+    def append_usage_attribution(self, run_id: str, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+        raise RuntimeError("simulated usage attribution write failure")
+
+
 class RetryEndToEndDriver:
     def __init__(self) -> None:
         self.start_calls: List[Dict[str, Any]] = []
@@ -666,6 +671,9 @@ class OrchestratorTests(unittest.TestCase):
             manifest.workers[0].reasoning_effort = "medium"
             manifest.workers[0].service_tier = "flex"
             manifest.codex_binary_path = "/bin/custom-codex"
+            manifest.task_id = "task-001"
+            manifest.proposal_id = "proposal-001"
+            manifest.workspace_id = str(Path(manifest.cwd).resolve())
             driver = FakeDriver(
                 start_results=[
                     _session("planner-thread", _planner_plan()),
@@ -795,6 +803,40 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(events[8]["applied"])
             self.assertEqual(events[9]["commit_hash"], _git(Path(manifest.cwd), ["rev-parse", "HEAD"]).strip())
             self.assertEqual(events[10]["status"], "APPROVED")
+            attribution = store.load_usage_attribution(manifest.run_id)
+            role_phase_pairs = [(item.get("role"), item.get("phase")) for item in attribution]
+            self.assertIn(("planner", "plan"), role_phase_pairs)
+            self.assertIn(("worker", "implement"), role_phase_pairs)
+            self.assertIn(("planner", "review"), role_phase_pairs)
+            self.assertIn(("reviewer", "review"), role_phase_pairs)
+            planner_plan = next(
+                item for item in attribution if item.get("role") == "planner" and item.get("phase") == "plan"
+            )
+            worker_implement = next(
+                item for item in attribution if item.get("role") == "worker" and item.get("phase") == "implement"
+            )
+            reviewer_review = next(
+                item for item in attribution if item.get("role") == "reviewer" and item.get("phase") == "review"
+            )
+            self.assertEqual(planner_plan["task_id"], "task-001")
+            self.assertEqual(planner_plan["proposal_id"], "proposal-001")
+            self.assertEqual(planner_plan["workspace_id"], str(Path(manifest.cwd).resolve()))
+            self.assertTrue(planner_plan["thread_id"])
+            self.assertEqual(planner_plan["model"], "planner-model")
+            self.assertEqual(planner_plan["reasoning_effort"], "high")
+            self.assertEqual(planner_plan["service_tier"], "fast")
+            self.assertEqual(planner_plan["worktree_path"], str(worktree))
+            self.assertTrue(worker_implement["thread_id"])
+            self.assertEqual(worker_implement["model"], "worker-model")
+            self.assertEqual(worker_implement["reasoning_effort"], "medium")
+            self.assertEqual(worker_implement["service_tier"], "flex")
+            self.assertEqual(worker_implement["worktree_path"], str(worktree))
+            self.assertIsNone(reviewer_review["thread_id"])
+            self.assertIsNone(reviewer_review["session_id"])
+            self.assertIsNone(reviewer_review["model"])
+            self.assertIsNone(reviewer_review["reasoning_effort"])
+            self.assertIsNone(reviewer_review["service_tier"])
+            self.assertEqual(reviewer_review["worktree_path"], str(worktree))
             self.assertIsNotNone(result.timing)
             phase_names = [segment["phase"] for segment in result.timing.get("segments", [])]
             self.assertIn("planning", phase_names)
@@ -1122,6 +1164,15 @@ class OrchestratorTests(unittest.TestCase):
             self.assertGreaterEqual(len(result.workers[0].evidence_files), 14)
             self.assertEqual(len(applier.calls), 1)
             self.assertIn("git-commit-hash.txt", result.review.evidence_files[-1])
+            attribution = store.load_usage_attribution(manifest.run_id)
+            self.assertTrue(
+                any(
+                    item.get("role") == "worker"
+                    and item.get("phase") == "rework"
+                    and item.get("thread_id") == "worker-thread"
+                    for item in attribution
+                )
+            )
 
     def test_revision_requested_falls_back_to_new_worker_when_thread_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1159,6 +1210,15 @@ class OrchestratorTests(unittest.TestCase):
             event_types = [event["type"] for event in store.load_events(manifest.run_id)]
             self.assertIn("worker_rework_fallback_started", event_types)
             self.assertIn("worker_rework_fallback_thread_started", event_types)
+            attribution = store.load_usage_attribution(manifest.run_id)
+            self.assertTrue(
+                any(
+                    item.get("role") == "worker"
+                    and item.get("phase") == "rework"
+                    and item.get("thread_id") == "worker-fallback-thread"
+                    for item in attribution
+                )
+            )
 
     @unittest.skipIf(shutil.which("git") is None, "git is not available")
     def test_retry_flow_end_to_end_from_plan_gate_to_apply(self) -> None:
@@ -1904,6 +1964,15 @@ class OrchestratorTests(unittest.TestCase):
             event_types = [event["type"] for event in events]
             self.assertIn("planner_review_fallback_started", event_types)
             self.assertIn("planner_review_fallback_thread_started", event_types)
+            attribution = store.load_usage_attribution(manifest.run_id)
+            self.assertTrue(
+                any(
+                    item.get("role") == "planner"
+                    and item.get("phase") == "review"
+                    and item.get("thread_id") == "planner-fallback-thread"
+                    for item in attribution
+                )
+            )
 
     def test_retry_review_fallback_failure_preserves_work_done_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1941,9 +2010,37 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(result.review)
             self.assertGreaterEqual(len(result.review.evidence_files), 1)
 
+    def test_usage_attribution_write_failure_is_non_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = UsageAttributionFailingRunStore(root / "runs")
+            _stored, manifest, _worktree = _create_manifest_from_store(root, store)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            events = store.load_events(manifest.run_id)
+            self.assertIn("usage_attribution_failed", [event["type"] for event in events])
+
 
 def _create_manifest(root: Path):
     store = RunStore(root / "runs")
+    return _create_manifest_from_store(root, store)
+
+
+def _create_manifest_from_store(root: Path, store: RunStore):
     repo = root / "repo"
     repo.mkdir()
     (repo / "README.md").write_text("hello\n", encoding="utf-8")

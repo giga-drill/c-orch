@@ -596,6 +596,19 @@ class COrchRuntime:
                     reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
                     task_store.save(queue)
                     return
+                context_updated = False
+                if manifest.task_id != task.task_id:
+                    manifest.task_id = task.task_id
+                    context_updated = True
+                if manifest.workspace_id is None:
+                    try:
+                        task_workspace = self._scheduler_config.resolve_task_cwd(task.cwd)
+                        manifest.workspace_id = str(task_workspace)
+                    except Exception:
+                        manifest.workspace_id = manifest.cwd
+                    context_updated = True
+                if context_updated:
+                    run_store.save(manifest)
                 task_store.update_task(queue, task.task_id, status=TASK_RUNNING, error=None, reason="worker")
                 task_store.save(queue)
             else:
@@ -612,6 +625,8 @@ class COrchRuntime:
                         worker_reasoning_effort=self._scheduler_config.worker_reasoning_effort,
                         planner_service_tier=self._scheduler_config.planner_service_tier,
                         worker_service_tier=self._scheduler_config.worker_service_tier,
+                        task_id=task.task_id,
+                        workspace_id=str(task_cwd),
                     )
                     worker = manifest.workers[0]
                     worker.worktree_path = str(
@@ -829,6 +844,8 @@ class COrchRuntime:
                         user_task=proposal.prompt,
                         task_cwd=proposal_cwd,
                         worktree_factory=self._worktree_factory,
+                        proposal_id=proposal.proposal_id,
+                        workspace_id=str(proposal_cwd),
                     )
                 except Exception as exc:
                     proposal_store.update_proposal(
@@ -1558,6 +1575,8 @@ def create_proposal(
             user_task=proposal.prompt,
             task_cwd=proposal_cwd,
             worktree_factory=worktree_factory,
+            proposal_id=proposal.proposal_id,
+            workspace_id=str(proposal_cwd),
         )
         proposal_store.update_proposal(
             pool,
@@ -1727,6 +1746,8 @@ def proposal_action(
                     user_task=proposal.prompt,
                     task_cwd=proposal_cwd,
                     worktree_factory=worktree_factory,
+                    proposal_id=proposal.proposal_id,
+                    workspace_id=str(proposal_cwd),
                 )
             except Exception as exc:
                 proposal_store.update_proposal(
@@ -2001,6 +2022,9 @@ def _create_preflight_run(
     user_task: str,
     task_cwd: Path,
     worktree_factory: Optional[Callable[..., Path]],
+    task_id: Optional[str] = None,
+    proposal_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> RunManifest:
     worktrees_dir = config.resolve_worktrees_dir(task_cwd)
     manifest = run_store.create_run(
@@ -2013,6 +2037,9 @@ def _create_preflight_run(
         worker_reasoning_effort=config.worker_reasoning_effort,
         planner_service_tier=config.planner_service_tier,
         worker_service_tier=config.worker_service_tier,
+        task_id=task_id,
+        proposal_id=proposal_id,
+        workspace_id=workspace_id,
     )
     factory = worktree_factory or create_worker_worktree
     worker = manifest.workers[0]
@@ -2095,6 +2122,12 @@ def _approve_and_enqueue_proposal(
         run_id=manifest.run_id,
         fallback_cwd=manifest.cwd,
     )
+    manifest.task_id = task_id
+    if manifest.proposal_id is None:
+        manifest.proposal_id = proposal.proposal_id
+    if manifest.workspace_id is None:
+        manifest.workspace_id = manifest.cwd
+    run_store.save(manifest)
     proposal_store.remove_proposal(pool, proposal.proposal_id)
     proposal_store.save(pool)
     run_store.append_event(

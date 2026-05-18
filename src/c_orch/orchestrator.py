@@ -409,6 +409,7 @@ class RunOrchestrator:
         )
 
         try:
+            started_at = self.store.now_iso()
             result = self.driver.reply(
                 thread_id=manifest.planner.thread_id,
                 prompt=planner_revision_prompt(human_feedback=normalized_feedback),
@@ -417,6 +418,19 @@ class RunOrchestrator:
                 service_tier=manifest.planner.service_tier,
             )
             revised = PlannerPlan.parse(result.content)
+            self._record_usage_attribution(
+                manifest=manifest,
+                role="planner",
+                phase="plan",
+                thread_id=result.thread_id,
+                session_id=_session_id_from_result(result),
+                model=manifest.planner.model,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
+                started_at=started_at,
+                updated_at=self.store.now_iso(),
+                worktree_path=_single_worker(manifest).worktree_path,
+            )
         except Exception as exc:
             self._transition_status(
                 manifest,
@@ -476,6 +490,7 @@ class RunOrchestrator:
             "Planner started",
         )
 
+        started_at = self.store.now_iso()
         result = self.driver.start_session(
             role="planner",
             model=manifest.planner.model,
@@ -493,6 +508,19 @@ class RunOrchestrator:
         manifest.planner.thread_id = result.thread_id
 
         plan = PlannerPlan.parse(result.content)
+        self._record_usage_attribution(
+            manifest=manifest,
+            role="planner",
+            phase="plan",
+            thread_id=result.thread_id,
+            session_id=_session_id_from_result(result),
+            model=manifest.planner.model,
+            reasoning_effort=manifest.planner.reasoning_effort,
+            service_tier=manifest.planner.service_tier,
+            started_at=started_at,
+            updated_at=self.store.now_iso(),
+            worktree_path=worktree_path,
+        )
         manifest.acceptance_criteria = list(plan.acceptance_criteria)
         manifest.verification_commands = list(plan.verification_commands)
         manifest.plan = PlanRecord(
@@ -567,7 +595,9 @@ class RunOrchestrator:
             attempt=worker.attempt,
         )
 
+        usage_phase = "implement" if is_initial_attempt else "rework"
         if is_initial_attempt:
+            started_at = self.store.now_iso()
             result = self.driver.start_session(
                 role="worker",
                 model=worker.model,
@@ -584,6 +614,7 @@ class RunOrchestrator:
                 raise OrchestratorError("cannot continue worker without thread_id")
             previous_thread_id = worker.thread_id
             try:
+                started_at = self.store.now_iso()
                 result = self.driver.reply(
                     thread_id=previous_thread_id,
                     prompt=prompt,
@@ -609,6 +640,7 @@ class RunOrchestrator:
                     old_thread_id=previous_thread_id,
                     error=str(exc),
                 )
+                started_at = self.store.now_iso()
                 result = self.driver.start_session(
                     role="worker",
                     model=worker.model,
@@ -631,6 +663,21 @@ class RunOrchestrator:
                 )
 
         worker_result = WorkerResult.parse(result.content)
+        self._record_usage_attribution(
+            manifest=manifest,
+            role="worker",
+            phase=usage_phase,
+            thread_id=result.thread_id,
+            session_id=_session_id_from_result(result),
+            model=worker.model,
+            reasoning_effort=worker.reasoning_effort,
+            service_tier=worker.service_tier,
+            started_at=started_at,
+            updated_at=self.store.now_iso(),
+            worktree_path=worktree_path,
+            worker_id=worker.id,
+            attempt=worker.attempt,
+        )
         worker.result = dict(worker_result.raw)
         self._transition_status(
             manifest,
@@ -898,12 +945,26 @@ class RunOrchestrator:
         )
         previous_thread_id = manifest.planner.thread_id
         try:
+            started_at = self.store.now_iso()
             result = self.driver.reply(
                 thread_id=previous_thread_id,
                 prompt=primary_prompt,
                 model=manifest.planner.model,
                 reasoning_effort=manifest.planner.reasoning_effort,
                 service_tier=manifest.planner.service_tier,
+            )
+            self._record_usage_attribution(
+                manifest=manifest,
+                role="planner",
+                phase="review",
+                thread_id=result.thread_id,
+                session_id=_session_id_from_result(result),
+                model=manifest.planner.model,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
+                started_at=started_at,
+                updated_at=self.store.now_iso(),
+                worktree_path=review_workspace,
             )
             self._record_review_recovery_event(
                 manifest,
@@ -929,6 +990,7 @@ class RunOrchestrator:
                 old_thread_id=previous_thread_id,
                 error=str(exc),
             )
+            started_at = self.store.now_iso()
             fallback_result = self.driver.start_session(
                 role="planner",
                 model=manifest.planner.model,
@@ -951,6 +1013,19 @@ class RunOrchestrator:
                 reasoning_effort=manifest.planner.reasoning_effort,
                 service_tier=manifest.planner.service_tier,
             )
+            self._record_usage_attribution(
+                manifest=manifest,
+                role="planner",
+                phase="review",
+                thread_id=fallback_result.thread_id,
+                session_id=_session_id_from_result(fallback_result),
+                model=manifest.planner.model,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
+                started_at=started_at,
+                updated_at=self.store.now_iso(),
+                worktree_path=review_workspace,
+            )
             manifest.planner.thread_id = fallback_result.thread_id
             self._save(manifest)
             self._record_event(
@@ -971,11 +1046,28 @@ class RunOrchestrator:
         worktree_path: str,
         evidence: DiffEvidence,
     ) -> CodexReviewReport:
+        started_at = self.store.now_iso()
         report = self.code_review_runner(
             cwd=worktree_path,
             evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
             codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
             patch_path=evidence.patch_path,
+        )
+        # review CLI currently does not return Codex thread/session ids.
+        self._record_usage_attribution(
+            manifest=manifest,
+            role="reviewer",
+            phase="review",
+            thread_id=None,
+            session_id=None,
+            model=None,
+            reasoning_effort=None,
+            service_tier=None,
+            started_at=started_at,
+            updated_at=self.store.now_iso(),
+            worktree_path=worktree_path,
+            worker_id=worker.id,
+            attempt=worker.attempt,
         )
         worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
         self._save(manifest)
@@ -1123,6 +1215,59 @@ class RunOrchestrator:
         **fields: Any,
     ) -> None:
         self.store.append_event(manifest.run_id, event_type, message, **fields)
+
+    def _record_usage_attribution(
+        self,
+        *,
+        manifest: RunManifest,
+        role: str,
+        phase: str,
+        thread_id: Optional[str],
+        session_id: Optional[str],
+        model: Optional[str],
+        reasoning_effort: Optional[str],
+        service_tier: Optional[str],
+        started_at: Optional[str],
+        updated_at: Optional[str],
+        worktree_path: Optional[str],
+        worker_id: Optional[str] = None,
+        attempt: Optional[int] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        try:
+            self.store.append_usage_attribution(
+                manifest.run_id,
+                source="c-orch",
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                workspace_id=manifest.workspace_id,
+                cwd=manifest.cwd,
+                role=role,
+                phase=phase,
+                thread_id=thread_id,
+                session_id=session_id,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
+                started_at=started_at,
+                updated_at=updated_at,
+                worktree_path=worktree_path,
+                worker_id=worker_id,
+                attempt=attempt,
+                note=note,
+            )
+        except Exception as exc:
+            try:
+                self._record_event(
+                    manifest,
+                    "usage_attribution_failed",
+                    "Failed to write usage attribution sidecar.",
+                    role=role,
+                    phase=phase,
+                    error=str(exc),
+                )
+            except Exception:
+                pass
 
     def _record_recovery_decision(
         self,
@@ -1582,6 +1727,19 @@ def _changed_paths_from_patch(patch: str) -> List[str]:
             seen.add(candidate)
             paths.append(candidate)
     return paths
+
+
+def _session_id_from_result(result: SessionResult) -> Optional[str]:
+    structured = result.raw.get("structuredContent")
+    if isinstance(structured, dict):
+        session_id = structured.get("sessionId")
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id
+    for key in ("sessionId", "session_id"):
+        value = result.raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def _effective_codex_binary_path(manifest: RunManifest, driver: CodexDriver) -> Optional[str]:

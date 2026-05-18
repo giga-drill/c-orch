@@ -59,6 +59,22 @@ Automatic restart should eventually use a drain protocol: stop starting new
 lanes, let active lanes reach durable checkpoints or persist leases, restart
 the child runtime, reconcile persisted state, and then clear the restart gate.
 
+## Usage Attribution Sidecar
+
+c-orch writes a per-run `usage-attribution.jsonl` sidecar under
+`runs/<run_id>/` for business attribution only. It records run/task/proposal/
+workspace labels and Codex join keys (thread/session id when available) for
+Planner, Worker, and reviewer phases.
+
+c-orch does not collect full session usage facts or token accounting and does
+not compute usage totals. External collectors such as CodexUsage remain the
+source of truth for session/token facts; they should join with c-orch sidecar
+records primarily by thread/session id, with `cwd` and `worktree_path` only as
+fallback hints.
+
+Sidecar write failures are non-blocking: orchestration continues, and c-orch
+best-effort records a `usage_attribution_failed` event or warning.
+
 Worker worktrees isolate code changes, not package caches. Verification must run
 inside the worker worktree, but dependency setup should follow the target
 workspace's lockfile and package manager. For the bundled dashboard frontend,

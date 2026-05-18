@@ -268,6 +268,9 @@ class RunManifest:
     review_attempts: List[ReviewAttemptRecord]
     created_at: str
     updated_at: str
+    task_id: Optional[str] = None
+    proposal_id: Optional[str] = None
+    workspace_id: Optional[str] = None
     timing: Optional[Dict[str, Any]] = None
     codex_binary_path: Optional[str] = None
     requires_restart: bool = False
@@ -290,6 +293,9 @@ class RunManifest:
             "review_attempts": [attempt.to_dict() for attempt in self.review_attempts],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "task_id": self.task_id,
+            "proposal_id": self.proposal_id,
+            "workspace_id": self.workspace_id,
             "timing": dict(self.timing) if isinstance(self.timing, dict) else None,
             "codex_binary_path": self.codex_binary_path,
             "requires_restart": self.requires_restart,
@@ -328,6 +334,9 @@ class RunManifest:
             ] if isinstance(review_attempts, list) else [],
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            task_id=data.get("task_id"),
+            proposal_id=data.get("proposal_id"),
+            workspace_id=data.get("workspace_id"),
             timing=dict(data.get("timing")) if isinstance(data.get("timing"), dict) else None,
             codex_binary_path=data.get("codex_binary_path"),
             requires_restart=bool(data.get("requires_restart", False)),
@@ -352,6 +361,9 @@ class RunStore:
     def event_log_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "events.jsonl"
 
+    def usage_attribution_path(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "usage-attribution.jsonl"
+
     def create_run(
         self,
         cwd: Pathish,
@@ -363,6 +375,9 @@ class RunStore:
         worker_reasoning_effort: Optional[str] = None,
         planner_service_tier: Optional[str] = None,
         worker_service_tier: Optional[str] = None,
+        task_id: Optional[str] = None,
+        proposal_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> RunManifest:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = self._new_run_id()
@@ -395,6 +410,9 @@ class RunStore:
             review_attempts=[],
             created_at=now,
             updated_at=now,
+            task_id=task_id,
+            proposal_id=proposal_id,
+            workspace_id=workspace_id,
             timing={"version": 1, "segments": []},
             codex_binary_path=codex_path,
         )
@@ -454,6 +472,85 @@ class RunStore:
             file_obj.write(line)
             file_obj.write("\n")
         return json.loads(line)
+
+    def append_usage_attribution(
+        self,
+        run_id: str,
+        *,
+        source: str = "c-orch",
+        task_id: Optional[str] = None,
+        proposal_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        role: Optional[str] = None,
+        phase: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        service_tier: Optional[str] = None,
+        started_at: Optional[str] = None,
+        updated_at: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        attempt: Optional[int] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "schema_version": 1,
+            "source": source,
+            "run_id": run_id,
+            "task_id": task_id,
+            "proposal_id": proposal_id,
+            "workspace_id": workspace_id,
+            "cwd": cwd,
+            "role": role,
+            "phase": phase,
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "service_tier": service_tier,
+            "started_at": started_at,
+            "updated_at": updated_at,
+            "worktree_path": worktree_path,
+            "worker_id": worker_id,
+            "attempt": attempt,
+            "note": note,
+        }
+        line = json.dumps(
+            record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        path = self.usage_attribution_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file_obj:
+            file_obj.write(line)
+            file_obj.write("\n")
+        return json.loads(line)
+
+    def load_usage_attribution(self, run_id: str) -> List[Dict[str, Any]]:
+        path = self.usage_attribution_path(run_id)
+        if not path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as file_obj:
+                for raw_line in file_obj:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, dict):
+                        records.append(data)
+        except OSError:
+            return []
+        return records
 
     def load_events(self, run_id: str) -> List[Dict[str, Any]]:
         path = self.event_log_path(run_id)

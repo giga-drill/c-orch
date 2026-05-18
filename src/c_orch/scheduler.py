@@ -137,6 +137,16 @@ class TaskScheduler:
                 return queue
             if task.active_run_id:
                 active = self._load_active_run(task.active_run_id)
+                if active is not None:
+                    context_updated = False
+                    if active.task_id != task.task_id:
+                        active.task_id = task.task_id
+                        context_updated = True
+                    if active.workspace_id is None:
+                        active.workspace_id = active.cwd
+                        context_updated = True
+                    if context_updated:
+                        self.run_store.save(active)
                 if active is not None and active.status == RUN_PLAN_APPROVED:
                     self.task_store.update_task(
                         queue,
@@ -261,6 +271,8 @@ class TaskScheduler:
                     worker_reasoning_effort=self.config.worker_reasoning_effort,
                     planner_service_tier=self.config.planner_service_tier,
                     worker_service_tier=self.config.worker_service_tier,
+                    task_id=task.task_id,
+                    workspace_id=str(task_cwd),
                 )
                 worker = manifest.workers[0]
                 worker.worktree_path = str(

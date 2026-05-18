@@ -53,6 +53,9 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.workers[0].model, "worker-model")
             self.assertEqual(loaded.workers[0].reasoning_effort, "medium")
             self.assertEqual(loaded.workers[0].service_tier, "flex")
+            self.assertIsNone(loaded.task_id)
+            self.assertIsNone(loaded.proposal_id)
+            self.assertIsNone(loaded.workspace_id)
             self.assertIsNone(loaded.plan)
             self.assertFalse(loaded.requires_restart)
             self.assertIsNone(loaded.restart_reason)
@@ -68,6 +71,65 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(raw["restart_paths"], [])
             self.assertEqual(raw["timing"]["version"], 1)
             self.assertEqual(raw["timing"]["segments"], [])
+
+    def test_usage_attribution_jsonl_preserves_schema_and_null_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Attribution test",
+                planner_model="planner-model",
+                worker_model="worker-model",
+                task_id="task-001",
+                proposal_id="proposal-001",
+                workspace_id=str(root.resolve()),
+            )
+
+            record = store.append_usage_attribution(
+                manifest.run_id,
+                source="c-orch",
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                workspace_id=manifest.workspace_id,
+                cwd=manifest.cwd,
+                role="reviewer",
+                phase="review",
+                thread_id=None,
+                session_id=None,
+                model=None,
+                reasoning_effort=None,
+                service_tier=None,
+                started_at="2026-05-18T10:00:00+08:00",
+                updated_at="2026-05-18T10:00:01+08:00",
+                worktree_path=manifest.workers[0].worktree_path,
+                worker_id=None,
+                attempt=None,
+                note=None,
+            )
+
+            path = store.usage_attribution_path(manifest.run_id)
+            self.assertTrue(path.exists())
+            loaded = store.load_usage_attribution(manifest.run_id)
+            self.assertEqual(loaded, [record])
+            self.assertEqual(record["schema_version"], 1)
+            self.assertEqual(record["source"], "c-orch")
+            self.assertEqual(record["run_id"], manifest.run_id)
+            self.assertEqual(record["task_id"], "task-001")
+            self.assertEqual(record["proposal_id"], "proposal-001")
+            self.assertEqual(record["workspace_id"], str(root.resolve()))
+            self.assertEqual(record["cwd"], str(root.resolve()))
+            self.assertEqual(record["role"], "reviewer")
+            self.assertEqual(record["phase"], "review")
+            self.assertIsNone(record["thread_id"])
+            self.assertIsNone(record["session_id"])
+            self.assertIsNone(record["model"])
+            self.assertIsNone(record["reasoning_effort"])
+            self.assertIsNone(record["service_tier"])
+            self.assertIsNone(record["worktree_path"])
+            self.assertIsNone(record["worker_id"])
+            self.assertIsNone(record["attempt"])
+            self.assertIsNone(record["note"])
 
     def test_save_updates_review_and_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +289,9 @@ class RunStoreTests(unittest.TestCase):
             raw.pop("restart_reason", None)
             raw.pop("restart_paths", None)
             raw.pop("timing", None)
+            raw.pop("task_id", None)
+            raw.pop("proposal_id", None)
+            raw.pop("workspace_id", None)
             manifest_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             loaded = store.load(manifest.run_id)
@@ -234,6 +299,9 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNone(loaded.restart_reason)
             self.assertEqual(loaded.restart_paths, [])
             self.assertIsNone(loaded.timing)
+            self.assertIsNone(loaded.task_id)
+            self.assertIsNone(loaded.proposal_id)
+            self.assertIsNone(loaded.workspace_id)
 
 
 if __name__ == "__main__":
