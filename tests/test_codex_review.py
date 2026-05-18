@@ -4,12 +4,57 @@ import json
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from c_orch.codex_review import run_codex_uncommitted_review
 
 
 class CodexReviewTests(unittest.TestCase):
+    def test_review_defaults_to_macos_app_embedded_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_root = root / "Codex.app" / "Contents" / "Resources"
+            app_root.mkdir(parents=True)
+            app_codex = app_root / "codex"
+            app_codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"review\" ] && [ \"$2\" = \"--uncommitted\" ]; then\n"
+                "  printf 'app cli review ok\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 2\n",
+                encoding="utf-8",
+            )
+            app_codex.chmod(0o755)
+
+            with mock.patch("c_orch.codex_review.MACOS_CODEX_PATH", str(app_codex)):
+                report = run_codex_uncommitted_review(
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                )
+
+            self.assertEqual(report.status, "passed")
+            payload = json.loads(report.result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["command"][0], str(app_codex))
+            self.assertEqual(payload["command"][1:], ["review", "--uncommitted"])
+            self.assertEqual(payload["codex_binary_source"], "macos_app")
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn(f"$ {app_codex} review --uncommitted", output)
+            self.assertIn("codex_binary_source: macos_app", output)
+
+            with mock.patch("c_orch.codex_review.MACOS_CODEX_PATH", str(app_codex)):
+                explicit_report = run_codex_uncommitted_review(
+                    cwd=root,
+                    evidence_dir=root / "explicit-evidence",
+                    codex_binary_path=str(app_codex),
+                )
+
+            explicit_payload = json.loads(
+                explicit_report.result_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(explicit_payload["codex_binary_source"], "macos_app")
+
     def test_run_codex_uncommitted_review_records_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

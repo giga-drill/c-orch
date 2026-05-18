@@ -32,16 +32,21 @@ Add a mandatory code-quality step inside the Planner review phase. The Planner
 review phase should gather code-review evidence first, then make the single
 final business decision for that Worker attempt.
 
-The gate should use Codex's non-interactive review capability:
+The gate should use Codex's non-interactive review command. This is an
+explicit CLI gate, not a Codex Skill lookup. c-orch should invoke the
+Codex.app embedded CLI by default so review uses the same desktop-authenticated
+Codex binary and does not accidentally pick an older `codex` from `PATH`:
 
 ```bash
-codex review --uncommitted
-codex review --base <branch>
-codex review --commit <sha>
+/Applications/Codex.app/Contents/Resources/codex review --uncommitted
+/Applications/Codex.app/Contents/Resources/codex review --base <branch>
+/Applications/Codex.app/Contents/Resources/codex review --commit <sha>
 ```
 
 For c-orch's worker worktree flow, the first implementation should review the
-Worker's uncommitted diff inside the task worktree.
+Worker's captured patch inside an isolated review worktree. A user-provided
+`--codex-bin` / `C_ORCH_CODEX_BIN` override may still be used, but the default
+must be the App embedded CLI before falling back to `codex` on `PATH`.
 
 ### Proposed Flow
 
@@ -83,14 +88,14 @@ Each Worker attempt should persist:
   or no blocking findings
 - actionable findings included in Planner's next Worker prompt when Planner
   returns `revision_requested`
-- command, cwd, model/config if available
+- command, cwd, resolved Codex binary path/source, model/config if available
 - review output path in the run manifest evidence list
 
 Suggested evidence files:
 
 ```text
-evidence/attempt-N/codex-review-output.txt
-evidence/attempt-N/codex-review-result.json
+evidence/attempt-N/review-M/codex-review-output.txt
+evidence/attempt-N/review-M/codex-review-result.json
 ```
 
 The Planner review prompt should include the current code-review evidence every
@@ -114,6 +119,7 @@ orchestrator.py
 
 code_review.py
   run_codex_review(...)
+  resolve App embedded Codex review CLI
   parse/normalize review output
   persist review evidence
 ```

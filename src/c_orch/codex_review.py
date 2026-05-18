@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Union
+
+from .codex_discovery import MACOS_CODEX_PATH
 
 
 Pathish = Union[str, Path]
@@ -40,7 +43,7 @@ def run_codex_uncommitted_review(
     output_path = output_dir / "codex-review-output.txt"
     result_path = output_dir / "codex-review-result.json"
 
-    codex_bin = codex_binary_path or "codex"
+    codex_bin, codex_bin_source = _resolve_codex_review_binary(codex_binary_path)
     command_parts = [codex_bin, "review", "--uncommitted"]
     command_text = " ".join(command_parts)
 
@@ -128,6 +131,7 @@ def run_codex_uncommitted_review(
             review_workspace=review_workspace,
             review_workspace_mode=review_workspace_mode,
             prep_summary=prep_summary,
+            codex_bin_source=codex_bin_source,
         ),
         encoding="utf-8",
     )
@@ -140,6 +144,7 @@ def run_codex_uncommitted_review(
         "summary": summary,
         "output_path": str(output_path),
         "error": error,
+        "codex_binary_source": codex_bin_source,
         "review_workspace_mode": review_workspace_mode,
         "review_workspace": str(review_workspace),
         "prep_summary": prep_summary,
@@ -159,6 +164,32 @@ def run_codex_uncommitted_review(
     )
 
 
+def _resolve_codex_review_binary(codex_binary_path: Optional[str]) -> tuple[str, str]:
+    """Resolve the CLI used for the code-review gate.
+
+    c-orch intentionally prefers the Codex.app embedded CLI for review so the
+    gate uses the same Codex Pro-authenticated binary as the desktop app, not a
+    stale PATH install.
+    """
+    if codex_binary_path:
+        resolved = str(Path(codex_binary_path).expanduser())
+        if _same_codex_binary(resolved, MACOS_CODEX_PATH):
+            return resolved, "macos_app"
+        return resolved, "configured"
+
+    app_codex = Path(MACOS_CODEX_PATH).expanduser()
+    if app_codex.is_file() and os.access(app_codex, os.X_OK):
+        return str(app_codex), "macos_app"
+
+    return "codex", "path_fallback"
+
+
+def _same_codex_binary(left: str, right: str) -> bool:
+    return os.path.realpath(os.path.expanduser(left)) == os.path.realpath(
+        os.path.expanduser(right)
+    )
+
+
 def _format_output(
     *,
     command_text: str,
@@ -172,6 +203,7 @@ def _format_output(
     review_workspace: Path,
     review_workspace_mode: str,
     prep_summary: str,
+    codex_bin_source: str,
 ) -> str:
     returncode_text = "n/a" if returncode is None else str(returncode)
     lines = [
@@ -180,6 +212,7 @@ def _format_output(
         f"review_workspace_mode: {review_workspace_mode}",
         f"review_workspace: {review_workspace}",
         f"review_workspace_prep: {prep_summary}",
+        f"codex_binary_source: {codex_bin_source}",
         f"status: {status}",
         f"returncode: {returncode_text}",
         f"summary: {summary}",

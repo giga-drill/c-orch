@@ -194,6 +194,17 @@ Codex binary 解析顺序：
 3. PATH 中的 codex
 ```
 
+Code review gate 也使用这个解析结果，并且默认显式调用 Codex App 内置
+CLI：
+
+```text
+/Applications/Codex.app/Contents/Resources/codex review --uncommitted
+```
+
+这不是 Planner/Worker 动态发现的 `code-review` Skill。`c-orch` 控制器直接
+执行 review CLI，把命令、路径来源、输出和结构化结果写入 evidence，再交给
+Planner 做 `accepted` / `revision_requested` 的语义决策。
+
 解析后必须记录：
 
 ```text

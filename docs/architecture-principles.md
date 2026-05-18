@@ -72,6 +72,10 @@ Planner and Worker own semantic work:
   gate, inside the Planner review phase. These tools produce evidence for the
   Planner; they do not create an additional business outcome beyond
   `accepted` and `revision_requested`.
+- The code review gate calls the Codex App embedded CLI explicitly
+  (`/Applications/Codex.app/Contents/Resources/codex review --uncommitted`) by
+  default. It is not a named Skill that Planner/Worker discover dynamically.
+  A configured Codex binary may override this, and `PATH` is only a fallback.
 
 The task workspace is currently implemented as the single Worker's git
 worktree. Planner sessions must start in the same workspace before planning, and

@@ -175,6 +175,18 @@ worktrees_dir = ".c-orch/worktrees"
 This is intentional. On this machine, the Codex.app embedded CLI is newer and
 has `gpt-5.5`; the older Homebrew CLI does not.
 
+The Planner/Worker sessions and the code review gate use the same resolved
+Codex binary. For code review, c-orch explicitly invokes the Codex App embedded
+review CLI by default:
+
+```bash
+/Applications/Codex.app/Contents/Resources/codex review --uncommitted
+```
+
+This is a CLI quality gate, not a named Codex Skill lookup. A configured
+`--codex-bin` / `C_ORCH_CODEX_BIN` path can override it; `codex` on `PATH` is
+only the last fallback.
+
 ## Boundaries
 
 - The target repo must have a committed base ref before `c-orch run` can create
