@@ -802,10 +802,12 @@ class RunOrchestrator:
         attempt.completed_at = self.store.now_iso()
         attempt.decision = decision.decision
         attempt.reason = decision.reason
+        attempt.summary = _string_or_none(decision.raw.get("summary"))
         attempt.next_worker_prompt = decision.next_worker_prompt
         manifest.review = ReviewRecord(
             decision=decision.decision,
             reason=decision.reason,
+            summary=_string_or_none(decision.raw.get("summary")),
             next_worker_prompt=decision.next_worker_prompt,
             evidence_files=evidence_files,
         )
@@ -1593,3 +1595,10 @@ def _verification_has_failures(report: VerificationReport) -> bool:
     if not report.results:
         return False
     return any(result.status != "passed" for result in report.results)
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None

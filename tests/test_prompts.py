@@ -90,9 +90,14 @@ class PromptTests(unittest.TestCase):
             self.assertIn("every acceptance criterion", value)
             self.assertIn("regressions outside the edited lines", value)
             self.assertIn("reason` field must briefly state what you inspected", value)
+            self.assertIn("first sentence of `reason` must be", value)
+            self.assertIn("frontend-ready core summary", value)
+            self.assertIn("If `decision` is `accepted`, keep `reason` short", value)
             self.assertIn("Code review summary:", value)
             self.assertIn("codex review found 1 issue", value)
             self.assertIn("codex-review-output.txt", value)
+            self.assertIn('If decision is "revision_requested", the first sentence of reason', value)
+            self.assertIn('If decision is "accepted", keep reason concise', value)
 
 
 if __name__ == "__main__":

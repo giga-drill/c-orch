@@ -7,10 +7,65 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from c_orch.codex_review import run_codex_uncommitted_review
+from c_orch.codex_review import (
+    DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS,
+    run_codex_uncommitted_review,
+)
 
 
 class CodexReviewTests(unittest.TestCase):
+    def test_review_timeout_uses_900s_default_and_records_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch(
+                "c_orch.codex_review.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(
+                    cmd=["codex", "review", "--uncommitted"],
+                    timeout=DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS,
+                ),
+            ) as run_mock:
+                report = run_codex_uncommitted_review(
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                    codex_binary_path="codex",
+                )
+
+            self.assertEqual(report.status, "error")
+            self.assertIsNone(report.returncode)
+            self.assertIn("timed out after 900s", report.summary)
+            self.assertEqual(
+                run_mock.call_args.kwargs.get("timeout"),
+                DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS,
+            )
+            payload = json.loads(report.result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "error")
+            self.assertEqual(payload["error"], "timed out after 900s")
+            output = report.output_path.read_text(encoding="utf-8")
+            self.assertIn("timed out after 900s", output)
+
+    def test_review_timeout_honors_explicit_timeout_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch(
+                "c_orch.codex_review.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(
+                    cmd=["codex", "review", "--uncommitted"],
+                    timeout=7,
+                ),
+            ) as run_mock:
+                report = run_codex_uncommitted_review(
+                    cwd=root,
+                    evidence_dir=root / "evidence",
+                    codex_binary_path="codex",
+                    timeout_seconds=7,
+                )
+
+            self.assertEqual(report.status, "error")
+            self.assertIn("timed out after 7s", report.summary)
+            self.assertEqual(run_mock.call_args.kwargs.get("timeout"), 7)
+            payload = json.loads(report.result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["error"], "timed out after 7s")
+
     def test_review_defaults_to_macos_app_embedded_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

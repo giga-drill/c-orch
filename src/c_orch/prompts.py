@@ -39,7 +39,12 @@ PLANNER_REVIEW_INSTRUCTIONS = """Review depth requirements:
   missing error handling, concurrency/order issues, data compatibility, and
   mismatches with project architecture.
 - The `reason` field must briefly state what you inspected and why the work is
-  accepted or what concrete gap requires revision."""
+  accepted or what concrete gap requires revision.
+- If `decision` is `revision_requested`, the first sentence of `reason` must be
+  a concise, frontend-ready core summary of the rejection reason; subsequent
+  sentences can provide detailed fix guidance.
+- If `decision` is `accepted`, keep `reason` short and focused on acceptance
+  evidence."""
 
 
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:
@@ -161,6 +166,11 @@ Return exactly one JSON object with this shape:
 If decision is "accepted", next_worker_prompt must be null.
 If decision is "revision_requested", next_worker_prompt must be a concrete,
 self-contained instruction for the same Worker thread.
+If decision is "revision_requested", the first sentence of reason must be the
+frontend-ready core reason summary, and later sentences can list detailed
+revision guidance.
+If decision is "accepted", keep reason concise and focused on why acceptance
+criteria are satisfied.
 """
 
 
@@ -263,4 +273,9 @@ Return exactly one JSON object with this shape:
 If decision is "accepted", next_worker_prompt must be null.
 If decision is "revision_requested", next_worker_prompt must be a concrete,
 self-contained instruction for the same Worker thread.
+If decision is "revision_requested", the first sentence of reason must be the
+frontend-ready core reason summary, and later sentences can list detailed
+revision guidance.
+If decision is "accepted", keep reason concise and focused on why acceptance
+criteria are satisfied.
 """

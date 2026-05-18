@@ -13,6 +13,7 @@ from .codex_discovery import MACOS_CODEX_PATH
 
 
 Pathish = Union[str, Path]
+DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS = 900.0
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ def run_codex_uncommitted_review(
     evidence_dir: Pathish,
     codex_binary_path: Optional[str] = None,
     patch_path: Optional[Pathish] = None,
-    timeout_seconds: float = 300.0,
+    timeout_seconds: float = DEFAULT_CODEX_REVIEW_TIMEOUT_SECONDS,
 ) -> CodexReviewReport:
     worktree = Path(cwd).expanduser().resolve()
     output_dir = Path(evidence_dir).expanduser().resolve()

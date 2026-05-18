@@ -107,6 +107,7 @@ class WorkerRecord:
 class ReviewRecord:
     decision: Optional[str] = None
     reason: Optional[str] = None
+    summary: Optional[str] = None
     next_worker_prompt: Optional[str] = None
     evidence_files: List[str] = field(default_factory=list)
 
@@ -114,6 +115,7 @@ class ReviewRecord:
         return {
             "decision": self.decision,
             "reason": self.reason,
+            "summary": self.summary,
             "next_worker_prompt": self.next_worker_prompt,
             "evidence_files": list(self.evidence_files),
         }
@@ -123,6 +125,7 @@ class ReviewRecord:
         return cls(
             decision=data.get("decision"),
             reason=data.get("reason"),
+            summary=data.get("summary"),
             next_worker_prompt=data.get("next_worker_prompt"),
             evidence_files=_list_of_strings(data.get("evidence_files")),
         )
@@ -139,6 +142,7 @@ class ReviewAttemptRecord:
     completed_at: Optional[str] = None
     decision: Optional[str] = None
     reason: Optional[str] = None
+    summary: Optional[str] = None
     next_worker_prompt: Optional[str] = None
     error: Optional[str] = None
     evidence_files: List[str] = field(default_factory=list)
@@ -154,6 +158,7 @@ class ReviewAttemptRecord:
             "completed_at": self.completed_at,
             "decision": self.decision,
             "reason": self.reason,
+            "summary": self.summary,
             "next_worker_prompt": self.next_worker_prompt,
             "error": self.error,
             "evidence_files": list(self.evidence_files),
@@ -173,6 +178,7 @@ class ReviewAttemptRecord:
             completed_at=data.get("completed_at"),
             decision=data.get("decision"),
             reason=data.get("reason"),
+            summary=data.get("summary"),
             next_worker_prompt=data.get("next_worker_prompt"),
             error=data.get("error"),
             evidence_files=_list_of_strings(data.get("evidence_files")),

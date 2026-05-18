@@ -146,6 +146,40 @@ export interface AgentSummary {
   evidence_count?: number;
 }
 
+export interface ReviewAttemptSummary {
+  id: string | null;
+  status: string | null;
+  worker_attempt: number | null;
+  workspace_path: string | null;
+  evidence_count: number;
+  decision: string | null;
+  reason: string | null;
+  summary: string | null;
+  error: string | null;
+  completed_at: string | null;
+}
+
+export interface LatestRevisionRequestSummary {
+  review_attempt_id: string | null;
+  worker_attempt: number | null;
+  decision: "revision_requested";
+  summary: string | null;
+  reason: string | null;
+  completed_at: string | null;
+  source: "review_attempt" | "review";
+}
+
+export interface LatestReviewFailureSummary {
+  review_attempt_id: string | null;
+  worker_attempt: number | null;
+  status: string | null;
+  reason: string | null;
+  summary: string | null;
+  error: string | null;
+  completed_at: string | null;
+  source: "review_attempt" | "event";
+}
+
 export interface RunTimingSegment {
   id: string;
   sequence: number;
@@ -197,8 +231,12 @@ export interface RunListItem {
   updated_at: string;
   planner: AgentSummary;
   workers: AgentSummary[];
-  review: { decision: string | null; reason: string | null } | null;
+  review: { decision: string | null; reason: string | null; summary?: string | null } | null;
   review_attempt_count: number;
+  review_retry_count?: number | null;
+  last_review_attempt?: ReviewAttemptSummary | null;
+  latest_revision_request?: LatestRevisionRequestSummary | null;
+  latest_review_failure?: LatestReviewFailureSummary | null;
   last_event: RunEvent | null;
   last_error_event: RunEvent | null;
   can_retry_review: boolean;

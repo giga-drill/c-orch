@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from .codex_session_logs import CodexSessionLogStore
@@ -28,6 +29,7 @@ from .proposal_store import (
 )
 from .run_store import RunManifest, RunStore
 from .states import (
+    REVIEW_ATTEMPT_FAILED_RETRYABLE,
     RUN_PLAN_APPROVED,
     RUN_PLAN_REVIEW_REQUIRED,
     RUN_STATUS_ORDER,
@@ -39,6 +41,7 @@ from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
 
 Pathish = Union[str, Path]
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？]|[.?!](?=\s|$)|(?:\r?\n)")
 
 
 def _proposal_status_from_run(manifest: RunManifest) -> str:
@@ -401,6 +404,20 @@ def _summarize_manifest(
     status = str(manifest.get("status", "UNKNOWN"))
     event_list = events or []
     allowed_actions = _allowed_run_actions(manifest, event_list)
+    last_error_event = _last_error_event(event_list)
+    latest_revision_request = _latest_revision_request_summary(
+        review=review,
+        review_attempts=review_attempts,
+    )
+    latest_review_failure = _latest_review_failure_summary(
+        review_attempts=review_attempts,
+        last_error_event=last_error_event,
+    )
+    review_retry_count = sum(
+        1
+        for attempt in review_attempts
+        if attempt.get("status") == REVIEW_ATTEMPT_FAILED_RETRYABLE
+    )
     evidence_files = _unique_strings(
         _flatten(
             [
@@ -443,12 +460,16 @@ def _summarize_manifest(
         "review": {
             "decision": review.get("decision"),
             "reason": review.get("reason"),
+            "summary": review.get("summary"),
         } if review else None,
         "review_attempt_count": len(review_attempts),
+        "review_retry_count": review_retry_count,
         "last_review_attempt": _review_attempt_summary(review_attempts[-1]) if review_attempts else None,
+        "latest_revision_request": latest_revision_request,
+        "latest_review_failure": latest_review_failure,
         "can_retry_review": has_retryable_review_failure_dict(manifest),
         "last_event": _event_summary(event_list[-1]) if event_list else None,
-        "last_error_event": _last_error_event(event_list),
+        "last_error_event": last_error_event,
         "timing": timing,
         "plan": {
             "approval_status": plan.get("approval_status"),
@@ -717,6 +738,115 @@ def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:
         return "planner"
 
 
+def _latest_revision_request_summary(
+    *,
+    review: Dict[str, Any],
+    review_attempts: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    for attempt in reversed(review_attempts):
+        if attempt.get("decision") != "revision_requested":
+            continue
+        summary = _review_summary_text(attempt)
+        return {
+            "review_attempt_id": attempt.get("id"),
+            "worker_attempt": attempt.get("worker_attempt"),
+            "decision": "revision_requested",
+            "summary": summary,
+            "reason": attempt.get("reason"),
+            "completed_at": attempt.get("completed_at"),
+            "source": "review_attempt",
+        }
+    if review.get("decision") != "revision_requested":
+        return None
+    return {
+        "review_attempt_id": None,
+        "worker_attempt": None,
+        "decision": "revision_requested",
+        "summary": _review_summary_text(review),
+        "reason": review.get("reason"),
+        "completed_at": None,
+        "source": "review",
+    }
+
+
+def _latest_review_failure_summary(
+    *,
+    review_attempts: List[Dict[str, Any]],
+    last_error_event: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    for attempt in reversed(review_attempts):
+        if attempt.get("status") != REVIEW_ATTEMPT_FAILED_RETRYABLE:
+            continue
+        return {
+            "review_attempt_id": attempt.get("id"),
+            "worker_attempt": attempt.get("worker_attempt"),
+            "status": attempt.get("status"),
+            "reason": attempt.get("reason"),
+            "summary": _first_non_empty(
+                _string_or_none(attempt.get("summary")),
+                _first_sentence(_string_or_none(attempt.get("error"))),
+                _first_sentence(_string_or_none(attempt.get("reason"))),
+            ),
+            "error": attempt.get("error"),
+            "completed_at": attempt.get("completed_at"),
+            "source": "review_attempt",
+        }
+    if not isinstance(last_error_event, dict):
+        return None
+    event_type = str(last_error_event.get("type") or "")
+    if event_type not in {"code_review_failed", "planner_review_failed"}:
+        return None
+    summary = _first_non_empty(
+        _string_or_none(last_error_event.get("summary")),
+        _first_sentence(_string_or_none(last_error_event.get("message"))),
+        _first_sentence(_string_or_none(last_error_event.get("error"))),
+        _first_sentence(_string_or_none(last_error_event.get("reason"))),
+    )
+    return {
+        "review_attempt_id": None,
+        "worker_attempt": last_error_event.get("attempt"),
+        "status": REVIEW_ATTEMPT_FAILED_RETRYABLE,
+        "reason": last_error_event.get("reason"),
+        "summary": summary,
+        "error": last_error_event.get("error"),
+        "completed_at": last_error_event.get("timestamp"),
+        "source": "event",
+    }
+
+
+def _review_summary_text(payload: Dict[str, Any]) -> Optional[str]:
+    summary = _string_or_none(payload.get("summary"))
+    if summary:
+        return summary
+    return _first_sentence(_string_or_none(payload.get("reason")))
+
+
+def _first_sentence(value: Optional[str]) -> Optional[str]:
+    text = _string_or_none(value)
+    if not text:
+        return None
+    match = _SENTENCE_BOUNDARY_PATTERN.search(text)
+    if not match:
+        return text
+    sentence = text[: match.end()].strip()
+    return sentence or text
+
+
+def _first_non_empty(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        text = _string_or_none(value)
+        if text:
+            return text
+    return None
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
 def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": attempt.get("id"),
@@ -726,6 +856,7 @@ def _review_attempt_summary(attempt: Dict[str, Any]) -> Dict[str, Any]:
         "evidence_count": len(_list_value(attempt.get("evidence_files"))),
         "decision": attempt.get("decision"),
         "reason": attempt.get("reason"),
+        "summary": attempt.get("summary"),
         "error": attempt.get("error"),
         "completed_at": attempt.get("completed_at"),
     }

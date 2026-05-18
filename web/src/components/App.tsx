@@ -123,6 +123,14 @@ function timingSourceLabel(source?: string | null): string {
   return displayValue(source);
 }
 
+function reviewStageLabel(run: RunListItem): string {
+  if (run.waiting_for === "planner_review_retry") return "Review 基础设施失败，可重试";
+  if (run.waiting_for === "planner_review") return "Planner 正在复核";
+  if (run.waiting_for === "worker_rework") return "Worker 返工中";
+  if (run.waiting_for === "worker") return "Worker 工作中";
+  return "-";
+}
+
 function segmentsByPhase(segments: RunTimingSegment[]): Record<string, RunTimingSegment[]> {
   return segments.reduce<Record<string, RunTimingSegment[]>>((groups, segment) => {
     groups[segment.phase] = [...(groups[segment.phase] ?? []), segment];
@@ -1099,6 +1107,14 @@ function RunDetail({
 }
 
 function RunSummaryStrip({ run }: { run: RunListItem }) {
+  const latestRevisionSummary =
+    run.latest_revision_request?.summary ?? run.latest_revision_request?.reason;
+  const isActiveReviewInfraFailure =
+    run.waiting_for === "planner_review_retry" ||
+    run.can_retry_review ||
+    run.allowed_actions.includes("retry-review");
+  const showReviewFailure = Boolean(run.latest_review_failure) && isActiveReviewInfraFailure;
+  const reviewRetryCount = run.review_retry_count ?? 0;
   return (
     <section className="runSummaryStrip">
       <div className="summaryCell">
@@ -1123,16 +1139,41 @@ function RunSummaryStrip({ run }: { run: RunListItem }) {
       </div>
       <div className="summaryCell">
         <span className="label">Worker</span>
-        <strong>{formatStatus(run.workers[0]?.status)}</strong>
+        <strong>{formatStatus(run.workers[0]?.status ?? "PENDING")}</strong>
       </div>
       <div className="summaryCell">
-        <span className="label">复核次数</span>
-        <strong>{displayValue(run.review_attempt_count)}</strong>
+        <span className="label">复核/重试次数</span>
+        <strong>
+          {run.review_attempt_count} / {reviewRetryCount}
+        </strong>
       </div>
       <div className="summaryCell">
-        <span className="label">证据数量</span>
-        <strong>{displayValue(run.evidence_count)}</strong>
+        <span className="label">复核状态</span>
+        <strong>{reviewStageLabel(run)}</strong>
       </div>
+      {latestRevisionSummary ? (
+        <div className="summaryNote revisionNote">
+          <span className="label">最近一次 Planner 打回原因</span>
+          <strong>{latestRevisionSummary}</strong>
+          {run.latest_revision_request?.review_attempt_id ? (
+            <span className="meta mono">attempt: {run.latest_revision_request.review_attempt_id}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {showReviewFailure ? (
+        <div className="summaryNote failureNote">
+          <span className="label">Review 基础设施失败</span>
+          <strong>
+            {run.latest_review_failure?.summary ??
+              run.latest_review_failure?.error ??
+              run.latest_review_failure?.reason ??
+              "review infra failure"}
+          </strong>
+          {run.latest_review_failure?.review_attempt_id ? (
+            <span className="meta mono">attempt: {run.latest_review_failure.review_attempt_id}</span>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1234,13 +1275,15 @@ function AgentCard({ title, agent, waitingFor }: { title: string; agent: AgentSu
       <h2>{title}</h2>
       <KeyValue label="status" value={agent.status} />
       <KeyValue label="model" value={agent.model} />
-      <KeyValue label="thread_id" value={agent.thread_id} />
       <KeyValue label="reasoning_effort" value={agent.reasoning_effort} />
       <KeyValue label="service_tier" value={agent.service_tier} />
-      <KeyValue label="attempt" value={agent.attempt} />
-      <KeyValue label="worktree_path" value={agent.worktree_path} />
-      <KeyValue label="evidence_count" value={agent.evidence_count} />
-      <KeyValue label="waiting_for" value={waitingFor} />
+      <Collapsible title="技术详情">
+        <KeyValue label="thread_id" value={agent.thread_id} />
+        <KeyValue label="attempt" value={agent.attempt} />
+        <KeyValue label="worktree_path" value={agent.worktree_path} />
+        <KeyValue label="evidence_count" value={agent.evidence_count} />
+        <KeyValue label="waiting_for" value={waitingFor} />
+      </Collapsible>
     </section>
   );
 }

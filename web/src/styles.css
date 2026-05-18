@@ -375,6 +375,37 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.summaryNote {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid #e4eae0;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px 10px;
+}
+
+.summaryNote strong {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.summaryNote .meta {
+  overflow-wrap: anywhere;
+}
+
+.revisionNote {
+  border-color: #afcfe0;
+  background: #f4faff;
+}
+
+.failureNote {
+  border-color: #efb5b5;
+  background: #fff4f4;
+  color: var(--red);
+}
+
 .actionBar {
   display: flex;
   flex-wrap: wrap;
@@ -542,6 +573,10 @@ input {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 10px;
+}
+
+.agentCard details {
+  margin-top: 8px;
 }
 
 .kv {
