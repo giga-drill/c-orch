@@ -9,6 +9,7 @@ from pathlib import Path
 from c_orch import dashboard_payloads
 from c_orch.proposal_store import ProposalStore
 from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.runner_leases import RunnerLeaseStore
 from c_orch.task_store import TaskStore
 
 
@@ -509,16 +510,28 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                 started_at="2026-05-19T10:00:00+00:00",
                 updated_at="2026-05-19T10:01:00+00:00",
             )
+            RunnerLeaseStore(run_store.runner_leases_path(manifest.run_id)).create(
+                runtime_generation="runtime-1",
+                run_id=manifest.run_id,
+                phase="planner_plan",
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                process_hint="pid:123",
+                pid=123,
+                checkpoint={"run_status": "PLANNING"},
+            )
 
             manifest_path = root / "runs" / manifest.run_id / "manifest.json"
             events_path = root / "runs" / manifest.run_id / "events.jsonl"
             usage_path = root / "runs" / manifest.run_id / "usage-attribution.jsonl"
+            leases_path = root / "runs" / manifest.run_id / "runner-leases.json"
             before = {
                 "queue": (root / "queue.json").stat().st_mtime_ns,
                 "proposals": (root / "proposals.json").stat().st_mtime_ns,
                 "manifest": manifest_path.stat().st_mtime_ns,
                 "events": events_path.stat().st_mtime_ns,
                 "usage": usage_path.stat().st_mtime_ns,
+                "leases": leases_path.stat().st_mtime_ns,
             }
 
             payload = dashboard_payloads.build_state_payload(
@@ -537,8 +550,70 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                 "manifest": manifest_path.stat().st_mtime_ns,
                 "events": events_path.stat().st_mtime_ns,
                 "usage": usage_path.stat().st_mtime_ns,
+                "leases": leases_path.stat().st_mtime_ns,
             }
             self.assertEqual(before, after)
+
+    def test_state_and_run_payload_include_runner_lease_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            now = datetime.now(timezone.utc)
+            active_manifest = store.create_run(
+                cwd=root,
+                user_task="Task A",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            stale_manifest = store.create_run(
+                cwd=root,
+                user_task="Task B",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            active_leases = RunnerLeaseStore(store.runner_leases_path(active_manifest.run_id))
+            active_leases.create(
+                runtime_generation="runtime-1",
+                run_id=active_manifest.run_id,
+                phase="worker_implement",
+                task_id=active_manifest.task_id,
+                proposal_id=active_manifest.proposal_id,
+                process_hint="pid:123",
+                pid=123,
+                checkpoint={"run_status": "WORKING"},
+                now=now,
+                lease_ttl_seconds=3600,
+            )
+            stale_leases = RunnerLeaseStore(store.runner_leases_path(stale_manifest.run_id))
+            stale_leases.create(
+                runtime_generation="runtime-1",
+                run_id=stale_manifest.run_id,
+                phase="planner_review",
+                task_id=stale_manifest.task_id,
+                proposal_id=stale_manifest.proposal_id,
+                process_hint="pid:123",
+                pid=123,
+                checkpoint={"run_status": "REVIEWING"},
+                now=now - timedelta(hours=2),
+                lease_ttl_seconds=60,
+            )
+
+            state_payload = dashboard_payloads.build_state_payload(
+                runs_dir=root / "runs",
+                queue_path=None,
+                proposals_path=None,
+                runtime_generation="runtime-1",
+            )
+            runtime_leases = state_payload["runtime"]["runner_leases"]
+            self.assertEqual(runtime_leases["summary"]["total"], 2)
+            self.assertEqual(runtime_leases["summary"]["active"], 1)
+            self.assertEqual(runtime_leases["summary"]["stale"], 1)
+
+            run_payload = dashboard_payloads.build_run_payload(root / "runs", stale_manifest.run_id)
+            assert run_payload is not None
+            self.assertEqual(run_payload["runner_leases"]["summary"]["stale"], 1)
+            self.assertEqual(run_payload["runner_leases"]["leases"][0]["phase"], "planner_review")
+            self.assertIn("lease_expires_at", run_payload["runner_leases"]["leases"][0])
 
     def test_run_payload_service_tiers_uses_manifest_reviewer_tier_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

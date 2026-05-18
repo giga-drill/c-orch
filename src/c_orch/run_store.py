@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .runner_leases import RunnerLeaseStore
+
 
 Pathish = Union[str, Path]
 
@@ -401,6 +403,15 @@ class RunStore:
 
     def usage_attribution_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "usage-attribution.jsonl"
+
+    def runner_leases_path(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "runner-leases.json"
+
+    def runner_lease_store(self, run_id: str) -> RunnerLeaseStore:
+        return RunnerLeaseStore(self.runner_leases_path(run_id))
+
+    def load_runner_leases(self, run_id: str) -> Dict[str, Any]:
+        return self.runner_lease_store(run_id).read().to_dict()
 
     def create_run(
         self,

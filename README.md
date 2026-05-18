@@ -65,6 +65,27 @@ Each proposal/task can also bind its own target repository `cwd`. If omitted,
 the runtime falls back to the current `--cwd`. This allows one queue file to
 hold tasks for different repos while preserving per-task run/worktree binding.
 
+## Runner Lease Sidecar (Phase 1)
+
+c-orch now persists runner lease metadata per run in:
+
+```text
+runs/<run_id>/runner-leases.json
+```
+
+Phase-1 schema includes:
+
+- `runner_id`, `runtime_generation`, `pid` / `process_hint`
+- `run_id`, `task_id`, `proposal_id`
+- `phase`, `started_at`, `heartbeat_at`, `lease_expires_at`
+- `status` (`active`, `completed`, `failed`, `expired`)
+- `checkpoint` (phase boundary metadata)
+
+`stale` is derived on read when `status=active` and `lease_expires_at < now`.
+`GET` endpoints do not write lease files. Phase-1 scope is current-process
+phase checkpoints only; external runner subprocess ownership and startup
+reconciliation are still follow-up work.
+
 ## Quick Start
 
 Run from this repo without installing:

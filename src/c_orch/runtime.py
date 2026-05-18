@@ -239,6 +239,8 @@ class COrchRuntime:
                     if self._scheduler_config is not None
                     else None
                 ),
+                runtime_generation=self._runtime_generation,
+                process_hint=f"runtime:{os.getpid()}",
             )
             if self.queue_path is not None:
                 reconcile_queue_file(queue_path=self.queue_path, runs_dir=self.runs_dir)
@@ -316,6 +318,8 @@ class COrchRuntime:
                 config=self._scheduler_config,
                 worktree_factory=self._worktree_factory,
                 driver_factory=self._driver_context,
+                runtime_generation=self._runtime_generation,
+                process_hint=f"runtime:{os.getpid()}",
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
@@ -923,6 +927,8 @@ class COrchRuntime:
                 require_plan_approval=True,
                 approve_plan=True,
                 controller_repo_path=str(self._scheduler_config.cwd),
+                runtime_generation=self._runtime_generation,
+                process_hint=f"runtime:{os.getpid()}",
             ),
         )
 
@@ -1299,6 +1305,8 @@ class COrchRuntime:
                 require_plan_approval=True,
                 approve_plan=False,
                 controller_repo_path=str(self._scheduler_config.cwd),
+                runtime_generation=self._runtime_generation,
+                process_hint=f"runtime:{os.getpid()}",
             ),
         )
 
@@ -1464,6 +1472,8 @@ def run_action(
     *,
     driver_factory: Optional[DriverFactory] = None,
     reviewer_service_tier: Optional[str] = None,
+    runtime_generation: Optional[str] = None,
+    process_hint: Optional[str] = None,
 ) -> RunActionResponse:
     runs_path = Path(runs_dir).expanduser().resolve()
     if not _valid_run_id(run_id):
@@ -1505,6 +1515,8 @@ def run_action(
                 driver=_UnusedCodexDriver(),
                 config=OrchestratorConfig(
                     require_plan_approval=True,
+                    runtime_generation=runtime_generation,
+                    process_hint=process_hint,
                 ),
             )
             manifest = orchestrator.retry_verification(manifest)
@@ -1524,6 +1536,8 @@ def run_action(
                         require_plan_approval=True,
                         reviewer_service_tier=reviewer_service_tier,
                         approve_plan=action == "approve-plan",
+                        runtime_generation=runtime_generation,
+                        process_hint=process_hint,
                     ),
                 )
                 if action == "revise-plan":
@@ -1887,6 +1901,8 @@ def proposal_action(
     config: Optional[SchedulerConfig],
     worktree_factory: Optional[Callable[..., Path]],
     driver_factory: DriverFactory,
+    runtime_generation: Optional[str] = None,
+    process_hint: Optional[str] = None,
 ) -> RunActionResponse:
     if action not in {"approve-plan", "revise-plan", "retry-plan"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
@@ -2108,7 +2124,11 @@ def proposal_action(
                 orchestrator = RunOrchestrator(
                     store=run_store,
                     driver=driver,
-                    config=OrchestratorConfig(require_plan_approval=True),
+                    config=OrchestratorConfig(
+                        require_plan_approval=True,
+                        runtime_generation=runtime_generation,
+                        process_hint=process_hint,
+                    ),
                 )
                 manifest = orchestrator.revise_plan(manifest, feedback.strip())
         except Exception as exc:

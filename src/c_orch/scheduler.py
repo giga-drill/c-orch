@@ -77,6 +77,8 @@ class SchedulerConfig:
     max_tasks: Optional[int] = None
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
     require_proposal_plan_review: bool = False
+    runtime_generation: Optional[str] = None
+    process_hint: Optional[str] = None
 
     def resolve_task_cwd(self, task_cwd: Optional[str]) -> Path:
         if task_cwd is None or not task_cwd.strip():
@@ -413,6 +415,8 @@ class TaskScheduler:
                 require_plan_approval=True,
                 approve_plan=True,
                 controller_repo_path=str(self.config.cwd),
+                runtime_generation=self.config.runtime_generation,
+                process_hint=self.config.process_hint,
             ),
         )
 

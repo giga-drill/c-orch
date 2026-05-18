@@ -567,9 +567,11 @@ larger lifecycle architecture changes.
 8. Proposal decomposition and commit-size control.
    Let Planner suggest commit-sized subtasks for large intents, then later teach
    c-orch to enqueue those subtasks with explicit dependencies.
-9. Runner lease metadata.
-   Define and persist active phase ownership, runner id, heartbeat, lease
-   expiry, and safe checkpoint data.
+9. Runner lease metadata. (Phase 1 delivered)
+   c-orch now persists phase lease/checkpoint metadata in
+   `runs/<run_id>/runner-leases.json` and exposes active/stale summaries via
+   state/run payloads. Runtime-startup reconciliation and external subprocess
+   ownership are still follow-up items.
 10. Supervised runner subprocesses.
     Move long-running Planner/Worker/reviewer calls out of the dashboard
     runtime once leases and checkpoints are durable.

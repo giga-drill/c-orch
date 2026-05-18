@@ -226,6 +226,43 @@ export interface RetryStateSummary {
   ready?: boolean | null;
 }
 
+export interface RunnerLeaseSummary {
+  total: number;
+  active: number;
+  stale: number;
+  completed: number;
+  failed: number;
+  expired: number;
+  has_active?: boolean;
+  has_stale?: boolean;
+}
+
+export interface RunnerLeaseRecord {
+  runner_id: string;
+  runtime_generation: string;
+  process_hint: string | null;
+  pid: number | null;
+  run_id: string;
+  task_id: string | null;
+  proposal_id: string | null;
+  phase: string;
+  started_at: string;
+  heartbeat_at: string;
+  lease_expires_at: string;
+  status: string;
+  effective_status?: string;
+  completed_at?: string | null;
+  error?: string | null;
+  checkpoint: Record<string, unknown>;
+}
+
+export interface RunnerLeasesPayload {
+  schema_version: number;
+  updated_at: string | null;
+  summary: RunnerLeaseSummary;
+  leases: RunnerLeaseRecord[];
+}
+
 export interface RunTimingSegment {
   id: string;
   sequence: number;
@@ -289,6 +326,7 @@ export interface RunListItem {
   last_error_event: RunEvent | null;
   can_retry_review: boolean;
   timing: RunTimingSummary;
+  runner_lease_summary?: RunnerLeaseSummary | null;
   plan: { approval_status?: string | null; summary?: string | null } | null;
   plan_revision_count: number;
   latest_plan_revision_id: string | null;
@@ -423,6 +461,7 @@ export interface ActivitySummaryPayload {
 export interface RunPayload {
   run: RunListItem;
   manifest: ManifestRecord;
+  runner_leases?: RunnerLeasesPayload | null;
   evidence_files: EvidenceFile[];
   events: RunEvent[];
   activity_summary?: ActivitySummaryPayload | null;
@@ -440,6 +479,22 @@ export interface RuntimeState {
   proposal_lane_active_count?: number;
   last_dispatch_error: string | null;
   last_proposal_dispatch_error?: string | null;
+  runner_leases?: {
+    summary: {
+      runs_with_leases: number;
+      total: number;
+      active: number;
+      stale: number;
+      completed: number;
+      failed: number;
+      expired: number;
+    };
+    runs: Array<{
+      run_id: string;
+      updated_at: string | null;
+      summary: RunnerLeaseSummary;
+    }>;
+  } | null;
   restart_gate?: {
     active: boolean;
     waiting_for: string;

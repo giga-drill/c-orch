@@ -16,6 +16,7 @@ from c_orch.drivers import SessionResult
 from c_orch.failure_policy import has_retryable_review_failure
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
+from c_orch.runner_leases import LEASE_STATUS_COMPLETED, LEASE_STATUS_FAILED
 from c_orch.verification import CommandVerification, VerificationReport
 from c_orch.worktrees import ApplyReport, DiffEvidence, GitCommitReport, create_worker_worktree
 
@@ -2355,6 +2356,110 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(result.status, "APPROVED")
             events = store.load_events(manifest.run_id)
             self.assertIn("usage_attribution_failed", [event["type"] for event in events])
+
+    def test_run_writes_runner_leases_for_key_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                diff_applier=FakeDiffApplier(),
+                verification_runner=FakeVerificationRunner(),
+                code_review_runner=FakeCodeReviewRunner(),
+                config=OrchestratorConfig(runtime_generation="runtime-test"),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            leases = store.load_runner_leases(manifest.run_id)
+            phases = {item["phase"] for item in leases["leases"]}
+            self.assertTrue(
+                {
+                    "planner_plan",
+                    "worker_implement",
+                    "verification",
+                    "code_review",
+                    "planner_review",
+                    "apply_terminalization",
+                    "commit_terminalization",
+                }.issubset(phases)
+            )
+            status_by_phase = {item["phase"]: item["status"] for item in leases["leases"]}
+            self.assertEqual(status_by_phase["planner_plan"], LEASE_STATUS_COMPLETED)
+            self.assertEqual(status_by_phase["worker_implement"], LEASE_STATUS_COMPLETED)
+            self.assertEqual(status_by_phase["planner_review"], LEASE_STATUS_COMPLETED)
+            self.assertEqual(status_by_phase["commit_terminalization"], LEASE_STATUS_COMPLETED)
+
+    def test_failed_verification_marks_runner_lease_failed(self) -> None:
+        class RaisingVerificationRunner:
+            def __call__(self, commands: List[str], *, cwd: str, evidence_dir: Path) -> VerificationReport:
+                raise RuntimeError("verification exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[],
+            )
+            with self.assertRaisesRegex(RuntimeError, "verification exploded"):
+                RunOrchestrator(
+                    store=store,
+                    driver=driver,
+                    evidence_collector=FakeEvidenceCollector(),
+                    diff_applier=FakeDiffApplier(),
+                    verification_runner=RaisingVerificationRunner(),
+                    code_review_runner=FakeCodeReviewRunner(),
+                    config=OrchestratorConfig(runtime_generation="runtime-test"),
+                ).run(manifest)
+
+            saved = store.load(manifest.run_id)
+            self.assertEqual(saved.status, "FAILED")
+            leases = store.load_runner_leases(manifest.run_id)
+            verification_rows = [item for item in leases["leases"] if item["phase"] == "verification"]
+            self.assertTrue(verification_rows)
+            self.assertEqual(verification_rows[0]["status"], LEASE_STATUS_FAILED)
+
+    def test_revise_plan_writes_planner_revise_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            initial_driver = FakeDriver(
+                start_results=[_session("planner-thread", _planner_plan())],
+                reply_results=[],
+            )
+            paused = RunOrchestrator(
+                store=store,
+                driver=initial_driver,
+                config=OrchestratorConfig(require_plan_approval=True, runtime_generation="runtime-test"),
+            ).run(manifest)
+            self.assertEqual(paused.status, "PLAN_REVIEW_REQUIRED")
+
+            revise_driver = FakeDriver(
+                start_results=[],
+                reply_results=[_session("planner-thread", _planner_plan_revised())],
+            )
+            revised = RunOrchestrator(
+                store=store,
+                driver=revise_driver,
+                config=OrchestratorConfig(require_plan_approval=True, runtime_generation="runtime-test"),
+            ).revise_plan(store.load(manifest.run_id), "Please tighten failure handling")
+            self.assertEqual(revised.status, "PLAN_REVIEW_REQUIRED")
+            leases = store.load_runner_leases(manifest.run_id)
+            revise_rows = [item for item in leases["leases"] if item["phase"] == "planner_revise"]
+            self.assertTrue(revise_rows)
+            self.assertEqual(revise_rows[0]["status"], LEASE_STATUS_COMPLETED)
 
 
 def _create_manifest(root: Path):

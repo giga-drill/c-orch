@@ -213,10 +213,18 @@ Current recovery-policy audit contract (phase 1):
   add new business states such as `retryable` or `blocked` into Planner review
   outcomes
 
-Not implemented in phase 1:
+Runner lease metadata (phase 1 delivered):
 
-- runner lease ownership and heartbeat reconciliation
+- `runs/<run_id>/runner-leases.json` is the run-level lease sidecar
+- records include runner id, runtime generation, process hint/pid, phase,
+  heartbeat/expiry, status, and checkpoint metadata
+- `stale` is derived on read from `active + lease_expires_at`; GET payload
+  builders must not write lease files
+
+Still not implemented:
+
 - external runner subprocess execution handoff
+- runtime-startup lease reconciliation across alive/stale/completed runners
 - automatic rebase/replay for same-repo parallel apply conflicts
 
 Task state is the user-level lifecycle; run state is one execution attempt.

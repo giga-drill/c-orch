@@ -55,6 +55,7 @@ const statusText: Record<string, string> = {
   WAITING_WORKSPACE: "等待 workspace",
   WAITING_WORKSPACE_CLEAN: "等待工作区清理",
   WAITING_PROPOSAL_INPUT: "等待补充提案信息",
+  stale: "过期未续约",
   retry_backoff: "重试退避等待",
   retry_budget_exhausted: "自动重试预算耗尽",
   PLAN_APPROVED: "计划已通过",
@@ -81,6 +82,14 @@ const phaseText: Record<string, string> = {
   work_done_wait: "等待复核",
   planner_review: "Planner 复核",
   revision_wait: "等待返工",
+  planner_plan: "Planner 计划",
+  planner_revise: "Planner 改计划",
+  worker_implement: "Worker 实现",
+  worker_rework: "Worker 返工",
+  verification: "验证",
+  code_review: "Code review",
+  apply_terminalization: "Apply 边界",
+  commit_terminalization: "Commit 边界",
 };
 
 function formatStatus(value?: string | null): string {
@@ -393,6 +402,7 @@ export function App() {
           runtimeBusy={runtimeBusy}
           costMode={stateQuery.data?.cost_mode}
           restartGate={stateQuery.data?.runtime.restart_gate}
+          runtimeLeaseSummary={stateQuery.data?.runtime.runner_leases?.summary}
         />
         <RetrospectivePanel telemetry={stateQuery.data?.telemetry} />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
@@ -425,6 +435,7 @@ function SystemStatus({
   runtimeBusy,
   costMode,
   restartGate,
+  runtimeLeaseSummary,
 }: {
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
@@ -436,6 +447,11 @@ function SystemStatus({
     run_ids: string[];
     task_ids: string[];
     message: string | null;
+  } | null;
+  runtimeLeaseSummary?: {
+    active: number;
+    stale: number;
+    total: number;
   } | null;
 }) {
   const queueActionMutation = useQueueActionMutation();
@@ -515,6 +531,13 @@ function SystemStatus({
         <span className="label">新 run tiers</span>
         <strong>
           Planner {displayValue(tiers?.planner)} / Worker {displayValue(tiers?.worker)} / Reviewer {displayValue(tiers?.reviewer)}
+        </strong>
+      </div>
+      <div className="systemStatusWide">
+        <span className="label">Runner leases</span>
+        <strong>
+          active {displayValue((runtimeLeaseSummary as { active?: number } | undefined)?.active)} / stale{" "}
+          {displayValue((runtimeLeaseSummary as { stale?: number } | undefined)?.stale)}
         </strong>
       </div>
       {restartRequired ? (
@@ -1322,6 +1345,10 @@ function RunDetail({
           </Collapsible>
         </section>
         <section className="section">
+          <h2>Runner Leases</h2>
+          <RunnerLeasePanel payload={payload.runner_leases} />
+        </section>
+        <section className="section">
           <h2>运行时间线</h2>
           <Collapsible title={`完整事件（${payload.events.length}）`}>
             <Timeline events={payload.events} />
@@ -1712,6 +1739,36 @@ function ReviewAttempts({ attempts }: { attempts: ReviewAttempt[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+function RunnerLeasePanel({ payload }: { payload?: RunPayload["runner_leases"] }) {
+  if (!payload) return <p className="meta">暂无 lease 数据。</p>;
+  const summary = payload.summary;
+  return (
+    <div>
+      <p className="meta">
+        active {summary.active} / stale {summary.stale} / total {summary.total}
+      </p>
+      {payload.leases.length ? (
+        <ul className="timeline">
+          {newestFirst(payload.leases).map((lease) => (
+            <li key={lease.runner_id} className="timelineItem">
+              <div className="timelineTop">
+                <StatusBadge status={lease.effective_status ?? lease.status} />
+                <span className="mono">{displayValue(phaseText[lease.phase] ?? lease.phase)}</span>
+              </div>
+              <KeyValue label="runner_id" value={lease.runner_id} />
+              <KeyValue label="run_id" value={lease.run_id} />
+              <KeyValue label="heartbeat_at" value={lease.heartbeat_at} />
+              <KeyValue label="lease_expires_at" value={lease.lease_expires_at} />
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="meta">暂无 lease 记录。</p>
+      )}
+    </div>
   );
 }
 

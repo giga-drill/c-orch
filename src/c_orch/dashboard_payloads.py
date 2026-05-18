@@ -117,13 +117,16 @@ def build_proposals_payload(
 def build_runs_payload(runs_dir: Pathish) -> Dict[str, Any]:
     runs_path = Path(runs_dir).expanduser().resolve()
     store = RunStore(runs_path)
-    runs = [
-        _summarize_manifest(
-            manifest,
-            events=store.load_events(str(manifest.get("run_id", ""))),
+    runs: List[Dict[str, Any]] = []
+    for manifest in _load_manifests(runs_path):
+        run_id = str(manifest.get("run_id", ""))
+        runs.append(
+            _summarize_manifest(
+                manifest,
+                events=store.load_events(run_id),
+                runner_leases=store.load_runner_leases(run_id),
+            )
         )
-        for manifest in _load_manifests(runs_path)
-    ]
     runs.sort(key=lambda item: item["sort_key"], reverse=True)
     for run in runs:
         run.pop("sort_key", None)
@@ -164,6 +167,7 @@ def build_state_payload(
     )
     selected_run = build_run_payload(runs_dir, focused_run_id) if focused_run_id else None
     telemetry = build_project_telemetry(runs_dir)
+    runner_leases = _aggregate_runner_leases(runs_payload)
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "version": _state_version(
@@ -182,6 +186,7 @@ def build_state_payload(
             "last_dispatch_error": last_dispatch_error,
             "last_proposal_dispatch_error": last_proposal_dispatch_error,
             "restart_gate": restart_gate,
+            "runner_leases": runner_leases,
         },
         "cost_mode": _cost_mode_payload(cost_mode),
         "workspace_lanes": _workspace_lane_summary(
@@ -288,12 +293,15 @@ def build_run_payload(
     manifest = _load_manifest(manifest_path)
     if manifest is None:
         return None
-    events = RunStore(runs_path).load_events(run_id)
-    run_summary = _summarize_manifest(manifest, events=events)
+    run_store = RunStore(runs_path)
+    events = run_store.load_events(run_id)
+    runner_leases = run_store.load_runner_leases(run_id)
+    run_summary = _summarize_manifest(manifest, events=events, runner_leases=runner_leases)
     evidence_files = _evidence_details(manifest)
     return {
         "run": run_summary,
         "manifest": manifest,
+        "runner_leases": runner_leases,
         "evidence_files": evidence_files,
         "events": events,
         "activity_summary": _activity_summary(
@@ -358,6 +366,11 @@ def _state_version(
             except OSError:
                 continue
         for path in runs_dir.glob("*/usage-attribution.jsonl"):
+            try:
+                mtimes.append(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+        for path in runs_dir.glob("*/runner-leases.json"):
             try:
                 mtimes.append(path.stat().st_mtime_ns)
             except OSError:
@@ -476,6 +489,7 @@ def _summarize_manifest(
     manifest: Dict[str, Any],
     *,
     events: Optional[List[Dict[str, Any]]] = None,
+    runner_leases: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     planner = _dict_value(manifest.get("planner"))
     workers = [_summarize_worker(worker) for worker in _list_value(manifest.get("workers"))]
@@ -519,6 +533,8 @@ def _summarize_manifest(
     service_tiers = _service_tier_summary(manifest, workers=workers, review_attempts=review_attempts)
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
     timing = build_timing_summary(manifest, events or [], now_iso=now_iso)
+    leases = _dict_value(runner_leases)
+    lease_summary = _dict_value(leases.get("summary"))
     return {
         "run_id": str(manifest.get("run_id", "")),
         "status": status,
@@ -560,6 +576,16 @@ def _summarize_manifest(
         "last_event": _event_summary(event_list[-1]) if event_list else None,
         "last_error_event": last_error_event,
         "timing": timing,
+        "runner_lease_summary": {
+            "total": int(lease_summary.get("total", 0) or 0),
+            "active": int(lease_summary.get("active", 0) or 0),
+            "stale": int(lease_summary.get("stale", 0) or 0),
+            "completed": int(lease_summary.get("completed", 0) or 0),
+            "failed": int(lease_summary.get("failed", 0) or 0),
+            "expired": int(lease_summary.get("expired", 0) or 0),
+            "has_active": bool(lease_summary.get("has_active", False)),
+            "has_stale": bool(lease_summary.get("has_stale", False)),
+        },
         "plan": {
             "approval_status": plan.get("approval_status"),
             "summary": plan.get("summary"),
@@ -571,6 +597,47 @@ def _summarize_manifest(
         "acceptance_count": len(_list_value(manifest.get("acceptance_criteria"))),
         "verification_count": len(_list_value(manifest.get("verification_commands"))),
         "evidence_count": len(evidence_files),
+    }
+
+
+def _aggregate_runner_leases(runs_payload: Dict[str, Any]) -> Dict[str, Any]:
+    runs = _list_value(runs_payload.get("runs"))
+    summary = {
+        "runs_with_leases": 0,
+        "total": 0,
+        "active": 0,
+        "stale": 0,
+        "completed": 0,
+        "failed": 0,
+        "expired": 0,
+    }
+    per_run: List[Dict[str, Any]] = []
+    for item in runs:
+        if not isinstance(item, dict):
+            continue
+        run_id = str(item.get("run_id", ""))
+        lease_summary = _dict_value(item.get("runner_lease_summary"))
+        total = int(lease_summary.get("total", 0) or 0)
+        if total <= 0:
+            continue
+        summary["runs_with_leases"] += 1
+        summary["total"] += total
+        summary["active"] += int(lease_summary.get("active", 0) or 0)
+        summary["stale"] += int(lease_summary.get("stale", 0) or 0)
+        summary["completed"] += int(lease_summary.get("completed", 0) or 0)
+        summary["failed"] += int(lease_summary.get("failed", 0) or 0)
+        summary["expired"] += int(lease_summary.get("expired", 0) or 0)
+        per_run.append(
+            {
+                "run_id": run_id,
+                "updated_at": item.get("updated_at"),
+                "summary": lease_summary,
+            }
+        )
+    per_run.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    return {
+        "summary": summary,
+        "runs": per_run,
     }
 
 

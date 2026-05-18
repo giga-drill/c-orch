@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Protocol, Union
 
@@ -34,6 +36,7 @@ from .prompts import (
     planner_review_prompt,
     worker_prompt,
 )
+from .runner_leases import RunnerLeaseStore
 from .run_store import (
     PlanRecord,
     PlanRevisionRecord,
@@ -172,6 +175,9 @@ class OrchestratorConfig:
     approve_plan: bool = False
     reviewer_service_tier: Optional[str] = None
     controller_repo_path: Optional[str] = None
+    runtime_generation: Optional[str] = None
+    process_hint: Optional[str] = None
+    runner_lease_ttl_seconds: int = 300
 
 
 class RunOrchestrator:
@@ -203,6 +209,9 @@ class RunOrchestrator:
         self.config = config or OrchestratorConfig()
         if self.config.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        self._runtime_generation = self.config.runtime_generation or _default_runtime_generation()
+        self._process_hint = self.config.process_hint or f"pid:{os.getpid()}"
+        self._runner_lease_ttl_seconds = max(30, int(self.config.runner_lease_ttl_seconds or 300))
 
     def run(self, manifest: RunManifest) -> RunManifest:
         try:
@@ -595,9 +604,29 @@ class RunOrchestrator:
             "planner_plan_revision_started",
             "Planner plan revision started",
         )
+        lease_phase = "planner_revise"
+        revise_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_planner_revision_reply",
+                worker=_single_worker(manifest),
+            ),
+        )
 
         try:
             started_at = self.store.now_iso()
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=revise_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_revision_reply_inflight",
+                    worker=_single_worker(manifest),
+                ),
+            )
             result = self.driver.reply(
                 thread_id=manifest.planner.thread_id,
                 prompt=planner_revision_prompt(human_feedback=normalized_feedback),
@@ -624,6 +653,17 @@ class RunOrchestrator:
                 manifest,
                 RUN_PLAN_REVIEW_REQUIRED,
                 reason="planner_plan_revision_failed",
+            )
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=revise_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_revision_failed",
+                    worker=_single_worker(manifest),
+                ),
+                error=str(exc),
             )
             manifest.planner.status = RUN_PLAN_REVIEW_REQUIRED
             self._save(manifest)
@@ -667,6 +707,17 @@ class RunOrchestrator:
             acceptance_count=len(manifest.acceptance_criteria),
             verification_count=len(manifest.verification_commands),
         )
+        self._lease_complete(
+            manifest=manifest,
+            runner_id=revise_lease_id,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="planner_revision_completed",
+                worker=_single_worker(manifest),
+                extra={"revision_id": revision.id},
+            ),
+        )
         self._require_plan_review(manifest)
         return manifest
 
@@ -680,25 +731,58 @@ class RunOrchestrator:
             "planner_start",
             "Planner started",
         )
+        lease_phase = "planner_plan"
+        planner_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_planner_start_session",
+                worker=worker,
+            ),
+        )
 
         started_at = self.store.now_iso()
-        result = self.driver.start_session(
-            role="planner",
-            model=manifest.planner.model,
-            cwd=worktree_path,
-            prompt=planner_initial_prompt(
-                user_task=manifest.user_task,
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=planner_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_start_session_inflight",
+                    worker=worker,
+                ),
+            )
+            result = self.driver.start_session(
+                role="planner",
+                model=manifest.planner.model,
                 cwd=worktree_path,
-                worker_model=worker.model,
-            ),
-            sandbox=self.config.sandbox,
-            approval_policy=self.config.approval_policy,
-            reasoning_effort=manifest.planner.reasoning_effort,
-            service_tier=manifest.planner.service_tier,
-        )
-        manifest.planner.thread_id = result.thread_id
-
-        plan = PlannerPlan.parse(result.content)
+                prompt=planner_initial_prompt(
+                    user_task=manifest.user_task,
+                    cwd=worktree_path,
+                    worker_model=worker.model,
+                ),
+                sandbox=self.config.sandbox,
+                approval_policy=self.config.approval_policy,
+                reasoning_effort=manifest.planner.reasoning_effort,
+                service_tier=manifest.planner.service_tier,
+            )
+            manifest.planner.thread_id = result.thread_id
+            plan = PlannerPlan.parse(result.content)
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=planner_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_plan_failed",
+                    worker=worker,
+                ),
+                error=str(exc),
+            )
+            raise
         self._record_usage_attribution(
             manifest=manifest,
             role="planner",
@@ -732,6 +816,16 @@ class RunOrchestrator:
             "Planner plan ready",
             acceptance_count=len(manifest.acceptance_criteria),
             verification_count=len(manifest.verification_commands),
+        )
+        self._lease_complete(
+            manifest=manifest,
+            runner_id=planner_lease_id,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="planner_plan_completed",
+                worker=worker,
+            ),
         )
         return plan
 
@@ -790,50 +884,30 @@ class RunOrchestrator:
         )
 
         usage_phase = "implement" if is_initial_attempt else "rework"
-        if is_initial_attempt:
-            started_at = self.store.now_iso()
-            result = self.driver.start_session(
-                role="worker",
-                model=worker.model,
-                cwd=worktree_path,
-                prompt=prompt,
-                sandbox=self.config.sandbox,
-                approval_policy=self.config.approval_policy,
-                reasoning_effort=worker.reasoning_effort,
-                service_tier=worker.service_tier,
+        lease_phase = "worker_implement" if is_initial_attempt else "worker_rework"
+        worker_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_worker_call",
+                worker=worker,
+                extra={"usage_phase": usage_phase},
+            ),
+        )
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=worker_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="worker_call_inflight",
+                    worker=worker,
+                    extra={"usage_phase": usage_phase},
+                ),
             )
-            worker.thread_id = result.thread_id
-        else:
-            if not worker.thread_id:
-                raise OrchestratorError("cannot continue worker without thread_id")
-            previous_thread_id = worker.thread_id
-            try:
-                started_at = self.store.now_iso()
-                result = self.driver.reply(
-                    thread_id=previous_thread_id,
-                    prompt=prompt,
-                    model=worker.model,
-                    reasoning_effort=worker.reasoning_effort,
-                    service_tier=worker.service_tier,
-                )
-            except Exception as exc:
-                decision = classify_operation_failure(
-                    exc,
-                    phase="worker_reply",
-                    source=SOURCE_ORCHESTRATOR,
-                    attempt=worker.attempt,
-                )
-                self._record_recovery_decision(manifest, decision)
-                if decision.recovery_action != "start_replacement_agent":
-                    raise
-                self._record_event(
-                    manifest,
-                    "worker_rework_fallback_started",
-                    "Worker rework fallback started after unrecoverable thread error",
-                    worker_id=worker.id,
-                    old_thread_id=previous_thread_id,
-                    error=str(exc),
-                )
+            if is_initial_attempt:
                 started_at = self.store.now_iso()
                 result = self.driver.start_session(
                     role="worker",
@@ -846,51 +920,130 @@ class RunOrchestrator:
                     service_tier=worker.service_tier,
                 )
                 worker.thread_id = result.thread_id
-                self._save(manifest)
-                self._record_event(
-                    manifest,
-                    "worker_rework_fallback_thread_started",
-                    "Worker rework fallback thread started",
-                    worker_id=worker.id,
-                    old_thread_id=previous_thread_id,
-                    new_thread_id=result.thread_id,
-                )
+            else:
+                if not worker.thread_id:
+                    raise OrchestratorError("cannot continue worker without thread_id")
+                previous_thread_id = worker.thread_id
+                try:
+                    started_at = self.store.now_iso()
+                    result = self.driver.reply(
+                        thread_id=previous_thread_id,
+                        prompt=prompt,
+                        model=worker.model,
+                        reasoning_effort=worker.reasoning_effort,
+                        service_tier=worker.service_tier,
+                    )
+                except Exception as exc:
+                    decision = classify_operation_failure(
+                        exc,
+                        phase="worker_reply",
+                        source=SOURCE_ORCHESTRATOR,
+                        attempt=worker.attempt,
+                    )
+                    self._record_recovery_decision(manifest, decision)
+                    if decision.recovery_action != "start_replacement_agent":
+                        raise
+                    self._record_event(
+                        manifest,
+                        "worker_rework_fallback_started",
+                        "Worker rework fallback started after unrecoverable thread error",
+                        worker_id=worker.id,
+                        old_thread_id=previous_thread_id,
+                        error=str(exc),
+                    )
+                    self._lease_heartbeat(
+                        manifest=manifest,
+                        runner_id=worker_lease_id,
+                        phase=lease_phase,
+                        checkpoint=self._lease_checkpoint(
+                            manifest=manifest,
+                            phase_boundary="worker_rework_fallback_start_session_inflight",
+                            worker=worker,
+                            extra={"old_thread_id": previous_thread_id},
+                        ),
+                    )
+                    started_at = self.store.now_iso()
+                    result = self.driver.start_session(
+                        role="worker",
+                        model=worker.model,
+                        cwd=worktree_path,
+                        prompt=prompt,
+                        sandbox=self.config.sandbox,
+                        approval_policy=self.config.approval_policy,
+                        reasoning_effort=worker.reasoning_effort,
+                        service_tier=worker.service_tier,
+                    )
+                    worker.thread_id = result.thread_id
+                    self._save(manifest)
+                    self._record_event(
+                        manifest,
+                        "worker_rework_fallback_thread_started",
+                        "Worker rework fallback thread started",
+                        worker_id=worker.id,
+                        old_thread_id=previous_thread_id,
+                        new_thread_id=result.thread_id,
+                    )
 
-        worker_result = WorkerResult.parse(result.content)
-        self._record_usage_attribution(
-            manifest=manifest,
-            role="worker",
-            phase=usage_phase,
-            thread_id=result.thread_id,
-            session_id=_session_id_from_result(result),
-            model=worker.model,
-            reasoning_effort=worker.reasoning_effort,
-            service_tier=worker.service_tier,
-            started_at=started_at,
-            updated_at=self.store.now_iso(),
-            worktree_path=worktree_path,
-            worker_id=worker.id,
-            attempt=worker.attempt,
-        )
-        worker.result = dict(worker_result.raw)
-        self._transition_status(
-            manifest,
-            RUN_WORK_DONE,
-            worker_id=worker.id,
-            worker_attempt=worker.attempt,
-        )
-        worker.status = _worker_status_from_result(worker_result)
-        self._save(manifest)
-        self._record_event(
-            manifest,
-            "worker_done",
-            "Worker attempt completed",
-            worker_id=worker.id,
-            attempt=worker.attempt,
-            status=worker.status,
-            thread_id=worker.thread_id,
-        )
-        return worker_result
+            worker_result = WorkerResult.parse(result.content)
+            self._record_usage_attribution(
+                manifest=manifest,
+                role="worker",
+                phase=usage_phase,
+                thread_id=result.thread_id,
+                session_id=_session_id_from_result(result),
+                model=worker.model,
+                reasoning_effort=worker.reasoning_effort,
+                service_tier=worker.service_tier,
+                started_at=started_at,
+                updated_at=self.store.now_iso(),
+                worktree_path=worktree_path,
+                worker_id=worker.id,
+                attempt=worker.attempt,
+            )
+            worker.result = dict(worker_result.raw)
+            self._transition_status(
+                manifest,
+                RUN_WORK_DONE,
+                worker_id=worker.id,
+                worker_attempt=worker.attempt,
+            )
+            worker.status = _worker_status_from_result(worker_result)
+            self._save(manifest)
+            self._record_event(
+                manifest,
+                "worker_done",
+                "Worker attempt completed",
+                worker_id=worker.id,
+                attempt=worker.attempt,
+                status=worker.status,
+                thread_id=worker.thread_id,
+            )
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=worker_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="worker_attempt_completed",
+                    worker=worker,
+                    extra={"usage_phase": usage_phase},
+                ),
+            )
+            return worker_result
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=worker_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="worker_attempt_failed",
+                    worker=worker,
+                    extra={"usage_phase": usage_phase},
+                ),
+                error=str(exc),
+            )
+            raise
 
     def _collect_evidence(
         self,
@@ -917,21 +1070,66 @@ class RunOrchestrator:
         worker: WorkerRecord,
         worktree_path: str,
     ) -> VerificationReport:
-        report = self.verification_runner(
-            manifest.verification_commands,
-            cwd=worktree_path,
-            evidence_dir=self._attempt_evidence_dir(manifest, worker),
+        lease_phase = "verification"
+        verification_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_verification",
+                worker=worker,
+            ),
         )
-        worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
-        self._save(manifest)
-        self._record_event(
-            manifest,
-            "verification_finished",
-            "Verification finished",
-            result_count=len(report.results),
-            summary=report.summary,
-        )
-        return report
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=verification_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="verification_inflight",
+                    worker=worker,
+                ),
+            )
+            report = self.verification_runner(
+                manifest.verification_commands,
+                cwd=worktree_path,
+                evidence_dir=self._attempt_evidence_dir(manifest, worker),
+            )
+            worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
+            self._save(manifest)
+            self._record_event(
+                manifest,
+                "verification_finished",
+                "Verification finished",
+                result_count=len(report.results),
+                summary=report.summary,
+            )
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=verification_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="verification_completed",
+                    worker=worker,
+                    extra={"result_count": len(report.results)},
+                ),
+            )
+            return report
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=verification_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="verification_failed",
+                    worker=worker,
+                ),
+                error=str(exc),
+            )
+            raise
 
     def _review_attempt(
         self,
@@ -1027,6 +1225,7 @@ class RunOrchestrator:
                 code_review=code_review,
                 review_workspace=workspace_path,
                 worker_attempt=worker.attempt,
+                review_attempt_id=attempt.id,
             )
         except Exception as exc:
             self._mark_retryable_review_failure(
@@ -1136,9 +1335,21 @@ class RunOrchestrator:
         code_review: CodexReviewReport,
         review_workspace: str,
         worker_attempt: Optional[int] = None,
+        review_attempt_id: Optional[str] = None,
     ) -> ReviewDecision:
         if not manifest.planner.thread_id:
             raise OrchestratorError("cannot review without planner thread_id")
+        lease_phase = "planner_review"
+        planner_review_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_planner_review_reply",
+                review_attempt_id=review_attempt_id,
+                extra={"worker_attempt": worker_attempt},
+            ),
+        )
         primary_prompt = planner_review_prompt(
             original_plan_json=plan.raw,
             worker_result_json=worker_result.raw,
@@ -1152,6 +1363,17 @@ class RunOrchestrator:
         )
         previous_thread_id = manifest.planner.thread_id
         try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=planner_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_review_reply_inflight",
+                    review_attempt_id=review_attempt_id,
+                    extra={"worker_attempt": worker_attempt},
+                ),
+            )
             started_at = self.store.now_iso()
             result = self.driver.reply(
                 thread_id=previous_thread_id,
@@ -1179,7 +1401,19 @@ class RunOrchestrator:
                 old_thread_id=previous_thread_id,
                 attempt=worker_attempt,
             )
-            return ReviewDecision.parse(result.content)
+            decision = ReviewDecision.parse(result.content)
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=planner_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="planner_review_completed",
+                    review_attempt_id=review_attempt_id,
+                    extra={"worker_attempt": worker_attempt, "decision": decision.decision},
+                ),
+            )
+            return decision
         except Exception as exc:
             decision = classify_operation_failure(
                 exc,
@@ -1189,6 +1423,18 @@ class RunOrchestrator:
             )
             self._record_recovery_decision(manifest, decision)
             if decision.recovery_action != "start_replacement_agent":
+                self._lease_fail(
+                    manifest=manifest,
+                    runner_id=planner_review_lease_id,
+                    phase=lease_phase,
+                    checkpoint=self._lease_checkpoint(
+                        manifest=manifest,
+                        phase_boundary="planner_review_failed",
+                        review_attempt_id=review_attempt_id,
+                        extra={"worker_attempt": worker_attempt},
+                    ),
+                    error=str(exc),
+                )
                 raise
             self._record_event(
                 manifest,
@@ -1197,52 +1443,90 @@ class RunOrchestrator:
                 old_thread_id=previous_thread_id,
                 error=str(exc),
             )
-            started_at = self.store.now_iso()
-            fallback_result = self.driver.start_session(
-                role="planner",
-                model=manifest.planner.model,
-                cwd=review_workspace,
-                prompt=planner_review_fallback_prompt(
-                    user_task=manifest.user_task,
-                    original_plan_json=plan.raw,
-                    acceptance_criteria=plan.acceptance_criteria,
-                    worker_result_json=worker_result.raw,
-                    review_workspace=review_workspace,
-                    diff_summary=evidence.summary,
-                    diff_path=str(evidence.patch_path),
-                    test_summary=verification.summary,
-                    test_output_path=str(verification.output_path),
-                    code_review_summary=code_review.summary,
-                    code_review_output_path=str(code_review.output_path),
-                ),
-                sandbox=self.config.sandbox,
-                approval_policy=self.config.approval_policy,
-                reasoning_effort=manifest.planner.reasoning_effort,
-                service_tier=manifest.planner.service_tier,
-            )
-            self._record_usage_attribution(
-                manifest=manifest,
-                role="planner",
-                phase="review",
-                thread_id=fallback_result.thread_id,
-                session_id=_session_id_from_result(fallback_result),
-                model=manifest.planner.model,
-                reasoning_effort=manifest.planner.reasoning_effort,
-                service_tier=manifest.planner.service_tier,
-                started_at=started_at,
-                updated_at=self.store.now_iso(),
-                worktree_path=review_workspace,
-            )
-            manifest.planner.thread_id = fallback_result.thread_id
-            self._save(manifest)
-            self._record_event(
-                manifest,
-                "planner_review_fallback_thread_started",
-                "Planner review fallback thread started",
-                old_thread_id=previous_thread_id,
-                new_thread_id=fallback_result.thread_id,
-            )
-            return ReviewDecision.parse(fallback_result.content)
+            try:
+                self._lease_heartbeat(
+                    manifest=manifest,
+                    runner_id=planner_review_lease_id,
+                    phase=lease_phase,
+                    checkpoint=self._lease_checkpoint(
+                        manifest=manifest,
+                        phase_boundary="planner_review_fallback_start_session_inflight",
+                        review_attempt_id=review_attempt_id,
+                        extra={"worker_attempt": worker_attempt, "old_thread_id": previous_thread_id},
+                    ),
+                )
+                started_at = self.store.now_iso()
+                fallback_result = self.driver.start_session(
+                    role="planner",
+                    model=manifest.planner.model,
+                    cwd=review_workspace,
+                    prompt=planner_review_fallback_prompt(
+                        user_task=manifest.user_task,
+                        original_plan_json=plan.raw,
+                        acceptance_criteria=plan.acceptance_criteria,
+                        worker_result_json=worker_result.raw,
+                        review_workspace=review_workspace,
+                        diff_summary=evidence.summary,
+                        diff_path=str(evidence.patch_path),
+                        test_summary=verification.summary,
+                        test_output_path=str(verification.output_path),
+                        code_review_summary=code_review.summary,
+                        code_review_output_path=str(code_review.output_path),
+                    ),
+                    sandbox=self.config.sandbox,
+                    approval_policy=self.config.approval_policy,
+                    reasoning_effort=manifest.planner.reasoning_effort,
+                    service_tier=manifest.planner.service_tier,
+                )
+                self._record_usage_attribution(
+                    manifest=manifest,
+                    role="planner",
+                    phase="review",
+                    thread_id=fallback_result.thread_id,
+                    session_id=_session_id_from_result(fallback_result),
+                    model=manifest.planner.model,
+                    reasoning_effort=manifest.planner.reasoning_effort,
+                    service_tier=manifest.planner.service_tier,
+                    started_at=started_at,
+                    updated_at=self.store.now_iso(),
+                    worktree_path=review_workspace,
+                )
+                manifest.planner.thread_id = fallback_result.thread_id
+                self._save(manifest)
+                self._record_event(
+                    manifest,
+                    "planner_review_fallback_thread_started",
+                    "Planner review fallback thread started",
+                    old_thread_id=previous_thread_id,
+                    new_thread_id=fallback_result.thread_id,
+                )
+                fallback_decision = ReviewDecision.parse(fallback_result.content)
+                self._lease_complete(
+                    manifest=manifest,
+                    runner_id=planner_review_lease_id,
+                    phase=lease_phase,
+                    checkpoint=self._lease_checkpoint(
+                        manifest=manifest,
+                        phase_boundary="planner_review_completed_via_fallback",
+                        review_attempt_id=review_attempt_id,
+                        extra={"worker_attempt": worker_attempt, "decision": fallback_decision.decision},
+                    ),
+                )
+                return fallback_decision
+            except Exception as fallback_exc:
+                self._lease_fail(
+                    manifest=manifest,
+                    runner_id=planner_review_lease_id,
+                    phase=lease_phase,
+                    checkpoint=self._lease_checkpoint(
+                        manifest=manifest,
+                        phase_boundary="planner_review_failed",
+                        review_attempt_id=review_attempt_id,
+                        extra={"worker_attempt": worker_attempt},
+                    ),
+                    error=str(fallback_exc),
+                )
+                raise
 
     def _run_code_review(
         self,
@@ -1253,34 +1537,83 @@ class RunOrchestrator:
         worktree_path: str,
         evidence: DiffEvidence,
     ) -> CodexReviewReport:
+        lease_phase = "code_review"
+        code_review_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="before_code_review",
+                worker=worker,
+                review_attempt_id=attempt.id,
+            ),
+        )
         started_at = self.store.now_iso()
         reviewer_service_tier = self._effective_reviewer_service_tier(manifest)
-        report = self.code_review_runner(
-            cwd=worktree_path,
-            evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
-            codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
-            patch_path=evidence.patch_path,
-            service_tier=reviewer_service_tier,
-        )
-        # review CLI currently does not return Codex thread/session ids.
-        self._record_usage_attribution(
-            manifest=manifest,
-            role="reviewer",
-            phase="review",
-            thread_id=None,
-            session_id=None,
-            model=None,
-            reasoning_effort=None,
-            service_tier=reviewer_service_tier,
-            started_at=started_at,
-            updated_at=self.store.now_iso(),
-            worktree_path=worktree_path,
-            worker_id=worker.id,
-            attempt=worker.attempt,
-        )
-        worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
-        self._save(manifest)
-        return report
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_inflight",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                ),
+            )
+            report = self.code_review_runner(
+                cwd=worktree_path,
+                evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
+                codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
+                patch_path=evidence.patch_path,
+                service_tier=reviewer_service_tier,
+            )
+            # review CLI currently does not return Codex thread/session ids.
+            self._record_usage_attribution(
+                manifest=manifest,
+                role="reviewer",
+                phase="review",
+                thread_id=None,
+                session_id=None,
+                model=None,
+                reasoning_effort=None,
+                service_tier=reviewer_service_tier,
+                started_at=started_at,
+                updated_at=self.store.now_iso(),
+                worktree_path=worktree_path,
+                worker_id=worker.id,
+                attempt=worker.attempt,
+            )
+            worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
+            self._save(manifest)
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_completed",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                    extra={"code_review_status": report.status},
+                ),
+            )
+            return report
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_failed",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                ),
+                error=str(exc),
+            )
+            raise
 
     def _effective_reviewer_service_tier(self, manifest: RunManifest) -> Optional[str]:
         if self.config.reviewer_service_tier is not None:
@@ -1482,6 +1815,146 @@ class RunOrchestrator:
                 )
             except Exception:
                 pass
+
+    def _runner_lease_store(self, run_id: str) -> RunnerLeaseStore:
+        return self.store.runner_lease_store(run_id)
+
+    def _lease_checkpoint(
+        self,
+        *,
+        manifest: RunManifest,
+        phase_boundary: str,
+        worker: Optional[WorkerRecord] = None,
+        review_attempt_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        checkpoint: Dict[str, Any] = {
+            "run_status": manifest.status,
+            "phase_boundary": phase_boundary,
+            "planner_thread_id": manifest.planner.thread_id,
+        }
+        if worker is not None:
+            checkpoint["worker_id"] = worker.id
+            checkpoint["worker_attempt"] = worker.attempt
+            checkpoint["worker_thread_id"] = worker.thread_id
+            checkpoint["worktree_path"] = worker.worktree_path
+        if review_attempt_id:
+            checkpoint["review_attempt_id"] = review_attempt_id
+        if extra:
+            checkpoint.update(extra)
+        return checkpoint
+
+    def _lease_create(
+        self,
+        *,
+        manifest: RunManifest,
+        phase: str,
+        checkpoint: Dict[str, Any],
+    ) -> Optional[str]:
+        try:
+            lease = self._runner_lease_store(manifest.run_id).create(
+                runtime_generation=self._runtime_generation,
+                run_id=manifest.run_id,
+                phase=phase,
+                task_id=manifest.task_id,
+                proposal_id=manifest.proposal_id,
+                process_hint=self._process_hint,
+                pid=os.getpid(),
+                checkpoint=checkpoint,
+                lease_ttl_seconds=self._runner_lease_ttl_seconds,
+            )
+            return lease.runner_id
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_lease_write_failed",
+                "Runner lease create failed",
+                phase=phase,
+                operation="create",
+                error=str(exc),
+            )
+            return None
+
+    def _lease_heartbeat(
+        self,
+        *,
+        manifest: RunManifest,
+        runner_id: Optional[str],
+        phase: str,
+        checkpoint: Dict[str, Any],
+    ) -> None:
+        if not runner_id:
+            return
+        try:
+            self._runner_lease_store(manifest.run_id).heartbeat(
+                runner_id,
+                checkpoint=checkpoint,
+                lease_ttl_seconds=self._runner_lease_ttl_seconds,
+            )
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_lease_write_failed",
+                "Runner lease heartbeat failed",
+                phase=phase,
+                operation="heartbeat",
+                runner_id=runner_id,
+                error=str(exc),
+            )
+
+    def _lease_complete(
+        self,
+        *,
+        manifest: RunManifest,
+        runner_id: Optional[str],
+        phase: str,
+        checkpoint: Dict[str, Any],
+    ) -> None:
+        if not runner_id:
+            return
+        try:
+            self._runner_lease_store(manifest.run_id).complete(
+                runner_id,
+                checkpoint=checkpoint,
+            )
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_lease_write_failed",
+                "Runner lease complete failed",
+                phase=phase,
+                operation="complete",
+                runner_id=runner_id,
+                error=str(exc),
+            )
+
+    def _lease_fail(
+        self,
+        *,
+        manifest: RunManifest,
+        runner_id: Optional[str],
+        phase: str,
+        checkpoint: Dict[str, Any],
+        error: str,
+    ) -> None:
+        if not runner_id:
+            return
+        try:
+            self._runner_lease_store(manifest.run_id).fail(
+                runner_id,
+                checkpoint=checkpoint,
+                error=error,
+            )
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_lease_write_failed",
+                "Runner lease fail failed",
+                phase=phase,
+                operation="fail",
+                runner_id=runner_id,
+                error=str(exc),
+            )
 
     def _record_recovery_decision(
         self,
@@ -1754,43 +2227,88 @@ class RunOrchestrator:
         worker: WorkerRecord,
         evidence: DiffEvidence,
     ) -> ApplyReport:
-        apply_report = self.diff_applier(
-            evidence,
-            manifest.cwd,
-            self._attempt_evidence_dir(manifest, worker),
+        lease_phase = "apply_terminalization"
+        apply_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="apply_boundary_before_diff_applier",
+                worker=worker,
+            ),
         )
-        worker.evidence_files = _append_unique(worker.evidence_files, apply_report.evidence_files)
-        if manifest.review is not None:
-            manifest.review.evidence_files = _append_unique(
-                manifest.review.evidence_files,
-                apply_report.evidence_files,
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=apply_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="apply_boundary_inflight",
+                    worker=worker,
+                ),
             )
-        restart_paths: List[str] = []
-        if apply_report.applied:
-            restart_paths = self._restart_trigger_paths(manifest=manifest, changed_paths=evidence.changed_paths)
-            if restart_paths:
-                manifest.requires_restart = True
-                manifest.restart_reason = (
-                    "Applied diff touched c-orch runtime code or critical config."
+            apply_report = self.diff_applier(
+                evidence,
+                manifest.cwd,
+                self._attempt_evidence_dir(manifest, worker),
+            )
+            worker.evidence_files = _append_unique(worker.evidence_files, apply_report.evidence_files)
+            if manifest.review is not None:
+                manifest.review.evidence_files = _append_unique(
+                    manifest.review.evidence_files,
+                    apply_report.evidence_files,
                 )
-                manifest.restart_paths = _append_unique(manifest.restart_paths, restart_paths)
-        self._save(manifest)
-        self._record_event(
-            manifest,
-            "apply_completed",
-            "Apply completed",
-            applied=apply_report.applied,
-            summary=apply_report.summary,
-        )
-        if apply_report.applied and restart_paths:
+            restart_paths: List[str] = []
+            if apply_report.applied:
+                restart_paths = self._restart_trigger_paths(manifest=manifest, changed_paths=evidence.changed_paths)
+                if restart_paths:
+                    manifest.requires_restart = True
+                    manifest.restart_reason = (
+                        "Applied diff touched c-orch runtime code or critical config."
+                    )
+                    manifest.restart_paths = _append_unique(manifest.restart_paths, restart_paths)
+            self._save(manifest)
             self._record_event(
                 manifest,
-                "restart_required",
-                "Run applied self-modifying changes; restart before next queued work.",
-                restart_reason=manifest.restart_reason,
-                restart_paths=manifest.restart_paths,
+                "apply_completed",
+                "Apply completed",
+                applied=apply_report.applied,
+                summary=apply_report.summary,
             )
-        return apply_report
+            if apply_report.applied and restart_paths:
+                self._record_event(
+                    manifest,
+                    "restart_required",
+                    "Run applied self-modifying changes; restart before next queued work.",
+                    restart_reason=manifest.restart_reason,
+                    restart_paths=manifest.restart_paths,
+                )
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=apply_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="apply_boundary_completed",
+                    worker=worker,
+                    extra={"applied": apply_report.applied},
+                ),
+            )
+            return apply_report
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=apply_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="apply_boundary_failed",
+                    worker=worker,
+                ),
+                error=str(exc),
+            )
+            raise
 
     def _complete_after_accepted_review(
         self,
@@ -1908,59 +2426,104 @@ class RunOrchestrator:
         if manifest.review is not None:
             review_decision = manifest.review.decision or "accepted"
             review_reason = manifest.review.reason
-        commit_report = self.git_committer(
-            target_repo_path=manifest.cwd,
-            evidence_dir=self._attempt_evidence_dir(manifest, worker),
-            run_id=manifest.run_id,
-            worker_id=worker.id,
-            planner_review_decision=review_decision,
-            user_task=manifest.user_task,
-            plan_summary=manifest.plan.summary if manifest.plan is not None else None,
-            review_reason=review_reason,
-            changed_paths=list(evidence.changed_paths),
-            pre_apply_changed_paths=list(pre_apply_changed_paths),
-            pre_apply_staged_paths=list(pre_apply_staged_paths),
-            post_apply_changed_paths=list(post_apply_changed_paths)
-            if post_apply_changed_paths is not None
-            else self.repo_changed_paths_collector(manifest.cwd),
+        lease_phase = "commit_terminalization"
+        commit_lease_id = self._lease_create(
+            manifest=manifest,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="commit_boundary_before_git_commit",
+                worker=worker,
+            ),
         )
-        worker.evidence_files = _append_unique(worker.evidence_files, commit_report.evidence_files)
-        if manifest.review is not None:
-            manifest.review.evidence_files = _append_unique(
-                manifest.review.evidence_files,
-                commit_report.evidence_files,
+        try:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=commit_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="commit_boundary_inflight",
+                    worker=worker,
+                ),
             )
-        self._save(manifest)
-        if commit_report.committed:
-            self._record_event(
-                manifest,
-                "git_commit_completed",
-                "Git commit completed",
-                commit_hash=commit_report.commit_hash,
-                summary=commit_report.summary,
-                message_path=str(commit_report.message_path),
-                output_path=str(commit_report.output_path),
+            commit_report = self.git_committer(
+                target_repo_path=manifest.cwd,
+                evidence_dir=self._attempt_evidence_dir(manifest, worker),
+                run_id=manifest.run_id,
+                worker_id=worker.id,
+                planner_review_decision=review_decision,
+                user_task=manifest.user_task,
+                plan_summary=manifest.plan.summary if manifest.plan is not None else None,
+                review_reason=review_reason,
+                changed_paths=list(evidence.changed_paths),
+                pre_apply_changed_paths=list(pre_apply_changed_paths),
+                pre_apply_staged_paths=list(pre_apply_staged_paths),
+                post_apply_changed_paths=list(post_apply_changed_paths)
+                if post_apply_changed_paths is not None
+                else self.repo_changed_paths_collector(manifest.cwd),
             )
-        elif commit_report.skipped:
-            self._record_event(
-                manifest,
-                "git_commit_skipped",
-                "Git commit skipped",
-                summary=commit_report.summary,
-                message_path=str(commit_report.message_path),
-                output_path=str(commit_report.output_path),
+            worker.evidence_files = _append_unique(worker.evidence_files, commit_report.evidence_files)
+            if manifest.review is not None:
+                manifest.review.evidence_files = _append_unique(
+                    manifest.review.evidence_files,
+                    commit_report.evidence_files,
+                )
+            self._save(manifest)
+            if commit_report.committed:
+                self._record_event(
+                    manifest,
+                    "git_commit_completed",
+                    "Git commit completed",
+                    commit_hash=commit_report.commit_hash,
+                    summary=commit_report.summary,
+                    message_path=str(commit_report.message_path),
+                    output_path=str(commit_report.output_path),
+                )
+            elif commit_report.skipped:
+                self._record_event(
+                    manifest,
+                    "git_commit_skipped",
+                    "Git commit skipped",
+                    summary=commit_report.summary,
+                    message_path=str(commit_report.message_path),
+                    output_path=str(commit_report.output_path),
+                )
+            else:
+                self._record_event(
+                    manifest,
+                    "git_commit_failed",
+                    "Git commit failed",
+                    summary=commit_report.summary,
+                    reason=commit_report.failure_reason,
+                    message_path=str(commit_report.message_path),
+                    output_path=str(commit_report.output_path),
+                )
+            self._lease_complete(
+                manifest=manifest,
+                runner_id=commit_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="commit_boundary_completed",
+                    worker=worker,
+                    extra={"commit_status": commit_report.status},
+                ),
             )
-        else:
-            self._record_event(
-                manifest,
-                "git_commit_failed",
-                "Git commit failed",
-                summary=commit_report.summary,
-                reason=commit_report.failure_reason,
-                message_path=str(commit_report.message_path),
-                output_path=str(commit_report.output_path),
+            return commit_report
+        except Exception as exc:
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=commit_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="commit_boundary_failed",
+                    worker=worker,
+                ),
+                error=str(exc),
             )
-        return commit_report
+            raise
 
     def _restart_trigger_paths(self, *, manifest: RunManifest, changed_paths: List[str]) -> List[str]:
         if not self._is_controller_repo(manifest.cwd):
@@ -2236,3 +2799,8 @@ def _string_or_none(value: Any) -> Optional[str]:
         return None
     text = value.strip()
     return text or None
+
+
+def _default_runtime_generation() -> str:
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    return f"cli:{os.getpid()}:{now}"
