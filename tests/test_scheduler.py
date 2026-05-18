@@ -30,14 +30,18 @@ class _FakeOrchestrator:
         run_store: RunStore,
         outcomes: List[Tuple[str, bool]],
         retry_outcomes: List[Tuple[str, bool]] | None = None,
+        terminalization_outcomes: List[Tuple[str, bool]] | None = None,
     ) -> None:
         self.run_store = run_store
         self.outcomes = list(outcomes)
         self.retry_outcomes = list(retry_outcomes or [])
+        self.terminalization_outcomes = list(terminalization_outcomes or [])
         self.run_ids: List[str] = []
         self.retry_run_ids: List[str] = []
+        self.terminalization_run_ids: List[str] = []
         self.run_calls = 0
         self.retry_review_calls = 0
+        self.reconcile_terminalization_calls = 0
 
     def run(self, manifest):  # type: ignore[no-untyped-def]
         self.run_calls += 1
@@ -55,6 +59,36 @@ class _FakeOrchestrator:
         manifest.requires_restart = requires_restart
         self.run_store.save(manifest)
         self.retry_run_ids.append(manifest.run_id)
+        return manifest
+
+    def reconcile_accepted_review_terminalization(self, manifest):  # type: ignore[no-untyped-def]
+        self.reconcile_terminalization_calls += 1
+        status, requires_restart = self.terminalization_outcomes.pop(0)
+        manifest.status = status
+        manifest.requires_restart = requires_restart
+        self.run_store.save(manifest)
+        if status == "APPROVED":
+            self.run_store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=True,
+                summary="Recovered apply boundary.",
+            )
+            self.run_store.append_event(
+                manifest.run_id,
+                "git_commit_completed",
+                "Git commit completed",
+                summary="Recovered commit boundary.",
+                commit_hash="recovered",
+            )
+            self.run_store.append_event(
+                manifest.run_id,
+                "run_terminal_status",
+                "Run finished with APPROVED",
+                status="APPROVED",
+            )
+        self.terminalization_run_ids.append(manifest.run_id)
         return manifest
 
 
@@ -235,6 +269,55 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[1].status, TASK_PENDING)
             self.assertEqual(fake.run_calls, 0)
             self.assertEqual(fake.retry_review_calls, 1)
+
+    def test_active_accepted_review_terminalization_auto_reconciles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root / "repo",
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            manifest.status = RUN_WORK_DONE
+            manifest.review = ReviewRecord(decision="accepted", reason="looks good")
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status=TASK_RUNNING,
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            task_store.save(queue)
+            fake = _FakeOrchestrator(
+                run_store,
+                outcomes=[],
+                terminalization_outcomes=[("APPROVED", False)],
+            )
+
+            scheduler = TaskScheduler(
+                task_store=task_store,
+                run_store=run_store,
+                driver=object(),  # type: ignore[arg-type]
+                config=_config(root),
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+            queue = scheduler.run()
+
+            self.assertEqual(queue.status, QUEUE_APPROVED)
+            loaded = task_store.load()
+            self.assertEqual(loaded.tasks[0].status, TASK_APPROVED)
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 0)
+            self.assertEqual(fake.reconcile_terminalization_calls, 1)
+            self.assertEqual(fake.terminalization_run_ids, [manifest.run_id])
 
     def test_runs_two_pending_tasks_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

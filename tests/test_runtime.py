@@ -47,6 +47,12 @@ class _FakeOrchestrator:
         self.run_ids.append(manifest.run_id)
         return manifest
 
+    def retry_review(self, manifest):  # type: ignore[no-untyped-def]
+        return self.run(manifest)
+
+    def reconcile_accepted_review_terminalization(self, manifest):  # type: ignore[no-untyped-def]
+        return self.run(manifest)
+
 
 class _BlockingQueueOrchestrator:
     def __init__(
@@ -86,6 +92,9 @@ class _BlockingQueueOrchestrator:
     def retry_review(self, manifest):  # type: ignore[no-untyped-def]
         return self.run(manifest)
 
+    def reconcile_accepted_review_terminalization(self, manifest):  # type: ignore[no-untyped-def]
+        return self.run(manifest)
+
 
 class _RetryReviewQueueOrchestrator:
     def __init__(self, run_store: RunStore) -> None:
@@ -106,6 +115,9 @@ class _RetryReviewQueueOrchestrator:
         manifest.status = "APPROVED"
         self.run_store.save(manifest)
         return manifest
+
+    def reconcile_accepted_review_terminalization(self, manifest):  # type: ignore[no-untyped-def]
+        return self.run(manifest)
 
 
 class _FakeProposalPlanner:

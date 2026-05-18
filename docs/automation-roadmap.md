@@ -383,6 +383,22 @@ Accepted-review terminalization recovery:
   manual recovery action with the current diff, commit status, and run evidence
   instead of pretending Planner review is still running.
 
+Status (Phase 1 delivered):
+
+- `RunOrchestrator` now exposes accepted-review terminalization reconcile and
+  re-enters apply/commit/terminalization from durable boundaries without
+  restarting Planner/Worker.
+- Runtime startup and queue scheduler wakeup now detect accepted-but-not-
+  terminalized runs and trigger reconcile automatically when recovery is
+  provably safe.
+- Apply/commit side effects now emit durable `apply_started` and
+  `git_commit_started` boundary events before side effects, then
+  completed/failed events after side effects.
+- When apply/commit replay cannot be proven safe, c-orch records
+  `accepted_terminalization_recovery_required` and surfaces
+  `manual_terminalization_recovery` in run/task payloads instead of showing
+  Planner review as still running.
+
 ## 3. Self-Bootstrap Restart Protocol
 
 ### Goal
@@ -484,7 +500,7 @@ larger lifecycle architecture changes.
    Detect a Worker attempt whose transcript/heartbeat stops advancing, record a
    `worker_stalled` event, mark the task retryable, preserve the worktree, and
    expose normal retry handling.
-3. Accepted-review terminalization recovery.
+3. Accepted-review terminalization recovery. (Delivered in phase 1)
    Reconcile runs where Planner review is already `accepted` but
    apply/commit/terminal events are missing, so a runtime restart cannot leave
    the UI stuck in Planner review.

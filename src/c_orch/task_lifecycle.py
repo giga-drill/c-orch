@@ -20,6 +20,11 @@ from .states import (
     RUN_WORK_DONE,
     RUN_WORKING,
 )
+from .terminalization_recovery import (
+    WAITING_ACCEPTED_TERMINALIZATION_RECOVERY,
+    WAITING_MANUAL_TERMINALIZATION_RECOVERY,
+    accepted_review_terminalization_waiting_for,
+)
 from .task_store import (
     QUEUE_APPROVED,
     QUEUE_BLOCKED,
@@ -64,6 +69,18 @@ class TaskProgress:
 
 
 def derive_run_waiting_for(run: RunManifest) -> str:
+    return derive_run_waiting_for_with_events(run, events=None)
+
+
+def derive_run_waiting_for_with_events(
+    run: RunManifest,
+    *,
+    events: Optional[list[dict]] = None,
+) -> str:
+    if events is not None:
+        terminalization_waiting = accepted_review_terminalization_waiting_for(run, events)
+        if terminalization_waiting is not None:
+            return terminalization_waiting
     if run.status == RUN_APPROVED:
         return WAITING_RESTART if run.requires_restart else WAITING_DONE
     if run.status == RUN_FAILED:
@@ -89,11 +106,17 @@ def derive_task_progress(
     task: TaskRecord,
     *,
     active_run: Optional[RunManifest] = None,
+    active_run_events: Optional[list[dict]] = None,
 ) -> TaskProgress:
     if task.status == TASK_SKIPPED:
         return TaskProgress(status=TASK_SKIPPED, waiting_for=WAITING_SKIPPED, reason=task.reason)
     if active_run is not None:
-        waiting_for = derive_run_waiting_for(active_run)
+        waiting_for = derive_run_waiting_for_with_events(active_run, events=active_run_events)
+        if waiting_for in {
+            WAITING_ACCEPTED_TERMINALIZATION_RECOVERY,
+            WAITING_MANUAL_TERMINALIZATION_RECOVERY,
+        }:
+            return TaskProgress(status=TASK_WAITING, waiting_for=waiting_for, reason=waiting_for)
         if active_run.status == RUN_APPROVED:
             return TaskProgress(status=TASK_APPROVED, waiting_for=waiting_for)
         if active_run.status == RUN_FAILED:
@@ -108,7 +131,11 @@ def derive_task_progress(
                 waiting_for=WAITING_FAILED,
                 reason=REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
             )
-        if waiting_for == WAITING_PLANNER_REVIEW_RETRY:
+        if waiting_for in {
+            WAITING_PLANNER_REVIEW_RETRY,
+            WAITING_ACCEPTED_TERMINALIZATION_RECOVERY,
+            WAITING_MANUAL_TERMINALIZATION_RECOVERY,
+        }:
             return TaskProgress(status=TASK_WAITING, waiting_for=waiting_for, reason=waiting_for)
         return TaskProgress(status=TASK_RUNNING, waiting_for=waiting_for, reason=waiting_for)
 
@@ -131,9 +158,14 @@ def reconcile_task_with_active_run(
     task: TaskRecord,
     *,
     active_run: Optional[RunManifest],
+    active_run_events: Optional[list[dict]] = None,
     completed_at: Optional[str],
 ) -> bool:
-    progress = derive_task_progress(task, active_run=active_run)
+    progress = derive_task_progress(
+        task,
+        active_run=active_run,
+        active_run_events=active_run_events,
+    )
     changed = False
 
     if task.status != progress.status:
@@ -158,18 +190,26 @@ def reconcile_queue(
     queue: TaskQueue,
     *,
     run_loader,
+    run_events_loader=None,
     now_iso,
 ) -> bool:
     changed = False
     restart_required = False
     for task in queue.tasks:
         active_run = _load_active_run(task, run_loader)
+        active_run_events = []
+        if active_run is not None and run_events_loader is not None:
+            try:
+                active_run_events = run_events_loader(active_run.run_id)
+            except OSError:
+                active_run_events = []
         if active_run is not None:
             if active_run.status == RUN_APPROVED and active_run.requires_restart:
                 restart_required = True
             changed = reconcile_task_with_active_run(
                 task,
                 active_run=active_run,
+                active_run_events=active_run_events,
                 completed_at=now_iso(),
             ) or changed
 

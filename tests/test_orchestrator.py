@@ -800,7 +800,9 @@ class OrchestratorTests(unittest.TestCase):
                     "verification_finished",
                     "planner_review_start",
                     "planner_review_completed",
+                    "apply_started",
                     "apply_completed",
+                    "git_commit_started",
                     "git_commit_completed",
                     "run_terminal_status",
                 ],
@@ -809,9 +811,9 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(events[2]["worker_id"], "worker-1")
             self.assertEqual(events[3]["status"], "DONE")
             self.assertEqual(events[7]["decision"], "accepted")
-            self.assertTrue(events[8]["applied"])
-            self.assertEqual(events[9]["commit_hash"], _git(Path(manifest.cwd), ["rev-parse", "HEAD"]).strip())
-            self.assertEqual(events[10]["status"], "APPROVED")
+            self.assertTrue(events[9]["applied"])
+            self.assertEqual(events[11]["commit_hash"], _git(Path(manifest.cwd), ["rev-parse", "HEAD"]).strip())
+            self.assertEqual(events[12]["status"], "APPROVED")
             attribution = store.load_usage_attribution(manifest.run_id)
             role_phase_pairs = [(item.get("role"), item.get("phase")) for item in attribution]
             self.assertIn(("planner", "plan"), role_phase_pairs)
@@ -1401,7 +1403,9 @@ class OrchestratorTests(unittest.TestCase):
                     "verification_finished",
                     "planner_review_start",
                     "planner_review_completed",
+                    "apply_started",
                     "apply_completed",
+                    "git_commit_started",
                     "git_commit_completed",
                     "run_terminal_status",
                 ],
@@ -1615,6 +1619,253 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIn("verification_retry_started", [event["type"] for event in events])
             self.assertEqual(events[-1]["type"], "run_terminal_status")
             self.assertEqual(events[-1]["status"], "APPROVED")
+
+    def test_reconcile_accepted_review_terminalization_recovers_missing_apply_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            summary_path, patch_path = _write_review_patch_evidence(
+                repo=Path(manifest.cwd),
+                evidence_dir=store.run_dir(manifest.run_id) / "evidence",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.planner.status = "REVIEWING"
+            manifest.workers[0].status = "DONE"
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[str(summary_path), str(patch_path)],
+            )
+            store.save(manifest)
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(start_results=[], reply_results=[]),
+                diff_applier=applier,
+                git_committer=committer,
+            ).reconcile_accepted_review_terminalization(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(len(applier.calls), 1)
+            self.assertEqual(len(committer.calls), 1)
+            event_types = [event["type"] for event in store.load_events(manifest.run_id)]
+            self.assertIn("accepted_terminalization_reconcile_started", event_types)
+            self.assertIn("apply_started", event_types)
+            self.assertIn("apply_completed", event_types)
+            self.assertIn("git_commit_started", event_types)
+            self.assertIn("git_commit_completed", event_types)
+            self.assertEqual(event_types[-1], "run_terminal_status")
+
+    def test_reconcile_accepted_review_terminalization_recovers_missing_commit_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            summary_path, patch_path = _write_review_patch_evidence(
+                repo=Path(manifest.cwd),
+                evidence_dir=store.run_dir(manifest.run_id) / "evidence",
+            )
+            manifest.status = "REVIEWING"
+            manifest.planner.status = "REVIEWING"
+            manifest.workers[0].status = "DONE"
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[str(summary_path), str(patch_path)],
+            )
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "apply_started",
+                "Apply started",
+                worker_id=manifest.workers[0].id,
+                attempt=1,
+                changed_paths=["README.md"],
+                pre_apply_changed_paths=[],
+                pre_apply_staged_paths=[],
+                patch_path=str(patch_path),
+                patch_hash="placeholder",
+            )
+            store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=True,
+                summary="applied",
+            )
+            readme = Path(manifest.cwd) / "README.md"
+            readme.write_text(readme.read_text(encoding="utf-8") + "staged-for-commit\n", encoding="utf-8")
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(start_results=[], reply_results=[]),
+                diff_applier=applier,
+                git_committer=committer,
+            ).reconcile_accepted_review_terminalization(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(len(applier.calls), 0)
+            self.assertEqual(len(committer.calls), 1)
+            event_types = [event["type"] for event in store.load_events(manifest.run_id)]
+            self.assertIn("git_commit_started", event_types)
+            self.assertIn("git_commit_completed", event_types)
+            self.assertEqual(event_types[-1], "run_terminal_status")
+
+    def test_reconcile_accepted_review_terminalization_recovers_missing_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            summary_path, patch_path = _write_review_patch_evidence(
+                repo=Path(manifest.cwd),
+                evidence_dir=store.run_dir(manifest.run_id) / "evidence",
+            )
+            worker = manifest.workers[0]
+            manifest.status = "APPROVED"
+            manifest.planner.status = "APPROVED"
+            worker.status = "APPROVED"
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[str(summary_path), str(patch_path)],
+            )
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=True,
+                summary="applied",
+            )
+            commit_message = "\n".join(
+                [
+                    "Recovered commit",
+                    "",
+                    f"Run-ID: {manifest.run_id}",
+                    f"Worker-ID: {worker.id}",
+                    "Planner-Review: accepted",
+                ]
+            )
+            commit_message_path = Path(manifest.cwd) / ".recovered-commit-message.txt"
+            commit_message_path.write_text(commit_message + "\n", encoding="utf-8")
+            readme = Path(manifest.cwd) / "README.md"
+            readme.write_text(readme.read_text(encoding="utf-8") + "recovered\n", encoding="utf-8")
+            _git(Path(manifest.cwd), ["add", "README.md"])
+            _git(Path(manifest.cwd), ["commit", "-F", str(commit_message_path)])
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(start_results=[], reply_results=[]),
+                diff_applier=FakeDiffApplier(applied=True),
+                git_committer=committer,
+            ).reconcile_accepted_review_terminalization(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "APPROVED")
+            self.assertEqual(len(committer.calls), 0)
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertIn("git_commit_completed", event_types)
+            recovered_commit_event = next(event for event in events if event["type"] == "git_commit_completed")
+            self.assertTrue(recovered_commit_event.get("recovered"))
+            self.assertEqual(event_types[-1], "run_terminal_status")
+
+    def test_reconcile_accepted_review_terminalization_apply_completed_false_marks_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            summary_path, patch_path = _write_review_patch_evidence(
+                repo=Path(manifest.cwd),
+                evidence_dir=store.run_dir(manifest.run_id) / "evidence",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.planner.status = "REVIEWING"
+            manifest.workers[0].status = "DONE"
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[str(summary_path), str(patch_path)],
+            )
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=False,
+                summary="Failed: git apply --check rejected the patch.",
+            )
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(start_results=[], reply_results=[]),
+                diff_applier=applier,
+                git_committer=committer,
+            ).reconcile_accepted_review_terminalization(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(result.planner.status, "FAILED")
+            self.assertEqual(result.workers[0].status, "FAILED")
+            self.assertEqual(len(applier.calls), 0)
+            self.assertEqual(len(committer.calls), 0)
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "FAILED")
+            self.assertEqual(events[-1]["reason"], "apply_failed")
+
+    def test_reconcile_accepted_review_terminalization_git_commit_failed_marks_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            summary_path, patch_path = _write_review_patch_evidence(
+                repo=Path(manifest.cwd),
+                evidence_dir=store.run_dir(manifest.run_id) / "evidence",
+            )
+            manifest.status = "REVIEWING"
+            manifest.planner.status = "REVIEWING"
+            manifest.workers[0].status = "DONE"
+            manifest.review = ReviewRecord(
+                decision="accepted",
+                reason="looks good",
+                evidence_files=[str(summary_path), str(patch_path)],
+            )
+            store.save(manifest)
+            store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=True,
+                summary="Patch applied successfully.",
+            )
+            store.append_event(
+                manifest.run_id,
+                "git_commit_failed",
+                "Git commit failed",
+                summary="Failed: git commit returned a non-zero exit code.",
+                reason="git_commit_failed",
+            )
+            applier = FakeDiffApplier(applied=True)
+            committer = FakeGitCommitter()
+
+            result = RunOrchestrator(
+                store=store,
+                driver=FakeDriver(start_results=[], reply_results=[]),
+                diff_applier=applier,
+                git_committer=committer,
+            ).reconcile_accepted_review_terminalization(store.load(manifest.run_id))
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(result.planner.status, "FAILED")
+            self.assertEqual(result.workers[0].status, "FAILED")
+            self.assertEqual(len(applier.calls), 0)
+            self.assertEqual(len(committer.calls), 0)
+            events = store.load_events(manifest.run_id)
+            self.assertEqual(events[-1]["type"], "run_terminal_status")
+            self.assertEqual(events[-1]["status"], "FAILED")
+            self.assertEqual(events[-1]["reason"], "git_commit_failed")
 
     def test_commit_failure_after_apply_marks_run_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2135,6 +2386,21 @@ def _create_manifest_from_store(root: Path, store: RunStore):
     manifest.workers[0].worktree_path = str(worktree)
     store.save(manifest)
     return store, manifest, worktree
+
+
+def _write_review_patch_evidence(*, repo: Path, evidence_dir: Path) -> tuple[Path, Path]:
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    readme = repo / "README.md"
+    original = readme.read_text(encoding="utf-8")
+    readme.write_text(original + "reviewed-change\n", encoding="utf-8")
+    patch = _git(repo, ["diff", "--binary", "HEAD", "--"])
+    summary = _git(repo, ["diff", "--stat", "HEAD", "--"]).strip() or "No diff."
+    readme.write_text(original, encoding="utf-8")
+    summary_path = evidence_dir / "git-diff-summary.md"
+    patch_path = evidence_dir / "git-diff.patch"
+    summary_path.write_text(summary + "\n", encoding="utf-8")
+    patch_path.write_text(patch, encoding="utf-8")
+    return summary_path, patch_path
 
 
 def _create_retry_e2e_repo(repo: Path) -> Path:

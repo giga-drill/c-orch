@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Protocol, Union
@@ -57,6 +59,11 @@ from .states import (
     TERMINAL_RUN_STATUSES,
     WORKER_ACTIVE,
     WORKER_DONE,
+)
+from .terminalization_recovery import (
+    EVENT_TERMINALIZATION_RECOVERY_REQUIRED,
+    accepted_review_needs_terminalization,
+    accepted_review_terminalization_requires_manual_recovery,
 )
 from .verification import VerificationReport, run_verification_commands
 from .worktrees import (
@@ -388,6 +395,183 @@ class RunOrchestrator:
             evidence=evidence,
             verification=verification,
         )
+
+    def reconcile_accepted_review_terminalization(self, manifest: RunManifest) -> RunManifest:
+        events = self.store.load_events(manifest.run_id)
+        if not accepted_review_needs_terminalization(manifest, events):
+            return manifest
+        if accepted_review_terminalization_requires_manual_recovery(manifest, events):
+            return manifest
+        worker = _single_worker(manifest)
+        if manifest.review is None or manifest.review.decision != "accepted":
+            raise OrchestratorError("accepted review terminalization requires accepted review evidence")
+        evidence = _evidence_from_review_record(manifest.review)
+        verification = _verification_from_review_record(manifest.review)
+        self._record_event(
+            manifest,
+            "accepted_terminalization_reconcile_started",
+            "Accepted-review terminalization reconcile started",
+            worker_id=worker.id,
+            attempt=worker.attempt,
+        )
+
+        events = self.store.load_events(manifest.run_id)
+        latest_apply_completed = self._latest_event_by_type(events=events, event_type="apply_completed")
+        if isinstance(latest_apply_completed, dict) and latest_apply_completed.get("applied") is not True:
+            self._transition_status(
+                manifest,
+                RUN_FAILED,
+                reason="apply_failed",
+                recovered_from="accepted_terminalization_reconcile",
+            )
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_terminal_status(manifest, reason="apply_failed")
+            self._save(manifest)
+            return manifest
+        has_apply_started = any(event.get("type") == "apply_started" for event in events if isinstance(event, dict))
+        has_apply_completed = isinstance(latest_apply_completed, dict)
+        if not has_apply_completed:
+            if not has_apply_started:
+                return self._apply_then_continue_terminalization(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                    verification=verification,
+                    replay=False,
+                )
+            apply_state = self._determine_partial_apply_state(manifest=manifest, evidence=evidence)
+            if apply_state == "already_applied":
+                self._record_event(
+                    manifest,
+                    "apply_completed",
+                    "Apply completed",
+                    applied=True,
+                    summary="Recovered: patch already applied in target repository.",
+                    recovered=True,
+                    source="accepted_terminalization_reconcile",
+                )
+            elif apply_state == "not_applied":
+                return self._apply_then_continue_terminalization(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                    verification=verification,
+                    replay=True,
+                )
+            else:
+                self._record_terminalization_manual_recovery_required(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                    waiting_for="apply",
+                    reason="cannot_prove_apply_boundary",
+                )
+                self._save(manifest)
+                return manifest
+
+        events = self.store.load_events(manifest.run_id)
+        latest_commit_failed = self._latest_event_by_type(events=events, event_type="git_commit_failed")
+        if isinstance(latest_commit_failed, dict):
+            self._transition_status(
+                manifest,
+                RUN_FAILED,
+                reason="git_commit_failed",
+                recovered_from="accepted_terminalization_reconcile",
+            )
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_terminal_status(manifest, reason="git_commit_failed")
+            self._save(manifest)
+            return manifest
+        has_commit_success_boundary = any(
+            isinstance(event, dict)
+            and str(event.get("type") or "") in {"git_commit_completed", "git_commit_skipped"}
+            for event in events
+        )
+        if not has_commit_success_boundary:
+            commit_marker = self._head_commit_terminalization_marker(
+                manifest=manifest,
+                worker=worker,
+            )
+            if commit_marker["matched"]:
+                self._record_event(
+                    manifest,
+                    "git_commit_completed",
+                    "Git commit completed",
+                    commit_hash=commit_marker["head"],
+                    summary="Recovered: HEAD commit already has this run's accepted-review marker.",
+                    recovered=True,
+                    source="accepted_terminalization_reconcile",
+                )
+            else:
+                commit_state = self._determine_commit_replay_state(manifest=manifest, evidence=evidence)
+                if commit_state != "safe_to_commit":
+                    self._record_terminalization_manual_recovery_required(
+                        manifest=manifest,
+                        worker=worker,
+                        evidence=evidence,
+                        waiting_for="commit",
+                        reason=commit_state,
+                    )
+                    self._save(manifest)
+                    return manifest
+                pre_apply_changed_paths = self._latest_apply_started_list_field(
+                    events=events,
+                    key="pre_apply_changed_paths",
+                ) or self.repo_changed_paths_collector(manifest.cwd)
+                pre_apply_staged_paths = self._latest_apply_started_list_field(
+                    events=events,
+                    key="pre_apply_staged_paths",
+                ) or self.repo_staged_paths_collector(manifest.cwd)
+                post_apply_changed_paths = self.repo_changed_paths_collector(manifest.cwd)
+                self._record_git_commit_started(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                    pre_apply_changed_paths=pre_apply_changed_paths,
+                    pre_apply_staged_paths=pre_apply_staged_paths,
+                    post_apply_changed_paths=post_apply_changed_paths,
+                    replay=True,
+                )
+                commit_report = self._commit_applied_diff(
+                    manifest=manifest,
+                    worker=worker,
+                    evidence=evidence,
+                    pre_apply_changed_paths=pre_apply_changed_paths,
+                    pre_apply_staged_paths=pre_apply_staged_paths,
+                    post_apply_changed_paths=post_apply_changed_paths,
+                )
+                if commit_report.failed:
+                    self._record_recovery_decision(
+                        manifest,
+                        classify_git_commit_failure(
+                            failure_reason=commit_report.failure_reason,
+                            summary=commit_report.summary,
+                            source=SOURCE_ORCHESTRATOR,
+                            attempt=worker.attempt,
+                        ),
+                    )
+                    self._transition_status(manifest, RUN_FAILED, reason="git_commit_failed")
+                    manifest.planner.status = RUN_FAILED
+                    worker.status = RUN_FAILED
+                    self._record_terminal_status(manifest, reason="git_commit_failed")
+                    self._save(manifest)
+                    return manifest
+
+        events = self.store.load_events(manifest.run_id)
+        has_terminal = any(event.get("type") == "run_terminal_status" for event in events if isinstance(event, dict))
+        if not has_terminal or manifest.status != RUN_APPROVED:
+            self._transition_status(
+                manifest,
+                RUN_APPROVED,
+                recovered_from="accepted_terminalization_reconcile",
+            )
+            manifest.planner.status = RUN_APPROVED
+            worker.status = RUN_APPROVED
+            self._record_terminal_status(manifest, reason="accepted_terminalization_recovered")
+            self._save(manifest)
+        return manifest
 
     def revise_plan(self, manifest: RunManifest, feedback: str) -> RunManifest:
         normalized_feedback = feedback.strip()
@@ -1317,6 +1501,221 @@ class RunOrchestrator:
             reason=reason,
         )
 
+    def _record_apply_started(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        pre_apply_changed_paths: List[str],
+        pre_apply_staged_paths: List[str],
+        replay: bool = False,
+    ) -> None:
+        self._record_event(
+            manifest,
+            "apply_started",
+            "Apply started",
+            worker_id=worker.id,
+            attempt=worker.attempt,
+            patch_path=str(evidence.patch_path),
+            patch_hash=_sha256_text(evidence.patch),
+            changed_paths=list(evidence.changed_paths),
+            pre_apply_changed_paths=list(pre_apply_changed_paths),
+            pre_apply_staged_paths=list(pre_apply_staged_paths),
+            replay=replay,
+        )
+
+    def _record_git_commit_started(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        pre_apply_changed_paths: List[str],
+        pre_apply_staged_paths: List[str],
+        post_apply_changed_paths: List[str],
+        replay: bool = False,
+    ) -> None:
+        self._record_event(
+            manifest,
+            "git_commit_started",
+            "Git commit started",
+            worker_id=worker.id,
+            attempt=worker.attempt,
+            patch_path=str(evidence.patch_path),
+            patch_hash=_sha256_text(evidence.patch),
+            changed_paths=list(evidence.changed_paths),
+            pre_apply_changed_paths=list(pre_apply_changed_paths),
+            pre_apply_staged_paths=list(pre_apply_staged_paths),
+            post_apply_changed_paths=list(post_apply_changed_paths),
+            replay=replay,
+        )
+
+    def _apply_then_continue_terminalization(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        verification: VerificationReport,
+        replay: bool,
+    ) -> RunManifest:
+        pre_apply_changed_paths = self.repo_changed_paths_collector(manifest.cwd)
+        pre_apply_staged_paths = self.repo_staged_paths_collector(manifest.cwd)
+        self._record_apply_started(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+            pre_apply_changed_paths=pre_apply_changed_paths,
+            pre_apply_staged_paths=pre_apply_staged_paths,
+            replay=replay,
+        )
+        apply_report = self._apply_reviewed_diff(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+        )
+        if not apply_report.applied:
+            self._record_recovery_decision(
+                manifest,
+                classify_apply_failure(
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                    error=apply_report.summary,
+                ),
+            )
+            self._transition_status(manifest, RUN_FAILED, reason="apply_failed")
+            manifest.planner.status = RUN_FAILED
+            worker.status = RUN_FAILED
+            self._record_terminal_status(manifest, reason="apply_failed")
+            self._save(manifest)
+            return manifest
+        return self.reconcile_accepted_review_terminalization(manifest)
+
+    def _determine_partial_apply_state(self, *, manifest: RunManifest, evidence: DiffEvidence) -> str:
+        if not evidence.patch.strip():
+            return "already_applied"
+        reverse_ok = self._git_apply_check(manifest.cwd, evidence.patch, reverse=True)
+        if reverse_ok:
+            return "already_applied"
+        forward_ok = self._git_apply_check(manifest.cwd, evidence.patch, reverse=False)
+        if forward_ok:
+            return "not_applied"
+        return "unknown"
+
+    def _determine_commit_replay_state(self, *, manifest: RunManifest, evidence: DiffEvidence) -> str:
+        changed_paths = set(self.repo_changed_paths_collector(manifest.cwd))
+        if not changed_paths:
+            return "cannot_prove_commit_boundary"
+        planned_paths = {_normalize_repo_path(path) for path in evidence.changed_paths if path}
+        if not planned_paths:
+            return "cannot_prove_commit_boundary"
+        if changed_paths.issubset(planned_paths):
+            return "safe_to_commit"
+        return "cannot_prove_commit_boundary"
+
+    def _head_commit_terminalization_marker(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+    ) -> dict[str, Optional[str] | bool]:
+        result = {"matched": False, "head": None, "message": None}
+        try:
+            completed = _git_process(["log", "-1", "--pretty=%B"], cwd=Path(manifest.cwd).expanduser().resolve())
+            if completed.returncode != 0:
+                return result
+            message = completed.stdout or ""
+            head = _git_process(["rev-parse", "HEAD"], cwd=Path(manifest.cwd).expanduser().resolve())
+            head_hash = head.stdout.strip() if head.returncode == 0 else None
+            markers = (
+                f"Run-ID: {manifest.run_id}",
+                f"Worker-ID: {worker.id}",
+                "Planner-Review: accepted",
+            )
+            matched = all(marker in message for marker in markers)
+            result["matched"] = matched
+            result["head"] = head_hash
+            result["message"] = message
+            return result
+        except Exception:
+            return result
+
+    def _latest_apply_started_list_field(self, *, events: List[dict[str, Any]], key: str) -> List[str]:
+        for event in reversed(events):
+            if not isinstance(event, dict) or event.get("type") != "apply_started":
+                continue
+            raw = event.get(key)
+            if not isinstance(raw, list):
+                continue
+            return [str(value) for value in raw]
+        return []
+
+    def _latest_event_by_type(
+        self,
+        *,
+        events: List[dict[str, Any]],
+        event_type: str,
+    ) -> Optional[dict[str, Any]]:
+        for event in reversed(events):
+            if isinstance(event, dict) and event.get("type") == event_type:
+                return event
+        return None
+
+    def _record_terminalization_manual_recovery_required(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        evidence: DiffEvidence,
+        waiting_for: str,
+        reason: str,
+    ) -> None:
+        events = self.store.load_events(manifest.run_id)
+        changed_paths = self.repo_changed_paths_collector(manifest.cwd)
+        staged_paths = self.repo_staged_paths_collector(manifest.cwd)
+        marker = self._head_commit_terminalization_marker(manifest=manifest, worker=worker)
+        latest_manual = None
+        for event in reversed(events):
+            if isinstance(event, dict) and event.get("type") == EVENT_TERMINALIZATION_RECOVERY_REQUIRED:
+                latest_manual = event
+                break
+        fingerprint = {
+            "waiting_for": waiting_for,
+            "reason": reason,
+            "changed_paths": changed_paths,
+            "staged_paths": staged_paths,
+            "head": marker.get("head"),
+            "patch_hash": _sha256_text(evidence.patch),
+        }
+        if latest_manual is not None and all(latest_manual.get(key) == value for key, value in fingerprint.items()):
+            return
+        self._record_event(
+            manifest,
+            EVENT_TERMINALIZATION_RECOVERY_REQUIRED,
+            "Accepted-review terminalization requires manual recovery.",
+            worker_id=worker.id,
+            attempt=worker.attempt,
+            waiting_for=waiting_for,
+            reason=reason,
+            action="manual_terminalization_recovery",
+            changed_paths=changed_paths,
+            staged_paths=staged_paths,
+            patch_path=str(evidence.patch_path),
+            patch_hash=_sha256_text(evidence.patch),
+            head=marker.get("head"),
+            head_message=marker.get("message"),
+            marker_matched=bool(marker.get("matched")),
+            review_evidence_files=list(manifest.review.evidence_files) if manifest.review is not None else [],
+        )
+
+    def _git_apply_check(self, repo_path: str, patch: str, *, reverse: bool) -> bool:
+        command = ["apply", "--check", "--binary", "-"]
+        if reverse:
+            command.insert(1, "--reverse")
+        completed = _git_process(command, cwd=Path(repo_path).expanduser().resolve(), stdin=patch)
+        return completed.returncode == 0
+
     def _has_event(self, manifest: RunManifest, event_type: str) -> bool:
         return any(
             isinstance(event, dict) and event.get("type") == event_type
@@ -1406,6 +1805,13 @@ class RunOrchestrator:
 
         pre_apply_changed_paths = self.repo_changed_paths_collector(manifest.cwd)
         pre_apply_staged_paths = self.repo_staged_paths_collector(manifest.cwd)
+        self._record_apply_started(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+            pre_apply_changed_paths=pre_apply_changed_paths,
+            pre_apply_staged_paths=pre_apply_staged_paths,
+        )
         apply_report = self._apply_reviewed_diff(
             manifest=manifest,
             worker=worker,
@@ -1427,12 +1833,22 @@ class RunOrchestrator:
             self._save(manifest)
             return manifest
 
+        post_apply_changed_paths = self.repo_changed_paths_collector(manifest.cwd)
+        self._record_git_commit_started(
+            manifest=manifest,
+            worker=worker,
+            evidence=evidence,
+            pre_apply_changed_paths=pre_apply_changed_paths,
+            pre_apply_staged_paths=pre_apply_staged_paths,
+            post_apply_changed_paths=post_apply_changed_paths,
+        )
         commit_report = self._commit_applied_diff(
             manifest=manifest,
             worker=worker,
             evidence=evidence,
             pre_apply_changed_paths=pre_apply_changed_paths,
             pre_apply_staged_paths=pre_apply_staged_paths,
+            post_apply_changed_paths=post_apply_changed_paths,
         )
         if commit_report.failed:
             self._record_recovery_decision(
@@ -1466,6 +1882,7 @@ class RunOrchestrator:
         evidence: DiffEvidence,
         pre_apply_changed_paths: List[str],
         pre_apply_staged_paths: List[str],
+        post_apply_changed_paths: Optional[List[str]] = None,
     ) -> GitCommitReport:
         review_decision = "accepted"
         review_reason: Optional[str] = None
@@ -1484,7 +1901,9 @@ class RunOrchestrator:
             changed_paths=list(evidence.changed_paths),
             pre_apply_changed_paths=list(pre_apply_changed_paths),
             pre_apply_staged_paths=list(pre_apply_staged_paths),
-            post_apply_changed_paths=self.repo_changed_paths_collector(manifest.cwd),
+            post_apply_changed_paths=list(post_apply_changed_paths)
+            if post_apply_changed_paths is not None
+            else self.repo_changed_paths_collector(manifest.cwd),
         )
         worker.evidence_files = _append_unique(worker.evidence_files, commit_report.evidence_files)
         if manifest.review is not None:
@@ -1760,6 +2179,25 @@ def _effective_codex_binary_path(manifest: RunManifest, driver: CodexDriver) -> 
     if isinstance(driver_path, str) and driver_path.strip():
         return driver_path
     return manifest.codex_binary_path or manifest.planner.codex_binary_path
+
+
+def _git_process(
+    args: List[str],
+    *,
+    cwd: Path,
+    stdin: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _verification_has_failures(report: VerificationReport) -> bool:

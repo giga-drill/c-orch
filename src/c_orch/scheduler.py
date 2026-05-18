@@ -13,6 +13,10 @@ from .failure_policy import (
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
 from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
+from .terminalization_recovery import (
+    accepted_review_needs_terminalization,
+    accepted_review_terminalization_requires_manual_recovery,
+)
 from .task_lifecycle import (
     REASON_PLAN_REVIEW_OUTSIDE_PROPOSAL_POOL,
     derive_queue_status,
@@ -47,6 +51,9 @@ class OrchestratorLike(Protocol):
         ...
 
     def retry_review(self, manifest: RunManifest) -> RunManifest:
+        ...
+
+    def reconcile_accepted_review_terminalization(self, manifest: RunManifest) -> RunManifest:
         ...
 
 
@@ -116,12 +123,14 @@ class TaskScheduler:
         if reconcile_queue(
             queue,
             run_loader=self.run_store.load,
+            run_events_loader=self.run_store.load_events,
             now_iso=self.run_store.now_iso,
         ):
             self.task_store.save(queue)
         orchestrator = self._orchestrator_factory()
         processed = 0
         attempted_retry_review_run_ids: set[str] = set()
+        attempted_terminalization_run_ids: set[str] = set()
 
         while True:
             if queue.status in {QUEUE_FAILED, QUEUE_BLOCKED, QUEUE_RESTART_REQUIRED}:
@@ -139,6 +148,7 @@ class TaskScheduler:
                 return queue
             if task.active_run_id:
                 active = self._load_active_run(task.active_run_id)
+                active_events = self.run_store.load_events(active.run_id) if active is not None else []
                 if active is not None:
                     context_updated = False
                     if active.task_id != task.task_id:
@@ -149,6 +159,48 @@ class TaskScheduler:
                         context_updated = True
                     if context_updated:
                         self.run_store.save(active)
+                if active is not None and accepted_review_needs_terminalization(active, active_events):
+                    if accepted_review_terminalization_requires_manual_recovery(active, active_events):
+                        self.task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_WAITING,
+                            error=None,
+                            reason="manual_terminalization_recovery",
+                        )
+                        queue.status = QUEUE_RUNNING
+                        self.task_store.save(queue)
+                        return queue
+                    if active.run_id in attempted_terminalization_run_ids:
+                        queue.status = QUEUE_RUNNING
+                        self.task_store.save(queue)
+                        return queue
+                    attempted_terminalization_run_ids.add(active.run_id)
+                    self.task_store.update_task(
+                        queue,
+                        task.task_id,
+                        status=TASK_WAITING,
+                        error=None,
+                        reason="accepted_terminalization_recovery",
+                    )
+                    self.task_store.save(queue)
+                    try:
+                        active = orchestrator.reconcile_accepted_review_terminalization(active)
+                    except Exception as exc:
+                        queue.status = QUEUE_FAILED
+                        self.task_store.update_task(
+                            queue,
+                            task.task_id,
+                            status=TASK_FAILED,
+                            error=str(exc),
+                            reason="orchestrator_exception",
+                        )
+                        self.task_store.save(queue)
+                        raise
+                    if self._handle_manifest_result(queue=queue, task=task, manifest=active):
+                        processed += 1
+                        continue
+                    return queue
                 if active is not None and active.status == RUN_PLAN_APPROVED:
                     self.task_store.update_task(
                         queue,
@@ -365,8 +417,15 @@ class TaskScheduler:
         reconcile_task_with_active_run(
             task,
             active_run=manifest,
+            active_run_events=self.run_store.load_events(manifest.run_id),
             completed_at=self.run_store.now_iso(),
         )
+
+        events = self.run_store.load_events(manifest.run_id)
+        if accepted_review_needs_terminalization(manifest, events):
+            queue.status = QUEUE_RUNNING
+            self.task_store.save(queue)
+            return False
 
         if manifest.status == RUN_APPROVED:
             if manifest.requires_restart:

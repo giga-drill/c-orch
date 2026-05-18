@@ -83,6 +83,7 @@ User task
 - `TaskStore` 保存 `.c-orch/tasks/queue.json`；task 记录可持久化可选 `cwd`。queue scheduler 创建新 run/worktree 时优先使用 `task.cwd`，缺省才回退 runtime `--cwd`。
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
+- 对 `review.decision=accepted` 的 run，`RunOrchestrator` 现在支持 terminalization reconcile：当 `apply/commit/run_terminal_status` 边界事件缺失时，可在 runtime 启动或 scheduler 唤醒后按幂等边界继续 apply -> commit -> terminal；若无法证明 apply/commit 是否已发生，则写入 manual recovery 事件并在 UI/API 暴露人工恢复等待点。
 - `COrchRuntime` 是 dashboard 后端控制面入口。前端/HTTP handler 只负责展示状态和转发用户意图，action 校验、Codex driver 创建、Orchestrator 调用和 manifest 更新都在 runtime 层完成。dashboard server 会在进程生命周期内保留同一个 runtime，并可复用长活 MCP driver；但 MCP 内存状态只作为 cache，可靠恢复仍以 manifest、event log、Codex thread id 和 `codex exec resume` 为准。
 - `task_lifecycle.py` 将 Task 作为用户级状态机、Run 作为一次执行 attempt。它负责从 `active_run_id` 收敛 task/queue 状态，并派生 `waiting_for` / `next_action`。例如 active run 进入 `FAILED` 后，task 会收敛为 `FAILED`，queue 为 `FAILED`，等待点为 `retry_task`，而不是继续卡在 `RUNNING`。`queue retry <task_id>` 和 dashboard 的“重新排队”会保留旧 `run_ids`、清空 `active_run_id`、把 task 设回 `PENDING`。当 dashboard backend 拥有执行配置时，队首 `PENDING` task 会自动触发 scheduler 创建新的 run attempt；`queue run` 仍是手动触发同一调度路径的 CLI 入口。
 - `failure_policy.py` 将可恢复异常从业务状态机中拆出。比如 Planner review 的 Codex session 丢失时，run 保持 `WORK_DONE`，review attempt 记录 `FAILED_RETRYABLE`，UI/CLI 再提供重试动作。

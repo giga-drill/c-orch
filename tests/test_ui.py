@@ -120,6 +120,26 @@ class UiTests(unittest.TestCase):
                 summary="2 of 3 verification command(s) failed.",
                 reason="verification_failed",
             )
+            store.append_event(
+                manifest.run_id,
+                "apply_completed",
+                "Apply completed",
+                applied=True,
+                summary="Applied reviewed diff.",
+            )
+            store.append_event(
+                manifest.run_id,
+                "git_commit_completed",
+                "Git commit completed",
+                commit_hash="abc123",
+                summary="Committed applied changes.",
+            )
+            store.append_event(
+                manifest.run_id,
+                "run_terminal_status",
+                "Run finished with APPROVED",
+                status="APPROVED",
+            )
 
             payload = build_run_payload(root / "runs", manifest.run_id)
 
@@ -396,6 +416,90 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["current_waiting_point"], "planner_review_retry")
             self.assertEqual(loaded.tasks[0].status, "RUNNING")
             self.assertIsNone(loaded.tasks[0].reason)
+
+    def test_build_queue_payload_derives_accepted_terminalization_recovery_waiting_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(decision="accepted", reason="looks good")
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["tasks"][0]["status"], "WAITING")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "accepted_terminalization_recovery")
+            self.assertEqual(payload["tasks"][0]["next_action"], "accepted_terminalization_recovery")
+            self.assertEqual(payload["summary"]["current_waiting_point"], "accepted_terminalization_recovery")
+            run_payload = build_run_payload(root / "runs", manifest.run_id)
+            assert run_payload is not None
+            self.assertEqual(run_payload["run"]["waiting_for"], "accepted_terminalization_recovery")
+
+    def test_build_queue_payload_derives_manual_terminalization_recovery_waiting_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORK_DONE"
+            manifest.review = ReviewRecord(decision="accepted", reason="looks good")
+            run_store.save(manifest)
+            run_store.append_event(
+                manifest.run_id,
+                "accepted_terminalization_recovery_required",
+                "Accepted-review terminalization requires manual recovery.",
+                waiting_for="commit",
+                reason="cannot_prove_commit_boundary",
+                action="manual_terminalization_recovery",
+            )
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="RUNNING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            payload = build_queue_payload(root / "queue.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["tasks"][0]["status"], "WAITING")
+            self.assertEqual(payload["tasks"][0]["waiting_for"], "manual_terminalization_recovery")
+            self.assertEqual(payload["tasks"][0]["allowed_actions"], ["manual-terminalization-recovery"])
+            run_payload = build_run_payload(root / "runs", manifest.run_id)
+            assert run_payload is not None
+            self.assertEqual(run_payload["run"]["waiting_for"], "manual_terminalization_recovery")
+            self.assertEqual(run_payload["run"]["allowed_actions"], ["manual-terminalization-recovery"])
+            self.assertEqual(
+                run_payload["run"]["terminalization_recovery"]["action"],
+                "manual-terminalization-recovery",
+            )
 
     def test_build_state_payload_includes_version_and_runtime_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

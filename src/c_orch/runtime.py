@@ -39,6 +39,10 @@ from .states import (
     RUN_PLAN_APPROVED,
     RUN_PLAN_REVIEW_REQUIRED,
 )
+from .terminalization_recovery import (
+    accepted_review_needs_terminalization,
+    accepted_review_terminalization_requires_manual_recovery,
+)
 from .task_lifecycle import (
     derive_run_waiting_for,
     mark_task_handled_skipped,
@@ -130,8 +134,15 @@ class COrchRuntime:
         self._runtime_generation = f"{datetime.now().astimezone().isoformat(timespec='seconds')}:{os.getpid()}"
         if self.proposals_path is not None:
             prune_queued_proposals(self.proposals_path)
-        if self.proposals_path is not None and self._scheduler_config is not None:
-            self.dispatch_proposals_async()
+        if self._scheduler_config is not None:
+            if self.queue_path is not None:
+                try:
+                    reconcile_queue_file(queue_path=self.queue_path, runs_dir=self.runs_dir)
+                except Exception:
+                    pass
+                self.dispatch_queue_async()
+            if self.proposals_path is not None:
+                self.dispatch_proposals_async()
 
     def build_runs_payload(self) -> Dict[str, Any]:
         return dashboard_payloads.build_runs_payload(self.runs_dir)
@@ -316,7 +327,7 @@ class COrchRuntime:
             return False
         with self._dispatch_lock:
             if self._dispatch_thread is not None and self._dispatch_thread.is_alive():
-                return False
+                return True
             self._last_dispatch_error = None
             thread = threading.Thread(
                 target=self._dispatch_queue_worker,
@@ -368,7 +379,7 @@ class COrchRuntime:
             return False
         with self._proposal_dispatch_lock:
             if self._proposal_dispatch_thread is not None and self._proposal_dispatch_thread.is_alive():
-                return False
+                return True
             self._last_proposal_dispatch_error = None
             thread = threading.Thread(
                 target=self._dispatch_proposals_worker,
@@ -492,7 +503,12 @@ class COrchRuntime:
                 queue = task_store.load()
             except (OSError, ValueError):
                 return
-            reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+            reconcile_queue(
+                queue,
+                run_loader=run_store.load,
+                run_events_loader=run_store.load_events,
+                now_iso=run_store.now_iso,
+            )
             restart_gate = self._detect_restart_gate(queue=queue, run_store=run_store)
             if restart_gate.active:
                 task_store.save(queue)
@@ -540,6 +556,11 @@ class COrchRuntime:
                 continue
             active = self._load_task_active_run(task, run_store=run_store)
             if active is not None:
+                active_events = run_store.load_events(active.run_id)
+                if accepted_review_needs_terminalization(active, active_events):
+                    if not accepted_review_terminalization_requires_manual_recovery(active, active_events):
+                        candidates.append((lane_id, task))
+                    continue
                 retry_review_decision = classify_retryable_review_failure(
                     active,
                     source=SOURCE_QUEUE_SCHEDULER,
@@ -609,7 +630,12 @@ class COrchRuntime:
                 items=[],
                 message=None,
             )
-        reconcile_queue(loaded, run_loader=store.load, now_iso=store.now_iso)
+        reconcile_queue(
+            loaded,
+            run_loader=store.load,
+            run_events_loader=store.load_events,
+            now_iso=store.now_iso,
+        )
         return detect_restart_gate(loaded, run_loader=store.load)
 
     def _run_queue_lane_worker(self, *, lane_id: str, task_id: str) -> None:
@@ -646,31 +672,60 @@ class COrchRuntime:
             queue = task_store.load()
             restart_gate = self._detect_restart_gate(queue=queue, run_store=run_store)
             if restart_gate.active:
-                reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                reconcile_queue(
+                    queue,
+                    run_loader=run_store.load,
+                    run_events_loader=run_store.load_events,
+                    now_iso=run_store.now_iso,
+                )
                 task_store.save(queue)
                 return
             task = _find_task_record(queue, task_id)
             if task.active_run_id:
                 manifest = run_store.load(task.active_run_id)
+                active_events = run_store.load_events(manifest.run_id)
+                if accepted_review_needs_terminalization(manifest, active_events):
+                    if accepted_review_terminalization_requires_manual_recovery(manifest, active_events):
+                        reconcile_task_with_active_run(
+                            task,
+                            active_run=manifest,
+                            active_run_events=active_events,
+                            completed_at=run_store.now_iso(),
+                        )
+                        reconcile_queue(
+                            queue,
+                            run_loader=run_store.load,
+                            run_events_loader=run_store.load_events,
+                            now_iso=run_store.now_iso,
+                        )
+                        task_store.save(queue)
+                        return
+                    action = "accepted_terminalization_reconcile"
                 retry_review_decision = classify_retryable_review_failure(
                     manifest,
                     source=SOURCE_QUEUE_SCHEDULER,
                 )
-                if (
+                if action != "accepted_terminalization_reconcile" and (
                     retry_review_decision is not None
                     and retry_review_decision.recovery_action == "retry_review"
                     and retry_review_decision.automatic
                 ):
                     action = "retry_review"
-                elif manifest.status == RUN_PLAN_APPROVED:
+                elif action != "accepted_terminalization_reconcile" and manifest.status == RUN_PLAN_APPROVED:
                     action = "run"
-                else:
+                elif action != "accepted_terminalization_reconcile":
                     reconcile_task_with_active_run(
                         task,
                         active_run=manifest,
+                        active_run_events=active_events,
                         completed_at=run_store.now_iso(),
                     )
-                    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                    reconcile_queue(
+                        queue,
+                        run_loader=run_store.load,
+                        run_events_loader=run_store.load_events,
+                        now_iso=run_store.now_iso,
+                    )
                     task_store.save(queue)
                     return
                 context_updated = False
@@ -744,7 +799,12 @@ class COrchRuntime:
                         error=str(exc),
                         reason="run_prepare_failed",
                     )
-                    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                    reconcile_queue(
+                        queue,
+                        run_loader=run_store.load,
+                        run_events_loader=run_store.load_events,
+                        now_iso=run_store.now_iso,
+                    )
                     task_store.save(queue)
                     return
         if manifest is None:
@@ -768,6 +828,15 @@ class COrchRuntime:
                         action="retry-review",
                     )
                     manifest = orchestrator.retry_review(manifest)
+                elif action == "accepted_terminalization_reconcile":
+                    run_store.append_event(
+                        manifest.run_id,
+                        "queue_auto_terminalization_reconcile_started",
+                        "Queue scheduler started accepted-review terminalization reconcile",
+                        source=SOURCE_QUEUE_SCHEDULER,
+                        action="accepted-terminalization-reconcile",
+                    )
+                    manifest = orchestrator.reconcile_accepted_review_terminalization(manifest)
                 else:
                     manifest = orchestrator.run(manifest)
         except Exception as exc:
@@ -781,7 +850,12 @@ class COrchRuntime:
                     error=str(exc),
                     reason="orchestrator_exception",
                 )
-                reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+                reconcile_queue(
+                    queue,
+                    run_loader=run_store.load,
+                    run_events_loader=run_store.load_events,
+                    now_iso=run_store.now_iso,
+                )
                 task_store.save(queue)
             return
         with self._queue_lock:
@@ -790,9 +864,15 @@ class COrchRuntime:
             reconcile_task_with_active_run(
                 task,
                 active_run=manifest,
+                active_run_events=run_store.load_events(manifest.run_id),
                 completed_at=run_store.now_iso(),
             )
-            reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+            reconcile_queue(
+                queue,
+                run_loader=run_store.load,
+                run_events_loader=run_store.load_events,
+                now_iso=run_store.now_iso,
+            )
             task_store.save(queue)
 
     def _build_queue_orchestrator(self, *, run_store: RunStore, driver: CodexDriver) -> OrchestratorLike:
@@ -1425,7 +1505,12 @@ def task_action(
         return None
     if runs_dir is not None:
         run_store = RunStore(Path(runs_dir).expanduser().resolve())
-        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+        reconcile_queue(
+            queue,
+            run_loader=run_store.load,
+            run_events_loader=run_store.load_events,
+            now_iso=run_store.now_iso,
+        )
     if action == "retry-verification":
         if runs_dir is None:
             return HTTPStatus.BAD_REQUEST, {"error": "missing runs_dir"}
@@ -1444,7 +1529,12 @@ def task_action(
         if int(status) >= 400:
             return status, payload
         run_store = RunStore(Path(runs_dir).expanduser().resolve())
-        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+        reconcile_queue(
+            queue,
+            run_loader=run_store.load,
+            run_events_loader=run_store.load_events,
+            now_iso=run_store.now_iso,
+        )
         store.save(queue)
         queue_payload = dashboard_payloads.build_queue_payload(queue_file, runs_dir=runs_dir)
         queue_payload["transition"] = {
@@ -1550,7 +1640,12 @@ def queue_action(
             previous_restart_paths=previous_restart_paths,
         )
 
-    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    reconcile_queue(
+        queue,
+        run_loader=run_store.load,
+        run_events_loader=run_store.load_events,
+        now_iso=run_store.now_iso,
+    )
     queue_store.save(queue)
     payload = dashboard_payloads.build_queue_payload(queue_file, runs_dir=runs_path)
     payload["transition"] = {
@@ -2358,7 +2453,12 @@ def reconcile_queue_file(*, queue_path: Pathish, runs_dir: Pathish) -> bool:
     store = TaskStore(queue_file)
     queue = store.load()
     run_store = RunStore(runs_path)
-    changed = reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    changed = reconcile_queue(
+        queue,
+        run_loader=run_store.load,
+        run_events_loader=run_store.load_events,
+        now_iso=run_store.now_iso,
+    )
     if changed:
         store.save(queue)
     return changed

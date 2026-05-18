@@ -36,7 +36,17 @@ from .states import (
     RUN_STATUS_ORDER,
     TERMINAL_RUN_STATUSES,
 )
-from .task_lifecycle import derive_run_waiting_for, derive_task_progress, reconcile_queue
+from .terminalization_recovery import (
+    WAITING_MANUAL_TERMINALIZATION_RECOVERY,
+    accepted_review_terminalization_requires_manual_recovery,
+    latest_terminalization_recovery_required_event,
+)
+from .task_lifecycle import (
+    derive_run_waiting_for,
+    derive_run_waiting_for_with_events,
+    derive_task_progress,
+    reconcile_queue,
+)
 from .task_store import TASK_SKIPPED, TaskStore
 from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
 
@@ -203,7 +213,12 @@ def _restart_gate_payload(*, queue_path: Optional[Path], runs_dir: Path) -> Dict
             "items": [],
         }
     run_store = RunStore(runs_dir)
-    reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+    reconcile_queue(
+        queue,
+        run_loader=run_store.load,
+        run_events_loader=run_store.load_events,
+        now_iso=run_store.now_iso,
+    )
     return detect_restart_gate(queue, run_loader=run_store.load).to_payload()
 
 
@@ -233,7 +248,12 @@ def build_queue_payload(
         }
     run_store = RunStore(Path(runs_dir).expanduser().resolve()) if runs_dir is not None else None
     if run_store is not None:
-        reconcile_queue(queue, run_loader=run_store.load, now_iso=run_store.now_iso)
+        reconcile_queue(
+            queue,
+            run_loader=run_store.load,
+            run_events_loader=run_store.load_events,
+            now_iso=run_store.now_iso,
+        )
     tasks = _annotate_task_lane_waits([_summarize_task(task, run_store=run_store) for task in queue.tasks])
     return {
         "queue_file": str(queue_file),
@@ -468,7 +488,8 @@ def _summarize_manifest(
     )
     updated_at = str(manifest.get("updated_at", ""))
     created_at = str(manifest.get("created_at", ""))
-    waiting_for = _derive_manifest_waiting_for(manifest)
+    waiting_for = _derive_manifest_waiting_for(manifest, event_list)
+    terminalization_recovery = _terminalization_recovery_summary(manifest, event_list)
     service_tiers = _service_tier_summary(manifest, workers=workers, review_attempts=review_attempts)
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
     timing = build_timing_summary(manifest, events or [], now_iso=now_iso)
@@ -480,6 +501,7 @@ def _summarize_manifest(
         "waiting_for": waiting_for,
         "next_action": waiting_for,
         "allowed_actions": allowed_actions,
+        "terminalization_recovery": terminalization_recovery,
         "requires_restart": bool(manifest.get("requires_restart", False)),
         "restart_reason": manifest.get("restart_reason"),
         "restart_paths": _list_value(manifest.get("restart_paths")),
@@ -585,7 +607,11 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         except OSError:
             active_run = None
     task_cwd = task.cwd or (active_run.cwd if active_run is not None else None)
-    progress = derive_task_progress(task, active_run=active_run)
+    progress = derive_task_progress(
+        task,
+        active_run=active_run,
+        active_run_events=active_run_events,
+    )
     last_error_event = _last_error_event(active_run_events)
     return {
         "task_id": task.task_id,
@@ -785,6 +811,11 @@ def _allowed_run_actions(manifest: Dict[str, Any], events: List[Dict[str, Any]])
         actions.append("retry-review")
     if has_retryable_verification_failure_dict(manifest, events):
         actions.append("retry-verification")
+    if accepted_review_terminalization_requires_manual_recovery(
+        RunManifest.from_dict(manifest),
+        events,
+    ):
+        actions.append("manual-terminalization-recovery")
     return actions
 
 
@@ -794,6 +825,11 @@ def _allowed_task_actions(
     active_run: Optional[RunManifest] = None,
     events: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
+    if (
+        active_run is not None
+        and accepted_review_terminalization_requires_manual_recovery(active_run, events or [])
+    ):
+        return ["manual-terminalization-recovery"]
     if getattr(task, "status", None) == "FAILED":
         actions: List[str] = []
         if active_run is not None and has_retryable_verification_failure(active_run, events or []):
@@ -816,9 +852,12 @@ def _task_failure_summary(task: Any, last_error_event: Optional[Dict[str, Any]])
     return None
 
 
-def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:
+def _derive_manifest_waiting_for(manifest: Dict[str, Any], events: List[Dict[str, Any]]) -> str:
     try:
-        return derive_run_waiting_for(RunManifest.from_dict(manifest))
+        return derive_run_waiting_for_with_events(
+            RunManifest.from_dict(manifest),
+            events=events,
+        )
     except Exception:
         status = str(manifest.get("status", ""))
         if status == "APPROVED":
@@ -826,6 +865,37 @@ def _derive_manifest_waiting_for(manifest: Dict[str, Any]) -> str:
         if status == "FAILED":
             return "failed"
         return "planner"
+
+
+def _terminalization_recovery_summary(
+    manifest: Dict[str, Any],
+    events: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    try:
+        run = RunManifest.from_dict(manifest)
+    except Exception:
+        return None
+    if not accepted_review_terminalization_requires_manual_recovery(run, events):
+        return None
+    latest = latest_terminalization_recovery_required_event(events)
+    if not isinstance(latest, dict):
+        return {
+            "waiting_for": WAITING_MANUAL_TERMINALIZATION_RECOVERY,
+            "action": "manual-terminalization-recovery",
+            "reason": "manual_recovery_required",
+        }
+    return {
+        "waiting_for": str(latest.get("waiting_for") or WAITING_MANUAL_TERMINALIZATION_RECOVERY),
+        "action": "manual-terminalization-recovery",
+        "reason": latest.get("reason"),
+        "changed_paths": _list_value(latest.get("changed_paths")),
+        "staged_paths": _list_value(latest.get("staged_paths")),
+        "head": latest.get("head"),
+        "patch_hash": latest.get("patch_hash"),
+        "patch_path": latest.get("patch_path"),
+        "marker_matched": latest.get("marker_matched"),
+        "review_evidence_files": _list_value(latest.get("review_evidence_files")),
+    }
 
 
 def _latest_revision_request_summary(

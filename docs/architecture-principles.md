@@ -233,7 +233,8 @@ FAILED
 ```
 
 `BLOCKED` is retained only for legacy or exceptional queue records. Detailed
-waiting points such as `planner_review_retry`, `worker_rework`, and
+waiting points such as `planner_review_retry`, `worker_rework`,
+`accepted_terminalization_recovery`, `manual_terminalization_recovery`, and
 `retry_task` are derived values, not separate task statuses.
 `human_plan_review` belongs to the optional proposal-review policy; if an
 execution-queue task reaches it, c-orch treats that as a flow-boundary
@@ -250,6 +251,17 @@ dashboard backend has execution config and the task is the first incomplete
 task, the backend scheduler should automatically create the next run attempt.
 The CLI `queue run` command remains the explicit manual entrypoint for the same
 scheduler path.
+
+Accepted Planner review terminalization is controller-owned durable recovery,
+not a third Planner review outcome. If `review.decision=accepted` is already
+durable but `apply_completed`, `git_commit_completed/git_commit_skipped`, or
+`run_terminal_status` is missing, runtime startup and scheduler wakeup must run
+idempotent reconcile from the next provable boundary. The controller must write
+durable `*_started` boundary events before apply/commit side effects, then
+write completed/failed events after each side effect. If c-orch cannot prove
+whether apply or commit already happened, it must not replay dangerous side
+effects automatically; instead it records manual terminalization recovery
+evidence and exposes that waiting point in API/UI payloads.
 
 ## Apply Boundary
 
