@@ -104,7 +104,8 @@ this mode; its root page only points back to the Vite dev UI.
 
 For self-modifying Cork runs, prefer the supervised dashboard. It starts the
 same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the
-child, and then clears the restart gate through the backend queue action:
+child after active queue/proposal dispatch drains, and then clears the restart
+gate through the backend queue action:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \

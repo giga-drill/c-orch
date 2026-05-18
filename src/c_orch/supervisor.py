@@ -29,6 +29,9 @@ class DashboardClient(Protocol):
     def get_queue(self) -> Mapping[str, Any]:
         ...
 
+    def get_state(self) -> Mapping[str, Any]:
+        ...
+
     def confirm_runtime_restarted(self) -> Mapping[str, Any]:
         ...
 
@@ -46,6 +49,13 @@ class SupervisorConfig:
     stop_timeout_seconds: float = 10.0
 
 
+@dataclass(frozen=True)
+class BackendPayload:
+    payload: Mapping[str, Any]
+    state_supported: bool
+    state_available: bool
+
+
 class HttpDashboardClient:
     def __init__(self, base_url: str, *, timeout_seconds: float = 5.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -53,6 +63,9 @@ class HttpDashboardClient:
 
     def get_queue(self) -> Mapping[str, Any]:
         return self._request_json("GET", "/api/queue")
+
+    def get_state(self) -> Mapping[str, Any]:
+        return self._request_json("GET", "/api/state")
 
     def confirm_runtime_restarted(self) -> Mapping[str, Any]:
         return self._request_json(
@@ -157,10 +170,19 @@ class DashboardSupervisor:
             self.restart()
             return "runtime-restarted"
 
-        payload = self.client.get_queue()
+        backend = self._backend_payload()
+        payload = backend.payload
         if not is_restart_required(payload):
             self._last_restarted_gate_key = None
             return "idle"
+
+        if backend.state_supported and not backend.state_available:
+            print(
+                "supervisor: restart gate present but runtime state is unavailable; "
+                "waiting for a safe state read before restart",
+                flush=True,
+            )
+            return "restart-state-unavailable"
 
         gate_key = restart_gate_key(payload)
         if gate_key == self._last_restarted_gate_key:
@@ -171,6 +193,15 @@ class DashboardSupervisor:
             )
             return "restart-gate-already-handled"
 
+        drain_reasons = restart_drain_reasons(payload)
+        if drain_reasons:
+            print(
+                "supervisor: restart gate present; runtime still draining "
+                f"({', '.join(drain_reasons)})",
+                flush=True,
+            )
+            return "restart-draining"
+
         print("supervisor: restart gate detected; restarting UI runtime", flush=True)
         self._last_restarted_gate_key = gate_key
         self.restart()
@@ -178,17 +209,40 @@ class DashboardSupervisor:
         print("supervisor: restart gate confirmed", flush=True)
         return "restart-confirmed"
 
+    def _backend_payload(self) -> BackendPayload:
+        state_fetch = getattr(self.client, "get_state", None)
+        if not callable(state_fetch):
+            return BackendPayload(
+                payload=self.client.get_queue(),
+                state_supported=False,
+                state_available=False,
+            )
+        try:
+            return BackendPayload(
+                payload=state_fetch(),
+                state_supported=True,
+                state_available=True,
+            )
+        except (OSError, URLError, TimeoutError, ValueError):
+            return BackendPayload(
+                payload=self.client.get_queue(),
+                state_supported=True,
+                state_available=False,
+            )
+
 
 def is_restart_required(payload: Mapping[str, Any]) -> bool:
-    queue = payload.get("queue")
+    queue_payload = _queue_payload(payload)
+    queue = queue_payload.get("queue")
     if isinstance(queue, dict) and queue.get("status") == "RESTART_REQUIRED":
         return True
-    summary = payload.get("summary")
+    summary = queue_payload.get("summary")
     return isinstance(summary, dict) and summary.get("current_waiting_point") == "restart"
 
 
 def restart_gate_key(payload: Mapping[str, Any]) -> str:
-    tasks = payload.get("tasks")
+    queue_payload = _queue_payload(payload)
+    tasks = queue_payload.get("tasks")
     if not isinstance(tasks, list):
         return "restart"
     keys = []
@@ -206,6 +260,31 @@ def restart_gate_key(payload: Mapping[str, Any]) -> str:
     if not keys:
         return "restart"
     return json.dumps(keys, sort_keys=True, separators=(",", ":"))
+
+
+def restart_drain_reasons(payload: Mapping[str, Any]) -> list[str]:
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        return []
+    reasons: list[str] = []
+    if runtime.get("queue_dispatch_running"):
+        reasons.append("queue-dispatch-running")
+    if runtime.get("proposal_dispatch_running"):
+        reasons.append("proposal-dispatch-running")
+    if runtime.get("dispatch_running") and not reasons:
+        reasons.append("dispatch-running")
+    return reasons
+
+
+def _queue_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    queue_value = payload.get("queue")
+    if isinstance(queue_value, dict) and (
+        "summary" in queue_value
+        or "tasks" in queue_value
+        or isinstance(queue_value.get("queue"), dict)
+    ):
+        return queue_value
+    return payload
 
 
 def build_ui_command(
