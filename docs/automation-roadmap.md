@@ -18,11 +18,15 @@ Human involvement should become the exception after intent publication. c-orch
 should still expose clear evidence and recovery controls, but ordinary queue
 progress should not depend on a human watching the dashboard.
 
-The current system still has three important automation gaps:
+The current system has closed the first code-review, recovery-policy, and
+idle self-restart slices. The remaining important automation gaps are:
 
-- code quality review is only part of Planner semantic review
-- failure recovery is not yet centralized or durable enough
-- self-bootstrap restart needs a stronger runtime protocol
+- long-running Planner/Worker execution is still owned by the dashboard runtime
+  process instead of durable runner leases
+- self-bootstrap restart is only automatic when the runtime is idle
+- same-repo parallel conflict recovery is still manual/fail-with-evidence
+- live Agent activity is available from Codex session logs but not yet treated
+  as a first-class dashboard surface
 
 ## 1. Code Review Gate
 
@@ -133,7 +137,19 @@ The first version can be conservative:
 - cap total Worker attempts with the existing max-attempts budget
 - expose the code-review report in the dashboard evidence panel
 
-### Open Questions
+Status (Phase 1 delivered):
+
+- `codex_review.py` now invokes the Codex App embedded review CLI by default
+  and persists raw plus normalized review evidence.
+- Planner review now runs verification, gathers code-review evidence, sends
+  that evidence to Planner, and keeps Planner's business decision limited to
+  `accepted` or `revision_requested`.
+- Code-review findings can feed the Worker rework loop through Planner's next
+  prompt, then verification and review repeat on the next attempt.
+- The dashboard evidence panel can expose the review report for the current
+  run.
+
+Remaining followups:
 
 - Whether `codex review` can be prompted to emit strict JSON reliably enough, or
   whether c-orch needs a small parser/normalizer step.
@@ -301,6 +317,20 @@ The first implementation can be simpler: only auto-restart when no active lanes
 exist. Later, runner subprocesses plus leases can allow restart while external
 work is still running.
 
+Status (Phase 1 delivered):
+
+- `supervise-ui` and `dev-ui` use `DashboardSupervisor` to own the runtime
+  child process.
+- When an approved self-modifying run touches c-orch runtime code, c-orch marks
+  `restart_required` with affected paths after apply and commit.
+- The supervisor detects the restart gate, waits until active queue/proposal
+  dispatch drains, restarts the runtime child, and clears the gate through the
+  backend `confirm-runtime-restarted` queue action.
+- This supports the safe idle case: no active proposal planning lanes and no
+  active queue execution lanes at restart time.
+- The canonical dashboard entry points now prefer supervised startup; bare
+  `c-orch ui` is treated as a low-level child runtime/debug entry.
+
 ### Runner Subprocesses
 
 Moving Planner/Worker work into runner subprocesses is useful, but only as one
@@ -325,8 +355,13 @@ write durable phase output before c-orch considers the phase complete.
 
 ## Suggested Order
 
-1. Implement Code Review Gate.
-2. Centralize Failure Recovery Policy around durable recovery decisions.
-3. Implement Self-Bootstrap Restart Protocol in stages:
-   first drain-and-restart when idle, then runner leases, then restart while
-   external lanes are active.
+1. Promote live Planner/Worker activity from Codex session logs into the
+   dashboard as first-class run activity.
+2. Define and persist runner lease metadata for active Planner/Worker/reviewer
+   phases.
+3. Move long-running Planner/Worker/reviewer calls into supervised runner
+   subprocesses.
+4. Reconcile runner leases on runtime startup so stale, alive, completed, and
+   failed phases become explicit recovery decisions.
+5. Extend self-bootstrap restart from idle-only to drain-and-restart with active
+   external runners.
