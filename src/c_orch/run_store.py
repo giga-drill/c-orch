@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .runner_leases import RunnerLeaseStore
+from .runner_subprocess import (
+    RUNNER_SUBPROCESS_SCHEMA_VERSION,
+    RunnerSubprocessResult,
+    load_runner_subprocess_result,
+)
 
 
 Pathish = Union[str, Path]
@@ -412,6 +417,59 @@ class RunStore:
 
     def load_runner_leases(self, run_id: str) -> Dict[str, Any]:
         return self.runner_lease_store(run_id).read().to_dict()
+
+    def runner_subprocess_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "runner-subprocess"
+
+    def runner_subprocess_phase_dir(self, run_id: str, phase: str) -> Path:
+        return self.runner_subprocess_dir(run_id) / str(phase)
+
+    def runner_subprocess_request_path(self, run_id: str, phase: str, runner_id: str) -> Path:
+        return self.runner_subprocess_phase_dir(run_id, phase) / f"{runner_id}.request.json"
+
+    def runner_subprocess_result_path(self, run_id: str, phase: str, runner_id: str) -> Path:
+        return self.runner_subprocess_phase_dir(run_id, phase) / f"{runner_id}.result.json"
+
+    def load_runner_subprocess_result(
+        self,
+        run_id: str,
+        *,
+        phase: str,
+        runner_id: str,
+    ) -> RunnerSubprocessResult:
+        return load_runner_subprocess_result(self.runner_subprocess_result_path(run_id, phase, runner_id))
+
+    def discover_runner_subprocess_results(
+        self,
+        run_id: str,
+        *,
+        phase: Optional[str] = None,
+    ) -> List[RunnerSubprocessResult]:
+        if phase:
+            roots = [self.runner_subprocess_phase_dir(run_id, phase)]
+        else:
+            root = self.runner_subprocess_dir(run_id)
+            if not root.exists():
+                return []
+            roots = [path for path in root.iterdir() if path.is_dir()]
+
+        results: List[RunnerSubprocessResult] = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.glob("*.result.json"):
+                try:
+                    result = load_runner_subprocess_result(path)
+                except Exception:
+                    continue
+                if result.schema_version != RUNNER_SUBPROCESS_SCHEMA_VERSION:
+                    continue
+                results.append(result)
+        results.sort(
+            key=lambda item: (item.completed_at, item.runner_id),
+            reverse=True,
+        )
+        return results
 
     def create_run(
         self,

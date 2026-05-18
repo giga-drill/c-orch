@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,12 @@ from .prompts import (
     worker_prompt,
 )
 from .runner_leases import RunnerLeaseStore
+from .runner_subprocess import (
+    RUNNER_PHASE_CODE_REVIEW,
+    RUNNER_RESULT_COMPLETED,
+    RunnerSubprocessRequest,
+    write_runner_subprocess_request,
+)
 from .run_store import (
     PlanRecord,
     PlanRevisionRecord,
@@ -91,6 +98,7 @@ RESTART_REQUIRED_EXACT_PATHS = {
     "pyproject.toml",
     ".c-orch.toml",
 }
+CODE_REVIEW_RUNNER_SUBPROCESS_TIMEOUT_SECONDS = 1800.0
 
 
 class OrchestratorError(RuntimeError):
@@ -1548,28 +1556,52 @@ class RunOrchestrator:
                 review_attempt_id=attempt.id,
             ),
         )
-        started_at = self.store.now_iso()
         reviewer_service_tier = self._effective_reviewer_service_tier(manifest)
+        started_at = self.store.now_iso()
+        report: CodexReviewReport
         try:
-            self._lease_heartbeat(
-                manifest=manifest,
-                runner_id=code_review_lease_id,
-                phase=lease_phase,
-                checkpoint=self._lease_checkpoint(
+            if self._should_use_code_review_subprocess():
+                subprocess_report = self._run_code_review_via_subprocess(
                     manifest=manifest,
-                    phase_boundary="code_review_inflight",
                     worker=worker,
-                    review_attempt_id=attempt.id,
-                ),
-            )
-            report = self.code_review_runner(
-                cwd=worktree_path,
-                evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
-                codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
-                patch_path=evidence.patch_path,
-                service_tier=reviewer_service_tier,
-            )
-            # review CLI currently does not return Codex thread/session ids.
+                    attempt=attempt,
+                    worktree_path=worktree_path,
+                    evidence=evidence,
+                    lease_phase=lease_phase,
+                    code_review_lease_id=code_review_lease_id,
+                )
+                if subprocess_report is not None:
+                    report = subprocess_report
+                else:
+                    self._record_event(
+                        manifest,
+                        "runner_subprocess_fallback_started",
+                        "Code review runner subprocess failed; starting direct code_review_runner fallback",
+                        runner_id=code_review_lease_id,
+                        phase=RUNNER_PHASE_CODE_REVIEW,
+                        review_attempt_id=attempt.id,
+                    )
+                    report = self._run_code_review_direct(
+                        manifest=manifest,
+                        worker=worker,
+                        attempt=attempt,
+                        worktree_path=worktree_path,
+                        evidence=evidence,
+                        code_review_lease_id=None,
+                        lease_phase=lease_phase,
+                        manage_lease=False,
+                    )
+            else:
+                report = self._run_code_review_direct(
+                    manifest=manifest,
+                    worker=worker,
+                    attempt=attempt,
+                    worktree_path=worktree_path,
+                    evidence=evidence,
+                    code_review_lease_id=code_review_lease_id,
+                    lease_phase=lease_phase,
+                    manage_lease=True,
+                )
             self._record_usage_attribution(
                 manifest=manifest,
                 role="reviewer",
@@ -1587,6 +1619,55 @@ class RunOrchestrator:
             )
             worker.evidence_files = _append_unique(worker.evidence_files, report.evidence_files)
             self._save(manifest)
+            return report
+        except Exception as exc:
+            if not self._should_use_code_review_subprocess():
+                self._lease_fail(
+                    manifest=manifest,
+                    runner_id=code_review_lease_id,
+                    phase=lease_phase,
+                    checkpoint=self._lease_checkpoint(
+                        manifest=manifest,
+                        phase_boundary="code_review_failed",
+                        worker=worker,
+                        review_attempt_id=attempt.id,
+                    ),
+                    error=str(exc),
+                )
+            raise
+
+    def _run_code_review_direct(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        attempt: ReviewAttemptRecord,
+        worktree_path: str,
+        evidence: DiffEvidence,
+        code_review_lease_id: Optional[str],
+        lease_phase: str,
+        manage_lease: bool,
+    ) -> CodexReviewReport:
+        if manage_lease:
+            self._lease_heartbeat(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_inflight",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                ),
+            )
+        report = self.code_review_runner(
+            cwd=worktree_path,
+            evidence_dir=self._attempt_evidence_dir(manifest, worker) / attempt.id,
+            codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
+            patch_path=evidence.patch_path,
+            service_tier=self._effective_reviewer_service_tier(manifest),
+        )
+        if manage_lease:
             self._lease_complete(
                 manifest=manifest,
                 runner_id=code_review_lease_id,
@@ -1599,21 +1680,316 @@ class RunOrchestrator:
                     extra={"code_review_status": report.status},
                 ),
             )
-            return report
+        return report
+
+    def _run_code_review_via_subprocess(
+        self,
+        *,
+        manifest: RunManifest,
+        worker: WorkerRecord,
+        attempt: ReviewAttemptRecord,
+        worktree_path: str,
+        evidence: DiffEvidence,
+        lease_phase: str,
+        code_review_lease_id: Optional[str],
+    ) -> Optional[CodexReviewReport]:
+        runner_id = code_review_lease_id or f"runner-missing-lease-{manifest.run_id}-{attempt.id}"
+        request_path = self.store.runner_subprocess_request_path(
+            manifest.run_id,
+            RUNNER_PHASE_CODE_REVIEW,
+            runner_id,
+        )
+        result_path = self.store.runner_subprocess_result_path(
+            manifest.run_id,
+            RUNNER_PHASE_CODE_REVIEW,
+            runner_id,
+        )
+        request = RunnerSubprocessRequest(
+            schema_version=1,
+            runner_id=runner_id,
+            run_id=manifest.run_id,
+            phase=RUNNER_PHASE_CODE_REVIEW,
+            cwd=worktree_path,
+            evidence_dir=str(self._attempt_evidence_dir(manifest, worker) / attempt.id),
+            codex_binary_path=_effective_codex_binary_path(manifest, self.driver),
+            patch_path=str(evidence.patch_path),
+            service_tier=self._effective_reviewer_service_tier(manifest),
+            request_path=str(request_path),
+            result_path=str(result_path),
+            lease_path=str(self.store.runner_leases_path(manifest.run_id)),
+            lease_ttl_seconds=self._runner_lease_ttl_seconds,
+        )
+        write_runner_subprocess_request(request_path, request)
+        self._lease_heartbeat(
+            manifest=manifest,
+            runner_id=code_review_lease_id,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="code_review_subprocess_launch_inflight",
+                worker=worker,
+                review_attempt_id=attempt.id,
+                extra={
+                    "runner_id": runner_id,
+                    "request_path": str(request_path),
+                    "result_path": str(result_path),
+                },
+            ),
+        )
+
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "c_orch.runner_subprocess",
+                    "--request",
+                    str(request_path),
+                    "--result",
+                    str(result_path),
+                ],
+                cwd=worktree_path,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._runner_subprocess_env(),
+            )
         except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess failed to launch",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                request_path=str(request_path),
+                result_path=str(result_path),
+                error=str(exc),
+                failure_reason="launch_failed",
+            )
             self._lease_fail(
                 manifest=manifest,
                 runner_id=code_review_lease_id,
                 phase=lease_phase,
                 checkpoint=self._lease_checkpoint(
                     manifest=manifest,
-                    phase_boundary="code_review_failed",
+                    phase_boundary="code_review_subprocess_launch_failed",
                     worker=worker,
                     review_attempt_id=attempt.id,
+                    extra={"runner_id": runner_id},
                 ),
                 error=str(exc),
             )
-            raise
+            return None
+
+        self._record_event(
+            manifest,
+            "runner_subprocess_started",
+            "Code review runner subprocess started",
+            runner_id=runner_id,
+            phase=RUNNER_PHASE_CODE_REVIEW,
+            pid=proc.pid,
+            process_hint=f"pid:{proc.pid}",
+            request_path=str(request_path),
+            result_path=str(result_path),
+            review_attempt_id=attempt.id,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=CODE_REVIEW_RUNNER_SUBPROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess timed out",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                pid=proc.pid,
+                process_hint=f"pid:{proc.pid}",
+                request_path=str(request_path),
+                result_path=str(result_path),
+                returncode=proc.returncode,
+                failure_reason="timeout",
+                stdout_tail=(stdout or "")[-2000:],
+                stderr_tail=(stderr or "")[-2000:],
+            )
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_subprocess_timeout",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                    extra={"runner_id": runner_id},
+                ),
+                error="runner subprocess timed out",
+            )
+            return None
+
+        if not result_path.exists():
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess exited without result manifest",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                pid=proc.pid,
+                process_hint=f"pid:{proc.pid}",
+                request_path=str(request_path),
+                result_path=str(result_path),
+                returncode=proc.returncode,
+                failure_reason="result_missing",
+                stdout_tail=(stdout or "")[-2000:],
+                stderr_tail=(stderr or "")[-2000:],
+            )
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_subprocess_missing_result",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                    extra={"runner_id": runner_id},
+                ),
+                error="runner subprocess did not write result manifest",
+            )
+            return None
+
+        try:
+            runner_result = self.store.load_runner_subprocess_result(
+                manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                runner_id=runner_id,
+            )
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess result manifest could not be parsed",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                pid=proc.pid,
+                process_hint=f"pid:{proc.pid}",
+                request_path=str(request_path),
+                result_path=str(result_path),
+                returncode=proc.returncode,
+                failure_reason="result_unreadable",
+                error=str(exc),
+                stdout_tail=(stdout or "")[-2000:],
+                stderr_tail=(stderr or "")[-2000:],
+            )
+            self._lease_fail(
+                manifest=manifest,
+                runner_id=code_review_lease_id,
+                phase=lease_phase,
+                checkpoint=self._lease_checkpoint(
+                    manifest=manifest,
+                    phase_boundary="code_review_subprocess_result_unreadable",
+                    worker=worker,
+                    review_attempt_id=attempt.id,
+                    extra={"runner_id": runner_id},
+                ),
+                error=str(exc),
+            )
+            return None
+
+        if runner_result.status != RUNNER_RESULT_COMPLETED:
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess reported infrastructure failure",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                pid=proc.pid,
+                process_hint=runner_result.process_hint or f"pid:{proc.pid}",
+                request_path=runner_result.request_path or str(request_path),
+                result_path=runner_result.result_path or str(result_path),
+                returncode=proc.returncode,
+                failure_reason="runner_infra_failed",
+                error=runner_result.error,
+                lease_status=runner_result.lease_status,
+                review_status=runner_result.review_status,
+                evidence_files=runner_result.evidence_files,
+            )
+            return None
+
+        try:
+            report = runner_result.to_codex_review_report()
+        except Exception as exc:
+            self._record_event(
+                manifest,
+                "runner_subprocess_failed",
+                "Code review runner subprocess result manifest was invalid",
+                runner_id=runner_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                pid=proc.pid,
+                process_hint=runner_result.process_hint or f"pid:{proc.pid}",
+                request_path=runner_result.request_path or str(request_path),
+                result_path=runner_result.result_path or str(result_path),
+                returncode=proc.returncode,
+                failure_reason="result_invalid",
+                error=str(exc),
+                lease_status=runner_result.lease_status,
+                review_status=runner_result.review_status,
+                evidence_files=runner_result.evidence_files,
+            )
+            return None
+
+        self._lease_heartbeat(
+            manifest=manifest,
+            runner_id=code_review_lease_id,
+            phase=lease_phase,
+            checkpoint=self._lease_checkpoint(
+                manifest=manifest,
+                phase_boundary="code_review_subprocess_result_loaded",
+                worker=worker,
+                review_attempt_id=attempt.id,
+                extra={
+                    "runner_id": runner_id,
+                    "review_status": report.status,
+                    "result_path": runner_result.result_path,
+                },
+            ),
+        )
+        self._record_event(
+            manifest,
+            "runner_subprocess_completed",
+            "Code review runner subprocess completed",
+            runner_id=runner_id,
+            phase=RUNNER_PHASE_CODE_REVIEW,
+            pid=runner_result.pid or proc.pid,
+            process_hint=runner_result.process_hint or f"pid:{proc.pid}",
+            request_path=runner_result.request_path or str(request_path),
+            result_path=runner_result.result_path or str(result_path),
+            review_status=report.status,
+            lease_status=runner_result.lease_status,
+            returncode=proc.returncode,
+            evidence_files=runner_result.evidence_files,
+            review_attempt_id=attempt.id,
+        )
+        return report
+
+    def _should_use_code_review_subprocess(self) -> bool:
+        candidate = self.code_review_runner
+        return (
+            getattr(candidate, "__module__", "") == "c_orch.codex_review"
+            and getattr(candidate, "__name__", "") == "run_codex_uncommitted_review"
+        )
+
+    def _runner_subprocess_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        src_root = Path(__file__).resolve().parents[1]
+        current = env.get("PYTHONPATH", "")
+        if current:
+            env["PYTHONPATH"] = f"{src_root}{os.pathsep}{current}"
+        else:
+            env["PYTHONPATH"] = str(src_root)
+        return env
 
     def _effective_reviewer_service_tier(self, manifest: RunManifest) -> Optional[str]:
         if self.config.reviewer_service_tier is not None:

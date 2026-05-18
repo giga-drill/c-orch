@@ -82,9 +82,32 @@ Phase-1 schema includes:
 - `checkpoint` (phase boundary metadata)
 
 `stale` is derived on read when `status=active` and `lease_expires_at < now`.
-`GET` endpoints do not write lease files. Phase-1 scope is current-process
-phase checkpoints only; external runner subprocess ownership and startup
-reconciliation are still follow-up work.
+`GET` endpoints do not write lease files.
+
+Phase-1 now includes a supervised reviewer subprocess protocol for
+`phase=code_review` only. Runtime writes request manifests under:
+
+```text
+runs/<run_id>/runner-subprocess/code_review/<runner_id>.request.json
+```
+
+The subprocess writes durable result manifests under:
+
+```text
+runs/<run_id>/runner-subprocess/code_review/<runner_id>.result.json
+```
+
+Runtime treats result manifests as source-of-truth for review reconstruction.
+If subprocess launch/result parsing/result durability fails, runtime records
+`runner_subprocess_failed` + `runner_subprocess_fallback_started` and falls
+back to direct `code_review_runner`. A completed subprocess report with
+`CodexReviewReport.status=error` is preserved as review evidence and does not
+trigger infra fallback.
+
+Still follow-up work:
+
+- Planner/Worker subprocess handoff
+- runtime-startup lease reconciliation across alive/stale/completed runners
 
 ## Quick Start
 

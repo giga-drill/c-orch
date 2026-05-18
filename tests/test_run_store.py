@@ -13,6 +13,7 @@ from c_orch.run_store import (
     ReviewRecord,
     RunStore,
 )
+from c_orch.runner_subprocess import RUNNER_RESULT_COMPLETED, RunnerSubprocessResult
 
 
 class RunStoreTests(unittest.TestCase):
@@ -396,6 +397,59 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNone(loaded.task_id)
             self.assertIsNone(loaded.proposal_id)
             self.assertIsNone(loaded.workspace_id)
+
+    def test_discover_runner_subprocess_results_from_new_store_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Runner subprocess discover",
+                planner_model="planner-model",
+                worker_model="worker-model",
+            )
+            result = RunnerSubprocessResult(
+                schema_version=1,
+                runner_id="runner-1",
+                run_id=manifest.run_id,
+                phase="code_review",
+                status=RUNNER_RESULT_COMPLETED,
+                started_at="2026-05-19T10:00:00+08:00",
+                completed_at="2026-05-19T10:00:05+08:00",
+                request_path=str(store.runner_subprocess_request_path(manifest.run_id, "code_review", "runner-1")),
+                result_path=str(store.runner_subprocess_result_path(manifest.run_id, "code_review", "runner-1")),
+                lease_path=str(store.runner_leases_path(manifest.run_id)),
+                process_hint="pid:1234",
+                pid=1234,
+                lease_status="completed",
+                review_status="passed",
+                returncode=0,
+                error=None,
+                report={
+                    "summary": "Codex review completed successfully.",
+                    "output_path": str(root / "runs" / manifest.run_id / "out.txt"),
+                    "result_path": str(root / "runs" / manifest.run_id / "result.json"),
+                    "status": "passed",
+                    "returncode": 0,
+                    "command": "codex review --uncommitted",
+                    "service_tier": "flex",
+                },
+                evidence_files=[str(root / "runs" / manifest.run_id / "out.txt")],
+            )
+            result_path = store.runner_subprocess_result_path(manifest.run_id, "code_review", "runner-1")
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            refreshed = RunStore(root / "runs")
+            discovered = refreshed.discover_runner_subprocess_results(manifest.run_id, phase="code_review")
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(discovered[0].runner_id, "runner-1")
+            loaded = refreshed.load_runner_subprocess_result(
+                manifest.run_id,
+                phase="code_review",
+                runner_id="runner-1",
+            )
+            self.assertEqual(loaded.status, RUNNER_RESULT_COMPLETED)
 
 
 if __name__ == "__main__":

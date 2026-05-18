@@ -17,6 +17,7 @@ from c_orch.failure_policy import has_retryable_review_failure
 from c_orch.orchestrator import OrchestratorConfig, RunOrchestrator
 from c_orch.run_store import PlanRecord, ReviewRecord, RunStore
 from c_orch.runner_leases import LEASE_STATUS_COMPLETED, LEASE_STATUS_FAILED
+from c_orch.runner_subprocess import RUNNER_PHASE_CODE_REVIEW, RUNNER_RESULT_COMPLETED
 from c_orch.verification import CommandVerification, VerificationReport
 from c_orch.worktrees import ApplyReport, DiffEvidence, GitCommitReport, create_worker_worktree
 
@@ -2462,6 +2463,129 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(revise_rows[0]["status"], LEASE_STATUS_COMPLETED)
 
 
+class RunnerSubprocessCodeReviewTests(unittest.TestCase):
+    def test_code_review_runner_subprocess_persists_result_and_is_discoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            codex_bin = root / "fake-codex-ok.sh"
+            _write_fake_codex_binary(codex_bin, exit_code=0)
+            manifest.codex_binary_path = str(codex_bin)
+            store.save(manifest)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                diff_applier=FakeDiffApplier(),
+                config=OrchestratorConfig(runtime_generation="runtime-test"),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            events = store.load_events(manifest.run_id)
+            start_event = next(event for event in events if event.get("type") == "runner_subprocess_started")
+            done_event = next(event for event in events if event.get("type") == "runner_subprocess_completed")
+            self.assertEqual(start_event["phase"], RUNNER_PHASE_CODE_REVIEW)
+            self.assertEqual(done_event["phase"], RUNNER_PHASE_CODE_REVIEW)
+            runner_id = str(start_event["runner_id"])
+            self.assertEqual(done_event["runner_id"], runner_id)
+            self.assertEqual(done_event["review_status"], "passed")
+            self.assertTrue(done_event["evidence_files"])
+            result_manifest = store.load_runner_subprocess_result(
+                manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+                runner_id=runner_id,
+            )
+            self.assertEqual(result_manifest.status, RUNNER_RESULT_COMPLETED)
+            self.assertEqual(result_manifest.review_status, "passed")
+            self.assertGreaterEqual(len(result_manifest.evidence_files), 2)
+            refreshed_store = RunStore(store.runs_dir)
+            discovered = refreshed_store.discover_runner_subprocess_results(
+                manifest.run_id,
+                phase=RUNNER_PHASE_CODE_REVIEW,
+            )
+            self.assertTrue(discovered)
+            self.assertEqual(discovered[0].runner_id, runner_id)
+
+    def test_runner_subprocess_failure_falls_back_to_direct_code_review_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            codex_bin = root / "fake-codex-ok.sh"
+            _write_fake_codex_binary(codex_bin, exit_code=0)
+            manifest.codex_binary_path = str(codex_bin)
+            store.save(manifest)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+
+            def _write_bad_phase_request(path: Path, request: Any) -> Path:
+                payload = request.to_dict()
+                payload["phase"] = "invalid-phase"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                return path
+
+            with mock.patch("c_orch.orchestrator.write_runner_subprocess_request", side_effect=_write_bad_phase_request):
+                result = RunOrchestrator(
+                    store=store,
+                    driver=driver,
+                    evidence_collector=FakeEvidenceCollector(),
+                    verification_runner=FakeVerificationRunner(),
+                    diff_applier=FakeDiffApplier(),
+                ).run(manifest)
+
+            self.assertEqual(result.status, "APPROVED")
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertIn("runner_subprocess_failed", event_types)
+            self.assertIn("runner_subprocess_fallback_started", event_types)
+            self.assertIn("planner_review_completed", event_types)
+
+    def test_runner_subprocess_completed_with_review_error_does_not_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, manifest, _worktree = _create_manifest(root)
+            codex_bin = root / "fake-codex-error.sh"
+            _write_fake_codex_binary(codex_bin, exit_code=1)
+            manifest.codex_binary_path = str(codex_bin)
+            store.save(manifest)
+            driver = FakeDriver(
+                start_results=[
+                    _session("planner-thread", _planner_plan()),
+                    _session("worker-thread", _worker_result()),
+                ],
+                reply_results=[_session("planner-thread", _review("accepted"))],
+            )
+            result = RunOrchestrator(
+                store=store,
+                driver=driver,
+                evidence_collector=FakeEvidenceCollector(),
+                verification_runner=FakeVerificationRunner(),
+                diff_applier=FakeDiffApplier(),
+            ).run(manifest)
+
+            self.assertEqual(result.status, "WORK_DONE")
+            self.assertTrue(has_retryable_review_failure(result))
+            events = store.load_events(manifest.run_id)
+            event_types = [event["type"] for event in events]
+            self.assertIn("runner_subprocess_completed", event_types)
+            self.assertNotIn("runner_subprocess_fallback_started", event_types)
+            done_event = next(event for event in events if event.get("type") == "runner_subprocess_completed")
+            self.assertEqual(done_event["review_status"], "error")
+
+
 def _create_manifest(root: Path):
     store = RunStore(root / "runs")
     return _create_manifest_from_store(root, store)
@@ -2491,6 +2615,23 @@ def _create_manifest_from_store(root: Path, store: RunStore):
     manifest.workers[0].worktree_path = str(worktree)
     store.save(manifest)
     return store, manifest, worktree
+
+
+def _write_fake_codex_binary(path: Path, *, exit_code: int) -> None:
+    script = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            'if [ \"$1\" = \"review\" ] && [ \"$2\" = \"--uncommitted\" ]; then',
+            "  echo \"fake codex review output\"",
+            f"  exit {int(exit_code)}",
+            "fi",
+            "echo \"unexpected command\" >&2",
+            "exit 64",
+        ]
+    )
+    path.write_text(script + "\n", encoding="utf-8")
+    path.chmod(0o755)
 
 
 def _write_review_patch_evidence(*, repo: Path, evidence_dir: Path) -> tuple[Path, Path]:

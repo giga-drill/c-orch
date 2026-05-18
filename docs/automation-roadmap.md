@@ -521,6 +521,25 @@ part of the solution:
 It does not replace manifest/event/evidence persistence. Runner completion must
 write durable phase output before c-orch considers the phase complete.
 
+Status (phase-1 partial delivery):
+
+- reviewer `phase=code_review` now runs through a supervised subprocess protocol
+- runtime writes request manifest:
+  `runs/<run_id>/runner-subprocess/code_review/<runner_id>.request.json`
+- subprocess writes result manifest:
+  `runs/<run_id>/runner-subprocess/code_review/<runner_id>.result.json`
+- runtime reconstructs `CodexReviewReport` only from durable result manifests
+- fallback to direct `code_review_runner` is infra-only:
+  launch failure, timeout, missing result, unreadable/invalid result, or
+  result status=`failed`
+- completed review reports with `status=error` remain business review evidence
+  and do not trigger direct fallback
+
+Still pending in this area:
+
+- Planner/Worker subprocess handoff
+- runtime-startup lease reconciliation across alive/stale/completed runners
+
 ### Open Design Work
 
 - Define the exact lane lease schema.
@@ -572,9 +591,10 @@ larger lifecycle architecture changes.
    `runs/<run_id>/runner-leases.json` and exposes active/stale summaries via
    state/run payloads. Runtime-startup reconciliation and external subprocess
    ownership are still follow-up items.
-10. Supervised runner subprocesses.
-    Move long-running Planner/Worker/reviewer calls out of the dashboard
-    runtime once leases and checkpoints are durable.
+10. Supervised runner subprocesses. (Phase 1 partial delivery)
+    reviewer `code_review` is now subprocess-backed with durable
+    request/result manifests and infra-only fallback. Planner/Worker
+    subprocess migration remains follow-up.
 11. Runtime-startup lease reconciliation.
     Reconcile alive, stale, completed, and failed runners into explicit
     recovery decisions after restart.

@@ -223,9 +223,18 @@ Runner lease metadata (phase 1 delivered):
 
 Still not implemented:
 
-- external runner subprocess execution handoff
+- Planner/Worker subprocess execution handoff
 - runtime-startup lease reconciliation across alive/stale/completed runners
 - automatic rebase/replay for same-repo parallel apply conflicts
+
+Delivered in this phase:
+
+- reviewer `phase=code_review` supervised subprocess protocol
+- durable request/result manifests under `runs/<run_id>/runner-subprocess/`
+- runtime fallback to direct `code_review_runner` only for runner infra
+  failures (launch, missing/corrupt result, infra-failed result status)
+- completed Codex review reports with `status=error` are business review
+  evidence, not runner infra fallback triggers
 
 Task state is the user-level lifecycle; run state is one execution attempt.
 One task can have multiple run attempts over time. `active_run_id` points to the
