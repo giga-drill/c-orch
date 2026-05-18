@@ -229,6 +229,16 @@ function parseTimestamp(value?: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function formatShortTime(value?: string | null): string {
+  const parsed = parseTimestamp(value);
+  if (parsed === null) return displayValue(value);
+  return new Date(parsed).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function sortQueueTasks(tasks: TaskSummary[]): TaskSummary[] {
   return tasks
     .map((task, index) => ({ task, index }))
@@ -254,6 +264,11 @@ export function App() {
   const queuePayload = stateQuery.data?.queue;
   const proposalsPayload = stateQuery.data?.proposals;
   const runsPayload = stateQuery.data?.runs;
+  const runtimeBusy = Boolean(
+    stateQuery.data?.runtime.dispatch_running ||
+      stateQuery.data?.runtime.queue_dispatch_running ||
+      stateQuery.data?.runtime.proposal_dispatch_running,
+  );
   const focusedRunId = stateQuery.data?.focused_run_id ?? null;
   const firstRunId = runsPayload?.runs[0]?.run_id ?? null;
   const selectedRunExists = Boolean(
@@ -329,8 +344,7 @@ export function App() {
         <SystemStatus
           queuePayload={queuePayload}
           runsGeneratedAt={runsPayload?.generated_at}
-          runtimeGeneration={stateQuery.data?.runtime.generation}
-          stateVersion={stateQuery.data?.version}
+          runtimeBusy={runtimeBusy}
         />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
@@ -359,13 +373,11 @@ export function App() {
 function SystemStatus({
   queuePayload,
   runsGeneratedAt,
-  runtimeGeneration,
-  stateVersion,
+  runtimeBusy,
 }: {
   queuePayload?: QueuePayload;
   runsGeneratedAt?: string;
-  runtimeGeneration?: string;
-  stateVersion?: number;
+  runtimeBusy?: boolean;
 }) {
   const queueActionMutation = useQueueActionMutation();
   const [queueActionError, setQueueActionError] = useState<string | null>(null);
@@ -410,15 +422,11 @@ function SystemStatus({
       </div>
       <div>
         <span className="label">updated</span>
-        <strong>{displayValue(queuePayload?.generated_at ?? runsGeneratedAt)}</strong>
-      </div>
-      <div>
-        <span className="label">state_version</span>
-        <strong>{displayValue(stateVersion)}</strong>
+        <strong>{formatShortTime(queuePayload?.generated_at ?? runsGeneratedAt)}</strong>
       </div>
       <div>
         <span className="label">runtime</span>
-        <strong>{displayValue(runtimeGeneration)}</strong>
+        <strong>{restartRequired ? "需重启" : runtimeBusy ? "运行中" : "空闲"}</strong>
       </div>
       {restartRequired ? (
         <>
@@ -972,23 +980,9 @@ function RunDetail({
           <p className="meta">Run</p>
           <h1>{run.run_id}</h1>
         </div>
-        <StatusBadge status={run.status} />
       </header>
 
-      <div className="stateStrip">
-        <div>
-          <span className="label">waiting_for</span>
-          <strong>{displayValue(run.waiting_for)}</strong>
-        </div>
-        <div>
-          <span className="label">next_action</span>
-          <strong>{displayValue(run.next_action)}</strong>
-        </div>
-        <div>
-          <span className="label">allowed_actions</span>
-          <strong>{run.allowed_actions.length ? run.allowed_actions.join(", ") : "-"}</strong>
-        </div>
-      </div>
+      <RunSummaryStrip run={run} />
 
       <ActionBar
         actions={run.allowed_actions}
@@ -997,13 +991,6 @@ function RunDetail({
       />
       {actionError ? <div className="error">{actionError}</div> : null}
       <FailurePanel run={run} events={payload.events} files={payload.evidence_files} />
-
-      <div className="metrics">
-        <Metric label="Planner" value={formatStatus(run.planner.status)} />
-        <Metric label="Worker" value={formatStatus(run.workers[0]?.status)} />
-        <Metric label="复核次数" value={run.review_attempt_count} />
-        <Metric label="证据" value={run.evidence_count} />
-      </div>
       <section className="section">
         <h2>阶段耗时</h2>
         <PhaseTimingPanel run={run} />
@@ -1051,7 +1038,9 @@ function RunDetail({
       <div className="detailGrid">
         <section className="section">
           <h2>证据文件</h2>
-          <EvidenceList files={payload.evidence_files} />
+          <Collapsible title={`证据文件（${payload.evidence_files.length}）`}>
+            <EvidenceList files={payload.evidence_files} />
+          </Collapsible>
         </section>
         <section className="section">
           <h2>Worker 活动</h2>
@@ -1067,6 +1056,45 @@ function RunDetail({
         </section>
       </div>
     </div>
+  );
+}
+
+function RunSummaryStrip({ run }: { run: RunListItem }) {
+  return (
+    <section className="runSummaryStrip">
+      <div className="summaryCell">
+        <span className="label">status</span>
+        <StatusBadge status={run.status} />
+      </div>
+      <div className="summaryCell">
+        <span className="label">waiting_for</span>
+        <strong>{displayValue(run.waiting_for)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">next_action</span>
+        <strong>{displayValue(run.next_action)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">allowed_actions</span>
+        <strong>{run.allowed_actions.length ? run.allowed_actions.join(", ") : "-"}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">Planner</span>
+        <strong>{formatStatus(run.planner.status)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">Worker</span>
+        <strong>{formatStatus(run.workers[0]?.status)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">复核次数</span>
+        <strong>{displayValue(run.review_attempt_count)}</strong>
+      </div>
+      <div className="summaryCell">
+        <span className="label">证据数量</span>
+        <strong>{displayValue(run.evidence_count)}</strong>
+      </div>
+    </section>
   );
 }
 
@@ -1365,15 +1393,6 @@ function eventDetails(event: RunEvent): string {
     ),
   );
   return Object.keys(details).length ? JSON.stringify(details) : "";
-}
-
-function Metric({ label, value }: { label: string; value: unknown }) {
-  return (
-    <div className="metric">
-      <span className="label">{label}</span>
-      <strong>{displayValue(value)}</strong>
-    </div>
-  );
 }
 
 function KeyValue({ label, value }: { label: string; value: unknown }) {

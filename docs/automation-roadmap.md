@@ -28,6 +28,8 @@ idle self-restart slices. The remaining important automation gaps are:
 - live Agent activity is available from Codex session logs but not yet treated
   as a first-class dashboard surface
 
+Dashboard UX follow-up: Worker activity should be promoted to a first-class panel so execution progress, phase events, and actionable evidence stay visible without expanding raw logs by default.
+
 ## 1. Code Review Gate
 
 ### Goal

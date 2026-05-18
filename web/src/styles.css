@@ -84,22 +84,22 @@ pre {
 .shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
 }
 
 .sidebar {
   min-width: 0;
   border-right: 1px solid var(--line);
   background: #fbfcf8;
-  padding: 18px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 }
 
 .content {
   min-width: 0;
-  padding: 22px;
+  padding: 18px;
   overflow: auto;
 }
 
@@ -129,7 +129,7 @@ pre {
 .section,
 .agentCard,
 .systemStatus,
-.stateStrip,
+.runSummaryStrip,
 .actionBar,
 .failurePanel,
 .empty,
@@ -143,16 +143,23 @@ pre {
 .section,
 .agentCard,
 .systemStatus,
-.stateStrip,
+.runSummaryStrip,
 .actionBar,
 .failurePanel {
-  padding: 12px;
+  padding: 10px;
 }
 
 .systemStatus {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.systemStatus > div,
+.systemStatus strong,
+.systemStatus .meta {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .systemStatus.restart {
@@ -165,55 +172,45 @@ pre {
   color: var(--amber);
 }
 
-.metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.metric {
-  min-width: 0;
-  border: 1px solid #e7ece3;
-  border-radius: 8px;
-  background: #fafcf8;
-  padding: 9px;
-}
-
-.metric strong {
-  display: block;
-  overflow-wrap: anywhere;
-}
-
 .queueStats {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
+  gap: 4px;
+  margin-top: 6px;
   color: var(--muted);
   font-size: 12px;
 }
 
 .queueStats span {
-  min-height: 22px;
+  min-height: 20px;
   border: 1px solid #e7ece3;
   border-radius: 999px;
   background: #fafcf8;
-  padding: 2px 8px;
+  padding: 1px 7px;
 }
 
 .laneList {
   display: grid;
-  gap: 8px;
-  margin-top: 10px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .laneItem {
   display: grid;
-  gap: 4px;
-  padding: 8px;
+  gap: 3px;
+  padding: 7px;
   border: 1px solid #e7ece3;
   border-radius: 8px;
   background: #fafcf8;
+  min-width: 0;
+}
+
+.laneItem .meta,
+.laneItem strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .queueDisplayMeta {
@@ -236,7 +233,7 @@ pre {
 .detail,
 .planPanel {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .runsPanel {
@@ -250,15 +247,15 @@ pre {
 }
 
 .runList {
-  max-height: 34vh;
+  max-height: 38vh;
   overflow: auto;
   padding-right: 2px;
 }
 
 .taskItem {
   display: grid;
-  gap: 8px;
-  padding: 8px;
+  gap: 6px;
+  padding: 7px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -279,7 +276,7 @@ pre {
   background: transparent;
   text-align: left;
   display: grid;
-  gap: 4px;
+  gap: 3px;
 }
 
 .taskButton:hover:not(:disabled),
@@ -290,7 +287,7 @@ pre {
 .taskActions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 
 .taskFailure {
@@ -307,7 +304,7 @@ pre {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  padding: 10px;
+  padding: 8px;
 }
 
 .badge {
@@ -357,21 +354,31 @@ pre {
 }
 
 .detailHeader {
-  padding-bottom: 12px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--line);
 }
 
-.stateStrip {
+.runSummaryStrip {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px 8px;
   background: #f8fbf5;
+}
+
+.summaryCell {
+  min-width: 0;
+}
+
+.summaryCell strong {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .actionBar {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
   align-items: flex-start;
 }
 
@@ -412,7 +419,7 @@ input {
 
 .timingPanel {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .timingSummary {
@@ -528,13 +535,13 @@ input {
 .detailGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
 .agentGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
 .kv {
@@ -553,7 +560,7 @@ details {
 
 summary {
   cursor: pointer;
-  padding: 8px 10px;
+  padding: 7px 10px;
   font-weight: 700;
 }
 
@@ -567,14 +574,14 @@ details > div {
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .plainList li,
 .timelineItem {
   border: 1px solid #e4eae0;
   border-radius: 8px;
-  padding: 9px;
+  padding: 8px;
   background: #fcfdfa;
 }
 
@@ -621,8 +628,7 @@ details > div {
   }
 
   .detailGrid,
-  .metrics,
-  .stateStrip,
+  .runSummaryStrip,
   .systemStatus {
     grid-template-columns: 1fr;
   }
