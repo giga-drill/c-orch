@@ -198,6 +198,7 @@ class COrchRuntime:
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
+                self.dispatch_proposals_async()
             return self._attach_state(result)
 
     def queue_action(self, action: Any, *, confirmed_by: str = "dashboard") -> RunActionResponse:

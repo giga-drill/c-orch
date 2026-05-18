@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from unittest import mock
 
-from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalPool, ProposalRecord, ProposalStore
+from c_orch.proposal_store import (
+    PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_WORKSPACE,
+    ProposalPool,
+    ProposalRecord,
+    ProposalStore,
+)
 from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
@@ -219,6 +225,70 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(loaded.tasks[0].reason)
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
+
+    def test_mark_handled_skipped_wakes_waiting_workspace_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {
+                        "task_id": "failed-task",
+                        "title": "Failed Task",
+                        "prompt": "Failed task",
+                        "cwd": str(repo),
+                    }
+                ]
+            )
+            task_store.update_task(
+                queue,
+                "failed-task",
+                status="FAILED",
+                reason="active_run_failed",
+            )
+            task_store.save(queue)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(
+                pool,
+                title="Waiting Proposal",
+                prompt="Plan next task",
+                cwd=str(repo),
+            )
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_WAITING_WORKSPACE,
+                reason="workspace_lane",
+            )
+            proposal_store.save(pool)
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=2))
+            self.assertEqual(fake_planner.run_calls, 0)
+
+            status, payload = runtime.task_action("failed-task", "mark-handled-skipped")
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "task_marked_handled_skipped")
+            self.assertTrue(fake_planner.started.wait(timeout=2))
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            loaded_queue = task_store.load()
+            self.assertEqual(loaded_queue.tasks[0].status, "SKIPPED")
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(proposals[0]["status"], RUN_PLAN_REVIEW_REQUIRED)
+            self.assertEqual(fake_planner.run_calls, 1)
 
     def test_queue_lane_retry_review_is_policy_gated_and_records_recovery_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

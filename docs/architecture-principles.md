@@ -227,6 +227,18 @@ may reject the reviewed patch during apply instead of rebasing or merging it.
 Queue files may mix tasks for different target repos, but same-repo tasks are
 still serialized by this boundary.
 
+## Development Verification
+
+Use explicit unittest discovery for the Python suite:
+
+```bash
+PYTHONPATH=src python3.11 -m unittest discover -s tests
+```
+
+Do not use bare `python3.11 -m unittest` as the full-suite command for this
+repo. It can report `Ran 0 tests` because it does not automatically recurse
+into the repo's `tests/` directory in the way this project expects.
+
 ## Agent Context Contract
 
 Before planning or editing c-orch itself, agents should read:
