@@ -30,6 +30,77 @@ idle self-restart slices. The remaining important automation gaps are:
 
 Dashboard UX follow-up: Worker activity should be promoted to a first-class panel so execution progress, phase events, and actionable evidence stay visible without expanding raw logs by default.
 
+## Future Evolution Directions
+
+These are product and architecture directions to revisit after the current
+review/retry visibility and failure-recovery slices stabilize.
+
+### Remove Human Plan Approval From the Normal Path
+
+Today the proposal pool still has a human review gate after Planner generates a
+plan. The longer-term automation direction is to remove that gate from the
+ordinary path:
+
+```text
+human proposal -> Planner plan -> execution queue
+```
+
+The human would still publish intent and inspect evidence, but c-orch would not
+normally wait for plan approval before Worker execution. This needs safeguards
+before implementation:
+
+- proposal quality and scope checks before planning
+- clearer rollback/stop controls after execution starts
+- good run evidence so humans can audit what the Planner decided
+- optional policy modes for tasks that still require explicit human plan review
+
+### Performance Telemetry And Retrospective Optimization
+
+c-orch should record enough timing and phase data to understand where work is
+slow before trying to optimize it. The first step is durable measurement across
+tasks in a project:
+
+- proposal planning time
+- human wait time when any gate is enabled
+- Worker execution time
+- verification time
+- Codex review time
+- Planner review time
+- rework loop count and reason categories
+- apply, commit, restart, and recovery time
+
+After enough runs, c-orch should produce retrospective suggestions such as:
+
+- which phases dominate wall-clock time
+- which retry categories are most common
+- whether review timeout, verification setup, task size, or prompt ambiguity is
+  the main bottleneck
+- which concrete workflow or code changes could reduce runtime
+
+The long-term goal is a feedback loop where c-orch can propose, and eventually
+implement, efficiency improvements based on its own run history.
+
+### Proposal Decomposition And Commit-Size Control
+
+Human proposals may be much larger than a healthy single Worker task. c-orch
+should eventually decide whether a proposal should run as one task or be split
+into several sequenced tasks, each with a reviewable diff and meaningful commit.
+
+The decomposition policy should balance quality and speed:
+
+- too-large tasks make review, rollback, commit messages, and failure recovery
+  hard
+- too-small tasks waste context, planning, review, and setup overhead
+- each subtask should aim for one coherent commit-sized change
+- dependencies between subtasks should be explicit enough for the queue to run
+  them in order
+
+Useful signals may include expected touched modules, expected diff size,
+number of independent workflows affected, verification surface, architectural
+risk, and whether a rollback would need to undo unrelated concerns. The first
+version can be advisory: Planner proposes a decomposition and c-orch records
+the suggested subtask boundaries before later automating the split.
+
 ## 1. Code Review Gate
 
 ### Goal
@@ -359,11 +430,17 @@ write durable phase output before c-orch considers the phase complete.
 
 1. Promote live Planner/Worker activity from Codex session logs into the
    dashboard as first-class run activity.
-2. Define and persist runner lease metadata for active Planner/Worker/reviewer
+2. Improve run-history performance telemetry and add a project-level
+   retrospective view for phase timing and bottleneck suggestions.
+3. Define the policy for removing human plan approval from the normal
+   proposal-to-execution path while keeping optional approval modes.
+4. Design proposal decomposition so large human intents can become a small
+   sequence of commit-sized tasks.
+5. Define and persist runner lease metadata for active Planner/Worker/reviewer
    phases.
-3. Move long-running Planner/Worker/reviewer calls into supervised runner
+6. Move long-running Planner/Worker/reviewer calls into supervised runner
    subprocesses.
-4. Reconcile runner leases on runtime startup so stale, alive, completed, and
+7. Reconcile runner leases on runtime startup so stale, alive, completed, and
    failed phases become explicit recovery decisions.
-5. Extend self-bootstrap restart from idle-only to drain-and-restart with active
+8. Extend self-bootstrap restart from idle-only to drain-and-restart with active
    external runners.
