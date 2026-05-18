@@ -28,7 +28,16 @@ idle self-restart slices. The remaining important automation gaps are:
 - live Agent activity is available from Codex session logs but not yet treated
   as a first-class dashboard surface
 
-Dashboard UX follow-up: Worker activity should be promoted to a first-class panel so execution progress, phase events, and actionable evidence stay visible without expanding raw logs by default.
+Dashboard UX follow-ups:
+
+- Worker activity should be promoted to a first-class panel so execution
+  progress, phase events, and actionable evidence stay visible without
+  expanding raw logs by default.
+- Low-cost mode should become visible in the dashboard. The first UI slice can
+  show whether `[run].low_cost_mode` is active and display the effective
+  Planner/Worker/Reviewer `service_tier` for new runs. A later slice can add a
+  backend-owned action for toggling the mode, rather than letting frontend
+  mutate config files directly.
 
 ## Future Evolution Directions
 
@@ -462,19 +471,50 @@ write durable phase output before c-orch considers the phase complete.
 
 ## Suggested Order
 
-1. Promote live Planner/Worker activity from Codex session logs into the
-   dashboard as first-class run activity.
-2. Improve run-history performance telemetry and add a project-level
-   retrospective view for phase timing and bottleneck suggestions.
-3. Define the policy for removing human plan approval from the normal
-   proposal-to-execution path while keeping optional approval modes.
-4. Design proposal decomposition so large human intents can become a small
-   sequence of commit-sized tasks.
-5. Define and persist runner lease metadata for active Planner/Worker/reviewer
-   phases.
-6. Move long-running Planner/Worker/reviewer calls into supervised runner
-   subprocesses.
-7. Reconcile runner leases on runtime startup so stale, alive, completed, and
-   failed phases become explicit recovery decisions.
-8. Extend self-bootstrap restart from idle-only to drain-and-restart with active
-   external runners.
+This order intentionally puts smaller, lower-risk, high-visibility work before
+larger lifecycle architecture changes.
+
+1. Low-cost mode dashboard visibility.
+   Show current config/effective mode and Planner/Worker/Reviewer
+   `service_tier` clearly in the dashboard. Keep the first slice read-only or
+   backend-authored; defer a writeable toggle until the backend action is
+   explicit.
+2. Stalled Worker recovery action.
+   Detect a Worker attempt whose transcript/heartbeat stops advancing, record a
+   `worker_stalled` event, mark the task retryable, preserve the worktree, and
+   expose normal retry handling.
+3. Accepted-review terminalization recovery.
+   Reconcile runs where Planner review is already `accepted` but
+   apply/commit/terminal events are missing, so a runtime restart cannot leave
+   the UI stuck in Planner review.
+4. Live Planner/Worker activity panel.
+   Promote Codex session-log progress into a first-class dashboard surface,
+   including latest phase, retry reason, and concise review/rework summaries.
+5. Retry budget plus backoff.
+   Apply lightweight retry budgets and backoff to infrastructure failures so
+   transient MCP/CLI/session problems do not immediately become manual repair.
+6. Run-history performance telemetry.
+   Aggregate phase timing, retry counts, review durations, and bottleneck
+   categories across runs before attempting deeper performance optimization.
+7. Proposal quality and scope checks.
+   Add lightweight pre-planning checks that tell humans when a proposal is too
+   vague, too broad, or risky, while keeping the normal path automated.
+8. Proposal decomposition and commit-size control.
+   Let Planner suggest commit-sized subtasks for large intents, then later teach
+   c-orch to enqueue those subtasks with explicit dependencies.
+9. Runner lease metadata.
+   Define and persist active phase ownership, runner id, heartbeat, lease
+   expiry, and safe checkpoint data.
+10. Supervised runner subprocesses.
+    Move long-running Planner/Worker/reviewer calls out of the dashboard
+    runtime once leases and checkpoints are durable.
+11. Runtime-startup lease reconciliation.
+    Reconcile alive, stale, completed, and failed runners into explicit
+    recovery decisions after restart.
+12. Active self-bootstrap drain-and-restart.
+    Extend self-bootstrap restart beyond the idle-only case so c-orch can
+    restart itself while external runners preserve or checkpoint active work.
+13. Same-repo parallel conflict recovery.
+    Add rebase/recreate/apply-conflict recovery for concurrent same-target-repo
+    work. Until then, same-target-repo edits remain serialized or fail with
+    evidence.
