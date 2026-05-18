@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type {
+  AllowedProposalAction,
   AllowedRunAction,
   AllowedTaskAction,
   AgentSummary,
@@ -47,6 +48,7 @@ const statusText: Record<string, string> = {
   PLAN_REVIEW_REQUIRED: "等待人工审核计划",
   PLAN_REVISING: "Planner 修改计划中",
   WAITING_WORKSPACE: "等待 workspace",
+  WAITING_WORKSPACE_CLEAN: "等待工作区清理",
   PLAN_APPROVED: "计划已通过",
   WORKING: "Worker 工作中",
   WORK_DONE: "Worker 已完成",
@@ -133,8 +135,9 @@ function newestFirst<T>(items?: T[] | null): T[] {
 }
 
 const QUEUE_PREVIEW_LIMIT = 5;
+const WORKSPACE_CLEAN_HINT_MESSAGE = "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。";
 
-type ProposalAction = "approve-plan" | "revise-plan";
+type ProposalAction = AllowedProposalAction;
 
 type PendingEntityAction<Action extends string> = {
   entityId: string;
@@ -165,6 +168,8 @@ function proposalRevision(proposal: ProposalRecord): string {
     proposal.task_id ?? "",
     proposal.error ?? "",
     proposal.reason ?? "",
+    proposal.blocker?.message ?? "",
+    proposal.blocker?.status_output ?? "",
   ].join("|");
 }
 
@@ -572,6 +577,7 @@ function ProposalPanel({
         <div className="queueStats" aria-label="计划池统计">
           <span>总数 {summary.total_proposals}</span>
           <span>待审 {summary.review_required}</span>
+          <span>待清理 {summary.waiting_workspace_clean ?? 0}</span>
           <span>失败 {summary.failed}</span>
         </div>
       ) : null}
@@ -628,6 +634,7 @@ function ProposalPanel({
               status={proposal.status}
               error={proposal.error}
               reason={proposal.reason}
+              blocker={proposal.blocker}
               plan={proposal.plan_detail}
               fallbackSummary={proposal.run?.plan?.summary}
             />
@@ -659,6 +666,17 @@ function ProposalPanel({
                 </button>
               </div>
             ) : null}
+            {proposal.allowed_actions.includes("retry-plan") ? (
+              <div className="proposalActions">
+                <button
+                  type="button"
+                  onClick={() => proposalAction(proposal, "retry-plan")}
+                  disabled={proposalActionPending}
+                >
+                  {pendingAction === "retry-plan" ? "处理中..." : "重试生成计划"}
+                </button>
+              </div>
+            ) : null}
                 </>
               );
             })()}
@@ -674,16 +692,37 @@ function ProposalPlanPanel({
   status,
   error,
   reason,
+  blocker,
   plan,
   fallbackSummary,
 }: {
   status: string;
   error?: string | null;
   reason?: string | null;
+  blocker?: {
+    message?: string | null;
+    suggested_action?: string | null;
+    status_output?: string | null;
+    command?: string | null;
+  } | null;
   plan?: ProposalPlanDetail | null;
   fallbackSummary?: string | null;
 }) {
   if (!plan) {
+    if (status === "WAITING_WORKSPACE_CLEAN") {
+      return (
+        <div className="proposalPlan">
+          <p>{displayValue(blocker?.message ?? WORKSPACE_CLEAN_HINT_MESSAGE)}</p>
+          {blocker?.suggested_action ? <p className="meta">{displayValue(blocker.suggested_action)}</p> : null}
+          {blocker?.command ? <p className="meta mono">{displayValue(blocker.command)}</p> : null}
+          {blocker?.status_output ? (
+            <Collapsible title="git status --short 输出" open>
+              <pre>{blocker.status_output}</pre>
+            </Collapsible>
+          ) : null}
+        </div>
+      );
+    }
     if (status === "PLANNING") {
       return <p className="meta">Planner 方案生成中...</p>;
     }

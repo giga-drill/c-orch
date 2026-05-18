@@ -12,6 +12,7 @@ Pathish = Union[str, Path]
 
 PROPOSAL_PLANNING = "PLANNING"
 PROPOSAL_WAITING_WORKSPACE = "WAITING_WORKSPACE"
+PROPOSAL_WAITING_WORKSPACE_CLEAN = "WAITING_WORKSPACE_CLEAN"
 PROPOSAL_PLAN_REVIEW_REQUIRED = "PLAN_REVIEW_REQUIRED"
 PROPOSAL_PLAN_REVISING = "PLAN_REVISING"
 PROPOSAL_APPROVED = "APPROVED"
@@ -45,6 +46,7 @@ class ProposalRecord:
     updated_at: str = field(default_factory=_now_iso)
     error: Optional[str] = None
     reason: Optional[str] = None
+    blocker: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -59,6 +61,7 @@ class ProposalRecord:
             "updated_at": self.updated_at,
             "error": self.error,
             "reason": self.reason,
+            "blocker": self.blocker,
         }
 
     @classmethod
@@ -76,6 +79,7 @@ class ProposalRecord:
             updated_at=str(data.get("updated_at", now)),
             error=data.get("error"),
             reason=data.get("reason"),
+            blocker=_optional_object(data.get("blocker")),
         )
 
 
@@ -226,6 +230,8 @@ class ProposalStore:
                 proposal.cwd = _as_string(proposal.cwd, field_name=f"proposals[{index}].cwd")
             if not proposal.status:
                 proposal.status = PROPOSAL_PLANNING
+            if proposal.blocker is not None and not isinstance(proposal.blocker, dict):
+                raise ValueError(f"proposals[{index}].blocker must be an object")
 
     def _new_proposal_id(self, pool: ProposalPool, *, title: str) -> str:
         base = _slug(title) or "proposal"
@@ -261,3 +267,11 @@ def _optional_text(value: Any) -> Optional[str]:
         return text or None
     text = str(value).strip()
     return text or None
+
+
+def _optional_object(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return dict(value)

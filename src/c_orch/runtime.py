@@ -27,6 +27,7 @@ from .proposal_store import (
     PROPOSAL_PLANNING,
     PROPOSAL_QUEUED,
     PROPOSAL_WAITING_WORKSPACE,
+    PROPOSAL_WAITING_WORKSPACE_CLEAN,
     ProposalRecord,
     ProposalStore,
 )
@@ -55,12 +56,21 @@ from .task_store import (
     TaskStore,
 )
 from .worktrees import create_worker_worktree
-from .workspace_lanes import WorkspaceResolutionError, canonical_git_root
+from .workspace_lanes import (
+    WorkspaceCleanStatus,
+    WorkspaceResolutionError,
+    WorkspaceStatusCommandError,
+    canonical_git_root,
+    workspace_clean_status,
+)
 
 
 Pathish = Union[str, Path]
 RunActionResponse = Optional[Tuple[HTTPStatus, Dict[str, Any]]]
 DriverFactory = Callable[[str], ContextManager[CodexDriver]]
+
+WORKSPACE_DIRTY_MESSAGE = "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。"
+WORKSPACE_DIRTY_SUGGESTED_ACTION = "请先处理目标仓库改动，然后点击“重试生成计划”。"
 
 
 class _UnusedCodexDriver:
@@ -244,7 +254,7 @@ class COrchRuntime:
         with self._action_lock, self._proposal_lock, self._queue_lock:
             if self.proposals_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing proposals file"}
-            if self.queue_path is None:
+            if action == "approve-plan" and self.queue_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
             result = proposal_action(
                 self.proposals_path,
@@ -253,10 +263,14 @@ class COrchRuntime:
                 feedback,
                 runs_dir=self.runs_dir,
                 queue_path=self.queue_path,
+                config=self._scheduler_config,
+                worktree_factory=self._worktree_factory,
                 driver_factory=self._driver_context,
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
+                if action == "retry-plan":
+                    self.dispatch_proposals_async()
             selected_run_id = _selected_run_from_payload(result[1]) if result is not None else None
             return self._attach_state(result, selected_run_id=selected_run_id)
 
@@ -777,6 +791,37 @@ class COrchRuntime:
                 ):
                     continue
                 try:
+                    clean_status = _check_workspace_clean_or_raise(proposal_cwd)
+                except WorkspaceStatusCommandError as exc:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal.proposal_id,
+                        status=PROPOSAL_FAILED,
+                        error=str(exc),
+                        reason="workspace_git_status_failed",
+                        blocker=_workspace_status_command_blocker(
+                            cwd=proposal_cwd,
+                            error=str(exc),
+                        ),
+                    )
+                    promoted += 1
+                    continue
+                if not clean_status.clean:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal.proposal_id,
+                        status=PROPOSAL_WAITING_WORKSPACE_CLEAN,
+                        run_id=None,
+                        error=None,
+                        reason="workspace_clean",
+                        blocker=_workspace_dirty_blocker(
+                            cwd=proposal_cwd,
+                            clean_status=clean_status,
+                        ),
+                    )
+                    promoted += 1
+                    continue
+                try:
                     manifest = _create_preflight_run(
                         run_store=run_store,
                         config=self._scheduler_config,
@@ -801,6 +846,7 @@ class COrchRuntime:
                     status=PROPOSAL_PLANNING,
                     error=None,
                     reason="planner",
+                    blocker=None,
                 )
                 promoted += 1
             if promoted:
@@ -875,9 +921,90 @@ class COrchRuntime:
             self.dispatch_proposals_async()
             self.dispatch_queue_async()
 
+    def _preflight_proposal_planning(
+        self,
+        *,
+        proposal_id: str,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        if self.proposals_path is None or self._scheduler_config is None:
+            return False, None
+        with self._action_lock:
+            proposal_store = ProposalStore(self.proposals_path)
+            try:
+                pool = proposal_store.load()
+                proposal = proposal_store.find(pool, proposal_id)
+            except (OSError, ValueError):
+                return False, None
+            if proposal.status != PROPOSAL_PLANNING:
+                return False, proposal.run_id or run_id
+            try:
+                proposal_cwd = _resolve_task_cwd(proposal.cwd, default_cwd=self._scheduler_config.cwd)
+            except ValueError as exc:
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    status=PROPOSAL_FAILED,
+                    error=str(exc),
+                    reason="workspace_resolution_failed",
+                    blocker=_workspace_resolution_blocker(
+                        cwd=proposal.cwd,
+                        error=str(exc),
+                    ),
+                )
+                proposal_store.save(pool)
+                return False, proposal.run_id or run_id
+            try:
+                clean_status = _check_workspace_clean_or_raise(proposal_cwd)
+            except WorkspaceStatusCommandError as exc:
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    status=PROPOSAL_FAILED,
+                    error=str(exc),
+                    reason="workspace_git_status_failed",
+                    blocker=_workspace_status_command_blocker(
+                        cwd=proposal_cwd,
+                        error=str(exc),
+                    ),
+                )
+                proposal_store.save(pool)
+                return False, proposal.run_id or run_id
+            if not clean_status.clean:
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    status=PROPOSAL_WAITING_WORKSPACE_CLEAN,
+                    error=None,
+                    reason="workspace_clean",
+                    blocker=_workspace_dirty_blocker(
+                        cwd=proposal_cwd,
+                        clean_status=clean_status,
+                    ),
+                )
+                proposal_store.save(pool)
+                return False, proposal.run_id or run_id
+            if proposal.blocker is not None or proposal.reason == "workspace_clean":
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    blocker=None,
+                    error=None,
+                    reason="planner",
+                )
+                proposal_store.save(pool)
+            return True, proposal.run_id or run_id
+
     def _process_proposal_planning_job(self, *, proposal_id: str, run_id: str) -> None:
         if self._scheduler_config is None:
             return
+        should_continue, current_run_id = self._preflight_proposal_planning(
+            proposal_id=proposal_id,
+            run_id=run_id,
+        )
+        if not should_continue:
+            return
+        run_id = current_run_id or run_id
         run_store = RunStore(self.runs_dir)
         try:
             manifest = run_store.load(run_id)
@@ -938,7 +1065,7 @@ class COrchRuntime:
                 proposal = proposal_store.find(pool, proposal_id)
             except (OSError, ValueError):
                 return
-            if proposal.status == PROPOSAL_FAILED:
+            if proposal.status in {PROPOSAL_FAILED, PROPOSAL_WAITING_WORKSPACE_CLEAN}:
                 return
             status = _proposal_status_from_run(manifest)
             error = None
@@ -951,6 +1078,7 @@ class COrchRuntime:
                 status=status,
                 error=error,
                 reason=reason,
+                blocker=None,
             )
             proposal_store.save(pool)
 
@@ -1320,11 +1448,53 @@ def create_proposal(
         prompt=prompt.strip(),
         cwd=str(proposal_cwd),
     )
+    try:
+        clean_status = _check_workspace_clean_or_raise(proposal_cwd)
+    except WorkspaceStatusCommandError as exc:
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=PROPOSAL_FAILED,
+            error=str(exc),
+            reason="workspace_git_status_failed",
+            blocker=_workspace_status_command_blocker(
+                cwd=proposal_cwd,
+                error=str(exc),
+            ),
+        )
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_created_failed_preflight",
+            "proposal_id": proposal.proposal_id,
+        }
+        return HTTPStatus.OK, payload
+    if not clean_status.clean:
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=PROPOSAL_WAITING_WORKSPACE_CLEAN,
+            run_id=None,
+            error=None,
+            reason="workspace_clean",
+            blocker=_workspace_dirty_blocker(
+                cwd=proposal_cwd,
+                clean_status=clean_status,
+            ),
+        )
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_created_waiting_workspace_clean",
+            "proposal_id": proposal.proposal_id,
+        }
+        return HTTPStatus.OK, payload
     if lane_busy:
         proposal_store.update_proposal(
             pool,
             proposal.proposal_id,
             status=PROPOSAL_WAITING_WORKSPACE,
+            blocker=None,
             reason="workspace_lane",
         )
         proposal_store.save(pool)
@@ -1352,6 +1522,7 @@ def create_proposal(
             status=PROPOSAL_PLANNING,
             error=None,
             reason="planner",
+            blocker=None,
         )
         proposal_store.save(pool)
     except Exception as exc:
@@ -1382,10 +1553,12 @@ def proposal_action(
     feedback: Any = None,
     *,
     runs_dir: Pathish,
-    queue_path: Pathish,
+    queue_path: Optional[Pathish],
+    config: Optional[SchedulerConfig],
+    worktree_factory: Optional[Callable[..., Path]],
     driver_factory: DriverFactory,
 ) -> RunActionResponse:
-    if action not in {"approve-plan", "revise-plan"}:
+    if action not in {"approve-plan", "revise-plan", "retry-plan"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
     proposals_file = Path(proposals_path).expanduser().resolve()
     proposal_store = ProposalStore(proposals_file)
@@ -1394,6 +1567,153 @@ def proposal_action(
         proposal = proposal_store.find(pool, proposal_id)
     except (OSError, ValueError) as exc:
         return HTTPStatus.NOT_FOUND, {"error": str(exc)}
+    if action == "retry-plan":
+        if config is None:
+            return HTTPStatus.BAD_REQUEST, {"error": "missing execution config"}
+        if proposal.status not in {PROPOSAL_WAITING_WORKSPACE, PROPOSAL_WAITING_WORKSPACE_CLEAN, PROPOSAL_FAILED}:
+            return HTTPStatus.CONFLICT, {
+                "error": (
+                    "retry-plan requires WAITING_WORKSPACE, WAITING_WORKSPACE_CLEAN, "
+                    f"or FAILED proposal status, current status is {proposal.status}"
+                ),
+                "status": proposal.status,
+            }
+        if proposal.status == PROPOSAL_FAILED and proposal.reason not in {
+            "workspace_resolution_failed",
+            "workspace_git_status_failed",
+            "proposal_preflight_failed",
+            "workspace_clean",
+        }:
+            return HTTPStatus.CONFLICT, {
+                "error": f"retry-plan does not support failed reason: {proposal.reason}",
+                "status": proposal.status,
+                "reason": proposal.reason,
+            }
+        try:
+            proposal_cwd = _resolve_task_cwd(proposal.cwd, default_cwd=config.cwd)
+            workspace_root = canonical_git_root(proposal_cwd)
+        except (ValueError, WorkspaceResolutionError) as exc:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_FAILED,
+                error=str(exc),
+                reason="workspace_resolution_failed",
+                blocker=_workspace_resolution_blocker(
+                    cwd=proposal.cwd,
+                    error=str(exc),
+                ),
+            )
+            proposal_store.save(pool)
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        lane_busy = _workspace_lane_is_locked(
+            workspace_root=workspace_root,
+            proposals=pool.proposals,
+            queue_path=queue_path,
+            run_store=run_store,
+            ignore_proposal_id=proposal.proposal_id,
+        )
+        if lane_busy:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_WAITING_WORKSPACE,
+                error=None,
+                reason="workspace_lane",
+                blocker=None,
+            )
+            proposal_store.save(pool)
+            payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+            payload["transition"] = {
+                "type": "proposal_retry_waiting_workspace",
+                "proposal_id": proposal.proposal_id,
+            }
+            return HTTPStatus.OK, payload
+        try:
+            clean_status = _check_workspace_clean_or_raise(proposal_cwd)
+        except WorkspaceStatusCommandError as exc:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_FAILED,
+                error=str(exc),
+                reason="workspace_git_status_failed",
+                blocker=_workspace_status_command_blocker(
+                    cwd=proposal_cwd,
+                    error=str(exc),
+                ),
+            )
+            proposal_store.save(pool)
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        if not clean_status.clean:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_WAITING_WORKSPACE_CLEAN,
+                error=None,
+                reason="workspace_clean",
+                blocker=_workspace_dirty_blocker(
+                    cwd=proposal_cwd,
+                    clean_status=clean_status,
+                ),
+            )
+            proposal_store.save(pool)
+            payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+            payload["transition"] = {
+                "type": "proposal_retry_waiting_workspace_clean",
+                "proposal_id": proposal.proposal_id,
+            }
+            return HTTPStatus.OK, payload
+
+        manifest: Optional[RunManifest] = None
+        if proposal.run_id:
+            try:
+                loaded = run_store.load(proposal.run_id)
+            except OSError:
+                loaded = None
+            if loaded is not None and loaded.status in {"NEW", "PLANNING"}:
+                manifest = loaded
+        if manifest is None:
+            try:
+                manifest = _create_preflight_run(
+                    run_store=run_store,
+                    config=config,
+                    user_task=proposal.prompt,
+                    task_cwd=proposal_cwd,
+                    worktree_factory=worktree_factory,
+                )
+            except Exception as exc:
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    status=PROPOSAL_FAILED,
+                    error=str(exc),
+                    reason="proposal_preflight_failed",
+                    blocker=None,
+                )
+                proposal_store.save(pool)
+                return HTTPStatus.CONFLICT, {"error": str(exc)}
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            run_id=manifest.run_id,
+            cwd=str(proposal_cwd),
+            status=PROPOSAL_PLANNING,
+            error=None,
+            reason="planner",
+            blocker=None,
+        )
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_retry_planning",
+            "proposal_id": proposal.proposal_id,
+            "run_id": manifest.run_id,
+            "selected_run_id": manifest.run_id,
+        }
+        return HTTPStatus.OK, payload
     if not proposal.run_id:
         return HTTPStatus.CONFLICT, {"error": "proposal has no Planner run"}
     run_store = RunStore(Path(runs_dir).expanduser().resolve())
@@ -1429,6 +1749,7 @@ def proposal_action(
                 status=PROPOSAL_FAILED,
                 error=str(exc),
                 reason="proposal_revision_failed",
+                blocker=None,
             )
             proposal_store.save(pool)
             return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
@@ -1438,6 +1759,7 @@ def proposal_action(
             status=_proposal_status_from_run(manifest),
             error=None,
             reason=derive_run_waiting_for(manifest),
+            blocker=None,
         )
         proposal_store.save(pool)
         payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
@@ -1450,6 +1772,8 @@ def proposal_action(
         return HTTPStatus.OK, payload
 
     _approve_manifest_plan(run_store, manifest)
+    if queue_path is None:
+        return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
     task_id = _enqueue_approved_proposal(
         queue_path=queue_path,
         proposal=proposal,
@@ -1576,6 +1900,46 @@ def _same_workspace(path: Pathish, workspace_root: Path) -> bool:
         return canonical_git_root(path) == workspace_root
     except WorkspaceResolutionError:
         return False
+
+
+def _check_workspace_clean_or_raise(path: Path) -> WorkspaceCleanStatus:
+    return workspace_clean_status(path)
+
+
+def _workspace_dirty_blocker(*, cwd: Path, clean_status: WorkspaceCleanStatus) -> Dict[str, Any]:
+    return {
+        "type": "workspace_dirty",
+        "message": WORKSPACE_DIRTY_MESSAGE,
+        "suggested_action": WORKSPACE_DIRTY_SUGGESTED_ACTION,
+        "status_output": clean_status.status_output,
+        "command": clean_status.command,
+        "cwd": str(cwd),
+        "root": str(clean_status.root),
+    }
+
+
+def _workspace_status_command_blocker(*, cwd: Path, error: str) -> Dict[str, Any]:
+    return {
+        "type": "workspace_status_command_failed",
+        "message": "无法检查目标工作区改动，请先确认目标仓库状态。",
+        "suggested_action": WORKSPACE_DIRTY_SUGGESTED_ACTION,
+        "status_output": None,
+        "command": f"git -C {cwd} status --short",
+        "cwd": str(cwd),
+        "error": error,
+    }
+
+
+def _workspace_resolution_blocker(*, cwd: Optional[str], error: str) -> Dict[str, Any]:
+    return {
+        "type": "workspace_resolution_failed",
+        "message": "无法解析目标工作区，请检查 cwd 是否有效且位于 Git 仓库中。",
+        "suggested_action": "请修正目标仓库路径后重试生成计划。",
+        "status_output": None,
+        "command": None,
+        "cwd": cwd,
+        "error": error,
+    }
 
 
 

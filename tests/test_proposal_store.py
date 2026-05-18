@@ -53,6 +53,34 @@ class ProposalStoreTests(unittest.TestCase):
             self.assertEqual(pool.proposals[0].proposal_id, "proposal-001")
             self.assertIsNone(pool.proposals[0].cwd)
 
+    def test_proposal_blocker_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProposalStore(Path(tmp) / "proposals.json")
+            pool = store.create()
+            proposal = store.add_proposal(
+                pool,
+                title="Dirty workspace proposal",
+                prompt="Do task 1",
+                cwd="/tmp/repo-a",
+            )
+            store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                blocker={
+                    "type": "workspace_dirty",
+                    "message": "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。",
+                    "status_output": " M src/main.py",
+                    "command": "git -C /tmp/repo-a status --short",
+                },
+            )
+            store.save(pool)
+
+            loaded = store.load()
+            self.assertIsNotNone(loaded.proposals[0].blocker)
+            assert loaded.proposals[0].blocker is not None
+            self.assertEqual(loaded.proposals[0].blocker["type"], "workspace_dirty")
+            self.assertIn("src/main.py", loaded.proposals[0].blocker["status_output"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -107,6 +107,14 @@ already approved to run automatically:
 approved plan -> Worker execution -> Planner review -> apply -> commit
 ```
 
+Proposal planning must pass a backend workspace-clean preflight guard before
+Planner generation starts. The guard runs against the proposal/task target
+`cwd` (not the controller repo), resolves its Git root, and checks
+`git -C <root> status --short`. If the target workspace is dirty, the proposal
+stays in the pool as `WAITING_WORKSPACE_CLEAN` with blocker details; c-orch
+must not create/advance Planner calls for that proposal until the user cleans
+the target repo and retries plan generation.
+
 This boundary keeps the queue pipeline from stopping on human plan review. The
 queue may still stop at explicit operational gates such as restart confirmation
 or failed task retry, but it should not treat "waiting for human plan approval"

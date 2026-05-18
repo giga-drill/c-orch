@@ -606,6 +606,81 @@ class RuntimeTests(unittest.TestCase):
             block_event.set()
             self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
 
+    def test_create_proposal_dirty_workspace_waits_for_clean_without_planner_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status, payload = runtime.create_proposal("Task dirty", "Do task dirty")
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_created_waiting_workspace_clean")
+            proposal = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(proposal.status, "WAITING_WORKSPACE_CLEAN")
+            self.assertIsNone(proposal.run_id)
+            self.assertIsNotNone(proposal.blocker)
+            assert proposal.blocker is not None
+            self.assertEqual(
+                proposal.blocker["message"],
+                "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。",
+            )
+            self.assertIn("dirty.txt", proposal.blocker["status_output"])
+            self.assertEqual(fake_planner.run_calls, 0)
+            self.assertEqual(list((root / "runs").glob("*/manifest.json")), [])
+
+    def test_retry_plan_rechecks_workspace_and_runs_planner_after_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            dirty_path = repo / "dirty.txt"
+            dirty_path.write_text("dirty\n", encoding="utf-8")
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            create_status, _create_payload = runtime.create_proposal("Task retry", "Do task retry")
+            self.assertEqual(int(create_status), 200)
+            proposal_id = ProposalStore(root / "proposals.json").load().proposals[0].proposal_id
+
+            retry_dirty_status, retry_dirty_payload = runtime.proposal_action(proposal_id, "retry-plan")
+            self.assertEqual(int(retry_dirty_status), 200)
+            self.assertEqual(
+                retry_dirty_payload["transition"]["type"],
+                "proposal_retry_waiting_workspace_clean",
+            )
+            self.assertEqual(fake_planner.run_calls, 0)
+
+            dirty_path.unlink()
+            retry_clean_status, retry_clean_payload = runtime.proposal_action(proposal_id, "retry-plan")
+            self.assertEqual(int(retry_clean_status), 200)
+            self.assertEqual(retry_clean_payload["transition"]["type"], "proposal_retry_planning")
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(proposals[0]["status"], "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(proposals[0]["allowed_actions"], ["approve-plan", "revise-plan"])
+            self.assertEqual(fake_planner.run_calls, 1)
+
     def test_proposal_background_planning_success_updates_plan_detail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

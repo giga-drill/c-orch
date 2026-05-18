@@ -1,7 +1,7 @@
 export type AllowedRunAction = "retry-review" | "retry-verification";
 export type AllowedTaskAction = "retry-task" | "retry-verification" | "mark-handled-skipped";
 export type AllowedQueueAction = "confirm-runtime-restarted";
-export type AllowedProposalAction = "approve-plan" | "revise-plan";
+export type AllowedProposalAction = "approve-plan" | "revise-plan" | "retry-plan";
 
 export interface QueueSummary {
   total_tasks: number;
@@ -57,6 +57,7 @@ export interface ProposalSummary {
   failed: number;
   active: number;
   waiting_workspace?: number;
+  waiting_workspace_clean?: number;
 }
 
 export interface ProposalPoolRecord {
@@ -87,6 +88,16 @@ export interface ProposalRecord {
   updated_at: string;
   error: string | null;
   reason: string | null;
+  blocker?: {
+    type?: string | null;
+    message?: string | null;
+    suggested_action?: string | null;
+    status_output?: string | null;
+    command?: string | null;
+    cwd?: string | null;
+    root?: string | null;
+    error?: string | null;
+  } | null;
   waiting_for: string;
   allowed_actions: AllowedProposalAction[];
   run: RunListItem | null;

@@ -14,11 +14,23 @@ class WorkspaceResolutionError(ValueError):
     pass
 
 
+class WorkspaceStatusCommandError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class WorkspaceLane:
     workspace_id: str
     root: Path
     slug: str
+
+
+@dataclass(frozen=True)
+class WorkspaceCleanStatus:
+    root: Path
+    clean: bool
+    status_output: str
+    command: str
 
 
 def resolve_workspace_lane(path: Pathish) -> WorkspaceLane:
@@ -77,3 +89,29 @@ def optional_workspace_lane(path: Optional[Pathish]) -> Optional[WorkspaceLane]:
     if path is None:
         return None
     return resolve_workspace_lane(path)
+
+
+def workspace_clean_status(path: Pathish) -> WorkspaceCleanStatus:
+    root = canonical_git_root(path)
+    command_parts = ["git", "-C", str(root), "status", "--short"]
+    result = subprocess.run(
+        command_parts,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    command = " ".join(command_parts)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        raise WorkspaceStatusCommandError(
+            f"failed to run `{command}`: {detail}"
+        )
+    status_output = (result.stdout or "").rstrip()
+    return WorkspaceCleanStatus(
+        root=root,
+        clean=not bool(status_output.strip()),
+        status_output=status_output,
+        command=command,
+    )

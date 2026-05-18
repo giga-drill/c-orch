@@ -526,6 +526,35 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["proposals"][0]["plan_detail"]["acceptance_criteria"], ["Acceptance 1"])
             self.assertEqual(payload["proposals"][0]["plan_detail"]["verification_commands"], ["pytest"])
 
+    def test_build_proposals_payload_waiting_workspace_clean_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task dirty", prompt="Do task dirty")
+            proposal.status = "WAITING_WORKSPACE_CLEAN"
+            proposal.cwd = str(root / "repo-a")
+            proposal.blocker = {
+                "type": "workspace_dirty",
+                "message": "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。",
+                "suggested_action": "请先处理目标仓库改动，然后点击“重试生成计划”。",
+                "status_output": " M src/main.py",
+                "command": "git -C /tmp/repo-a status --short",
+            }
+            proposal_store.save(pool)
+
+            payload = build_proposals_payload(root / "proposals.json", runs_dir=root / "runs")
+
+            self.assertEqual(payload["summary"]["waiting_workspace_clean"], 1)
+            self.assertEqual(payload["proposals"][0]["status"], "WAITING_WORKSPACE_CLEAN")
+            self.assertEqual(payload["proposals"][0]["waiting_for"], "workspace_clean")
+            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
+            self.assertEqual(
+                payload["proposals"][0]["blocker"]["message"],
+                "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。",
+            )
+            self.assertIn("src/main.py", payload["proposals"][0]["blocker"]["status_output"])
+
     def test_proposal_approve_queues_approved_plan_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -553,6 +582,8 @@ class UiTests(unittest.TestCase):
                 "approve-plan",
                 runs_dir=root / "runs",
                 queue_path=root / "queue.json",
+                config=None,
+                worktree_factory=None,
                 driver_factory=_unused_driver_factory,
             )
             queue = TaskStore(root / "queue.json").load()
@@ -925,6 +956,10 @@ class UiTests(unittest.TestCase):
         self.assertIn("目标仓库路径", app_source)
         self.assertIn("Planner 方案生成中", app_source)
         self.assertIn("Planner 方案生成中...", app_source)
+        self.assertIn("WAITING_WORKSPACE_CLEAN", app_source)
+        self.assertIn("重试生成计划", app_source)
+        self.assertIn("git status --short 输出", app_source)
+        self.assertIn("目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。", app_source)
         self.assertIn("规划失败：", app_source)
         self.assertIn("通过并加入执行队列", app_source)
         self.assertIn("pendingProposalAction", app_source)
