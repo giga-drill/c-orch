@@ -47,6 +47,21 @@ PLANNER_REVIEW_INSTRUCTIONS = """Review depth requirements:
   evidence."""
 
 
+DECOMPOSITION_ADVISORY_INSTRUCTIONS = """Advisory decomposition suggestion requirements:
+- Add optional `decomposition_suggestion` in the plan JSON.
+- This field is advisory only for phase 1: suggest boundaries and order, but do
+  not create multiple queue tasks and do not describe dependency scheduling.
+- Recommend decomposition when expected scope spans multiple modules/workflows,
+  verification surface is broad, architecture risk is high, or rollback would
+  mix unrelated concerns.
+- Keep one task when scope is a single coherent behavior/module with a small
+  verification surface and one clean commit message.
+- If `recommended` is true, include commit-sized subtasks in execution order.
+  Each subtask should be reviewable, rollback-friendly, and coherent.
+- If `recommended` is false, still provide a clear reason for keeping one task.
+"""
+
+
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:
     return f"""You are the Planner for c-orch.
 
@@ -65,6 +80,8 @@ Use Simplified Chinese for all human-readable plan content, including summary,
 acceptance_criteria, worker_prompt, and risk_notes. Keep JSON keys, status
 values, file paths, and commands unchanged.
 
+{DECOMPOSITION_ADVISORY_INSTRUCTIONS}
+
 Return exactly one JSON object with this shape:
 {{
   "status": "plan_ready",
@@ -72,7 +89,19 @@ Return exactly one JSON object with this shape:
   "acceptance_criteria": ["Criterion 1"],
   "worker_prompt": "Self-contained Worker instructions",
   "verification_commands": ["command to run"],
-  "risk_notes": ["Risk note"]
+  "risk_notes": ["Risk note"],
+  "decomposition_suggestion": {{
+    "recommended": true,
+    "reason": "Why split or not split",
+    "subtasks": [
+      {{
+        "id": "subtask-1",
+        "title": "Subtask title",
+        "goal": "Subtask goal",
+        "acceptance_criteria": ["Subtask criterion"]
+      }}
+    ]
+  }}
 }}
 """
 
@@ -188,6 +217,8 @@ Use Simplified Chinese for all human-readable plan content, including summary,
 acceptance_criteria, worker_prompt, and risk_notes. Keep JSON keys, status
 values, file paths, and commands unchanged.
 
+{DECOMPOSITION_ADVISORY_INSTRUCTIONS}
+
 Return exactly one complete JSON plan object with this shape:
 {{
   "status": "plan_ready",
@@ -195,7 +226,19 @@ Return exactly one complete JSON plan object with this shape:
   "acceptance_criteria": ["Criterion 1"],
   "worker_prompt": "Self-contained Worker instructions",
   "verification_commands": ["command to run"],
-  "risk_notes": ["Risk note"]
+  "risk_notes": ["Risk note"],
+  "decomposition_suggestion": {{
+    "recommended": true,
+    "reason": "Why split or not split",
+    "subtasks": [
+      {{
+        "id": "subtask-1",
+        "title": "Subtask title",
+        "goal": "Subtask goal",
+        "acceptance_criteria": ["Subtask criterion"]
+      }}
+    ]
+  }}
 }}
 """
 

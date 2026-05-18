@@ -68,6 +68,19 @@ export interface ProposalPoolRecord {
   updated_at: string;
 }
 
+export interface DecompositionSubtask {
+  id: string;
+  title: string;
+  goal: string;
+  acceptance_criteria: string[];
+}
+
+export interface DecompositionSuggestion {
+  recommended: boolean;
+  reason: string;
+  subtasks: DecompositionSubtask[];
+}
+
 export interface ProposalPlanDetail {
   approval_status: string | null;
   summary: string | null;
@@ -75,6 +88,7 @@ export interface ProposalPlanDetail {
   risk_notes: string[];
   acceptance_criteria: string[];
   verification_commands: string[];
+  decomposition_suggestion: DecompositionSuggestion | null;
 }
 
 export interface ProposalRecord {
@@ -296,6 +310,7 @@ export interface PlanRecord {
   worker_prompt: string;
   risk_notes: string[];
   raw: Record<string, unknown>;
+  decomposition_suggestion: DecompositionSuggestion | null;
   approval_status: string;
   approved_at: string | null;
   approved_by: string | null;

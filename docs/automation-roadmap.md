@@ -136,6 +136,29 @@ risk, and whether a rollback would need to undo unrelated concerns. The first
 version can be advisory: Planner proposes a decomposition and c-orch records
 the suggested subtask boundaries before later automating the split.
 
+Status (phase 1 delivered):
+
+- Planner initial-plan and revise-plan contracts now support optional
+  `decomposition_suggestion`:
+  - `recommended: boolean`
+  - `reason: string`
+  - `subtasks: [{id,title,goal,acceptance_criteria[]}]`
+- `subtasks` order is the suggested execution order.
+- Suggestion remains advisory only. c-orch does not auto-create multiple queue
+  tasks, does not add DAG/dependency scheduling, and does not alter proposal or
+  queue state machines.
+- Proposal payload (`plan_detail`) and run manifest data now persist and expose
+  the suggestion for dashboard rendering.
+
+Suggested split heuristics:
+
+- Recommend split when expected work spans multiple modules or workflows,
+  verification surface is broad, architecture risk is elevated, or rollback
+  would mix unrelated concerns.
+- Keep a single task when work stays in one coherent module/behavior, has a
+  small verification surface, and can still produce one clear commit with a
+  straightforward rollback path.
+
 ## 1. Code Review Gate
 
 ### Goal

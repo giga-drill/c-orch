@@ -172,6 +172,18 @@ class RunStoreTests(unittest.TestCase):
                 worker_prompt="Implement the focused path",
                 risk_notes=["Keep scope tight"],
                 raw={"status": "plan_ready"},
+                decomposition_suggestion={
+                    "recommended": True,
+                    "reason": "Split for safer rollback",
+                    "subtasks": [
+                        {
+                            "id": "subtask-1",
+                            "title": "Backend slice",
+                            "goal": "Add backend contract",
+                            "acceptance_criteria": ["Backend tests pass"],
+                        }
+                    ],
+                },
                 approval_status="approved",
                 approved_at="2026-05-12T09:00:00+08:00",
                 approved_by="human",
@@ -223,6 +235,21 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(loaded.plan.worker_prompt, "Implement the focused path")
             self.assertEqual(loaded.plan.risk_notes, ["Keep scope tight"])
             self.assertEqual(loaded.plan.raw, {"status": "plan_ready"})
+            self.assertEqual(
+                loaded.plan.decomposition_suggestion,
+                {
+                    "recommended": True,
+                    "reason": "Split for safer rollback",
+                    "subtasks": [
+                        {
+                            "id": "subtask-1",
+                            "title": "Backend slice",
+                            "goal": "Add backend contract",
+                            "acceptance_criteria": ["Backend tests pass"],
+                        }
+                    ],
+                },
+            )
             self.assertEqual(loaded.plan.approval_status, "approved")
             self.assertEqual(loaded.plan.approved_by, "human")
             self.assertEqual(len(loaded.plan_revisions), 1)
@@ -246,6 +273,37 @@ class RunStoreTests(unittest.TestCase):
             self.assertFalse(loaded.review_attempts[0].retry_budget_exhausted)
             self.assertEqual(loaded.workers[0].result["summary"], "done")
             self.assertIsNotNone(loaded.timing)
+
+    def test_load_manifest_without_plan_decomposition_suggestion_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(root / "runs")
+            manifest = store.create_run(
+                cwd=root,
+                user_task="Compat plan field",
+                planner_model="planner-model",
+                worker_model="worker-model",
+            )
+            manifest.plan = PlanRecord(
+                summary="Summary",
+                worker_prompt="Prompt",
+                risk_notes=["risk"],
+            )
+            store.save(manifest)
+            manifest_path = root / "runs" / manifest.run_id / "manifest.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            plan = data.get("plan") or {}
+            if isinstance(plan, dict):
+                plan.pop("decomposition_suggestion", None)
+            manifest_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = store.load(manifest.run_id)
+
+            self.assertIsNotNone(loaded.plan)
+            self.assertIsNone(loaded.plan.decomposition_suggestion)  # type: ignore[union-attr]
 
     def test_append_event_and_load_events_preserve_order_and_optional_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -20,6 +20,12 @@ def _list_of_strings(value: Any) -> List[str]:
     return [str(item) for item in value]
 
 
+def _optional_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    return dict(value)
+
+
 def _normalized_status(value: Any) -> str:
     status = str(value)
     return {
@@ -215,6 +221,7 @@ class PlanRecord:
     worker_prompt: str
     risk_notes: List[str] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    decomposition_suggestion: Optional[Dict[str, Any]] = None
     approval_status: str = "pending"
     approved_at: Optional[str] = None
     approved_by: Optional[str] = None
@@ -225,6 +232,9 @@ class PlanRecord:
             "worker_prompt": self.worker_prompt,
             "risk_notes": list(self.risk_notes),
             "raw": dict(self.raw),
+            "decomposition_suggestion": dict(self.decomposition_suggestion)
+            if isinstance(self.decomposition_suggestion, dict)
+            else None,
             "approval_status": self.approval_status,
             "approved_at": self.approved_at,
             "approved_by": self.approved_by,
@@ -238,6 +248,7 @@ class PlanRecord:
             worker_prompt=str(data.get("worker_prompt", "")),
             risk_notes=_list_of_strings(data.get("risk_notes")),
             raw=dict(raw) if isinstance(raw, dict) else {},
+            decomposition_suggestion=_optional_dict(data.get("decomposition_suggestion")),
             approval_status=str(data.get("approval_status", "pending")),
             approved_at=data.get("approved_at"),
             approved_by=data.get("approved_by"),

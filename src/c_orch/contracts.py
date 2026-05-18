@@ -54,6 +54,7 @@ class PlannerPlan:
     worker_prompt: str
     verification_commands: List[str]
     risk_notes: List[str]
+    decomposition_suggestion: Optional[Dict[str, Any]]
     raw: Dict[str, Any]
 
     @classmethod
@@ -73,6 +74,11 @@ class PlannerPlan:
             worker_prompt=_expect_string(payload, "worker_prompt"),
             verification_commands=_string_list(payload, "verification_commands"),
             risk_notes=_string_list(payload, "risk_notes", required=False),
+            decomposition_suggestion=_decomposition_suggestion(
+                payload,
+                "decomposition_suggestion",
+                required=False,
+            ),
             raw=dict(payload),
         )
 
@@ -160,3 +166,66 @@ def _string_list(payload: Mapping[str, Any], field: str, required: bool = True) 
     if not all(isinstance(item, str) for item in values):
         raise ContractError(f"{field} must be a list of strings")
     return list(values)
+
+
+def _decomposition_suggestion(
+    payload: Mapping[str, Any],
+    field: str,
+    *,
+    required: bool,
+) -> Optional[Dict[str, Any]]:
+    if field not in payload:
+        if required:
+            raise ContractError(f"missing required field: {field}")
+        return None
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{field} must be an object")
+    recommended = value.get("recommended")
+    if not isinstance(recommended, bool):
+        raise ContractError(f"{field}.recommended must be a boolean")
+    reason = value.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ContractError(f"{field}.reason must be a non-empty string")
+    subtasks_value = value.get("subtasks")
+    if not isinstance(subtasks_value, list):
+        raise ContractError(f"{field}.subtasks must be a list")
+    if recommended and not subtasks_value:
+        raise ContractError(f"{field}.subtasks must be non-empty when recommended is true")
+    subtasks: List[Dict[str, Any]] = []
+    for index, subtask_value in enumerate(subtasks_value):
+        if not isinstance(subtask_value, Mapping):
+            raise ContractError(f"{field}.subtasks[{index}] must be an object")
+        subtask_id = subtask_value.get("id")
+        title = subtask_value.get("title")
+        goal = subtask_value.get("goal")
+        if not isinstance(subtask_id, str) or not subtask_id.strip():
+            raise ContractError(f"{field}.subtasks[{index}].id must be a non-empty string")
+        if not isinstance(title, str) or not title.strip():
+            raise ContractError(f"{field}.subtasks[{index}].title must be a non-empty string")
+        if not isinstance(goal, str) or not goal.strip():
+            raise ContractError(f"{field}.subtasks[{index}].goal must be a non-empty string")
+        criteria = subtask_value.get("acceptance_criteria")
+        if not isinstance(criteria, list) or not all(isinstance(item, str) for item in criteria):
+            raise ContractError(
+                f"{field}.subtasks[{index}].acceptance_criteria must be a list of strings"
+            )
+        if not criteria or not all(item.strip() for item in criteria):
+            raise ContractError(
+                f"{field}.subtasks[{index}].acceptance_criteria must be a non-empty list of non-empty strings"
+            )
+        subtasks.append(
+            {
+                "id": subtask_id,
+                "title": title,
+                "goal": goal,
+                "acceptance_criteria": list(criteria),
+            }
+        )
+    return {
+        "recommended": recommended,
+        "reason": reason,
+        "subtasks": subtasks,
+    }

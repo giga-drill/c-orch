@@ -641,6 +641,9 @@ class RunOrchestrator:
             worker_prompt=revised.worker_prompt,
             risk_notes=list(revised.risk_notes),
             raw=dict(revised.raw),
+            decomposition_suggestion=dict(revised.decomposition_suggestion)
+            if isinstance(revised.decomposition_suggestion, dict)
+            else None,
             approval_status="pending",
             approved_at=None,
             approved_by=None,
@@ -716,6 +719,9 @@ class RunOrchestrator:
             worker_prompt=plan.worker_prompt,
             risk_notes=list(plan.risk_notes),
             raw=dict(plan.raw),
+            decomposition_suggestion=dict(plan.decomposition_suggestion)
+            if isinstance(plan.decomposition_suggestion, dict)
+            else None,
             approval_status="pending" if self.config.require_plan_approval else "not_required",
         )
         self._transition_status(manifest, RUN_PLAN_READY)
@@ -2066,6 +2072,9 @@ def _planner_plan_from_record(record: PlanRecord, manifest: RunManifest) -> Plan
             "worker_prompt": record.worker_prompt,
             "verification_commands": list(manifest.verification_commands),
             "risk_notes": list(record.risk_notes),
+            "decomposition_suggestion": dict(record.decomposition_suggestion)
+            if isinstance(record.decomposition_suggestion, dict)
+            else None,
         }
     return PlannerPlan(
         status="plan_ready",
@@ -2074,6 +2083,9 @@ def _planner_plan_from_record(record: PlanRecord, manifest: RunManifest) -> Plan
         worker_prompt=record.worker_prompt,
         verification_commands=list(manifest.verification_commands),
         risk_notes=list(record.risk_notes),
+        decomposition_suggestion=dict(record.decomposition_suggestion)
+        if isinstance(record.decomposition_suggestion, dict)
+        else None,
         raw=raw,
     )
 

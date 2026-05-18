@@ -359,9 +359,27 @@ Planner 初始输出必须包含 JSON：
   ],
   "risk_notes": [
     "Risk note"
-  ]
+  ],
+  "decomposition_suggestion": {
+    "recommended": true,
+    "reason": "Why split or keep one task",
+    "subtasks": [
+      {
+        "id": "subtask-1",
+        "title": "Subtask title",
+        "goal": "Subtask goal",
+        "acceptance_criteria": [
+          "Subtask criterion"
+        ]
+      }
+    ]
+  }
 }
 ```
+
+`decomposition_suggestion` 在第一阶段是可选 advisory 字段。它只用于记录和展示
+Planner 建议的 commit-sized 子任务顺序，不会自动创建多个 queue tasks，也不
+引入 DAG/依赖调度。`recommended=false` 时应给出保持单任务的原因。
 
 Worker 输出必须包含 JSON：
 

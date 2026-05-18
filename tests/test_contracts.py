@@ -17,6 +17,131 @@ class ContractTests(unittest.TestCase):
             """
         )
         self.assertEqual(plan.worker_prompt, "do it")
+        self.assertIsNone(plan.decomposition_suggestion)
+
+    def test_parse_planner_plan_with_decomposition_suggestion(self) -> None:
+        plan = PlannerPlan.parse(
+            """
+            {
+              "status":"plan_ready",
+              "summary":"s",
+              "acceptance_criteria":["a"],
+              "worker_prompt":"do it",
+              "verification_commands":["pytest"],
+              "risk_notes":[],
+              "decomposition_suggestion":{
+                "recommended":true,
+                "reason":"scope is broad",
+                "subtasks":[
+                  {
+                    "id":"subtask-1",
+                    "title":"Slice 1",
+                    "goal":"Deliver API",
+                    "acceptance_criteria":["API tests pass"]
+                  }
+                ]
+              }
+            }
+            """
+        )
+        self.assertIsNotNone(plan.decomposition_suggestion)
+        suggestion = plan.decomposition_suggestion or {}
+        self.assertTrue(suggestion.get("recommended"))
+        self.assertEqual(suggestion.get("reason"), "scope is broad")
+
+    def test_parse_planner_plan_rejects_invalid_decomposition_shape(self) -> None:
+        with self.assertRaises(ContractError):
+            PlannerPlan.parse(
+                """
+                {
+                  "status":"plan_ready",
+                  "summary":"s",
+                  "acceptance_criteria":["a"],
+                  "worker_prompt":"do it",
+                  "verification_commands":["pytest"],
+                  "risk_notes":[],
+                  "decomposition_suggestion":{
+                    "recommended":"yes",
+                    "reason":"bad",
+                    "subtasks":[]
+                  }
+                }
+                """
+            )
+
+    def test_parse_planner_plan_rejects_recommended_decomposition_with_empty_subtasks(self) -> None:
+        with self.assertRaises(ContractError):
+            PlannerPlan.parse(
+                """
+                {
+                  "status":"plan_ready",
+                  "summary":"s",
+                  "acceptance_criteria":["a"],
+                  "worker_prompt":"do it",
+                  "verification_commands":["pytest"],
+                  "risk_notes":[],
+                  "decomposition_suggestion":{
+                    "recommended":true,
+                    "reason":"should split",
+                    "subtasks":[]
+                  }
+                }
+                """
+            )
+
+    def test_parse_planner_plan_rejects_subtask_with_empty_acceptance_criteria(self) -> None:
+        with self.assertRaises(ContractError):
+            PlannerPlan.parse(
+                """
+                {
+                  "status":"plan_ready",
+                  "summary":"s",
+                  "acceptance_criteria":["a"],
+                  "worker_prompt":"do it",
+                  "verification_commands":["pytest"],
+                  "risk_notes":[],
+                  "decomposition_suggestion":{
+                    "recommended":true,
+                    "reason":"should split",
+                    "subtasks":[
+                      {
+                        "id":"subtask-1",
+                        "title":"Slice 1",
+                        "goal":"Deliver API",
+                        "acceptance_criteria":[]
+                      }
+                    ]
+                  }
+                }
+                """
+            )
+
+    def test_parse_planner_plan_allows_non_recommended_decomposition_with_empty_subtasks(self) -> None:
+        plan = PlannerPlan.parse(
+            """
+            {
+              "status":"plan_ready",
+              "summary":"s",
+              "acceptance_criteria":["a"],
+              "worker_prompt":"do it",
+              "verification_commands":["pytest"],
+              "risk_notes":[],
+              "decomposition_suggestion":{
+                "recommended":false,
+                "reason":"single coherent change",
+                "subtasks":[]
+              }
+            }
+            """
+        )
+        self.assertEqual(
+            plan.decomposition_suggestion,
+            {
+                "recommended": False,
+                "reason": "single coherent change",
+                "subtasks": [],
+            },
+        )
 
     def test_worker_status_validation(self) -> None:
         with self.assertRaises(ContractError):

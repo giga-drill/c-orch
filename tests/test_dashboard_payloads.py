@@ -8,7 +8,7 @@ from pathlib import Path
 
 from c_orch import dashboard_payloads
 from c_orch.proposal_store import ProposalStore
-from c_orch.run_store import ReviewAttemptRecord, ReviewRecord, RunStore
+from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.task_store import TaskStore
 
 
@@ -73,6 +73,83 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
                 ["说明要改动的模块、文件或接口范围。"],
             )
             self.assertEqual(payload["proposals"][0]["blocker"]["issues"], ["prompt_too_vague"])
+
+    def test_proposal_plan_detail_includes_decomposition_suggestion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1")
+
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.acceptance_criteria = ["Acceptance 1"]
+            manifest.verification_commands = ["pytest"]
+            manifest.plan = PlanRecord(
+                summary="Plan summary",
+                worker_prompt="Do the work",
+                risk_notes=["Risk 1"],
+                decomposition_suggestion={
+                    "recommended": True,
+                    "reason": "范围较大，建议拆分",
+                    "subtasks": [
+                        {
+                            "id": "subtask-1",
+                            "title": "先补契约",
+                            "goal": "补齐契约并加测试",
+                            "acceptance_criteria": ["契约测试通过"],
+                        }
+                    ],
+                },
+            )
+            run_store.save(manifest)
+
+            proposal.run_id = manifest.run_id
+            proposal.status = "PLAN_REVIEW_REQUIRED"
+            proposal_store.save(pool)
+
+            payload = dashboard_payloads.build_proposals_payload(root / "proposals.json", runs_dir=root / "runs")
+            detail = payload["proposals"][0]["plan_detail"]
+
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail["decomposition_suggestion"]["recommended"], True)
+            self.assertEqual(detail["decomposition_suggestion"]["subtasks"][0]["id"], "subtask-1")
+
+    def test_proposal_plan_detail_sets_null_when_suggestion_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1")
+
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=root,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "PLAN_REVIEW_REQUIRED"
+            manifest.acceptance_criteria = ["Acceptance 1"]
+            manifest.verification_commands = ["pytest"]
+            manifest.plan = PlanRecord(summary="Plan summary", worker_prompt="Do the work")
+            run_store.save(manifest)
+
+            proposal.run_id = manifest.run_id
+            proposal.status = "PLAN_REVIEW_REQUIRED"
+            proposal_store.save(pool)
+
+            payload = dashboard_payloads.build_proposals_payload(root / "proposals.json", runs_dir=root / "runs")
+            detail = payload["proposals"][0]["plan_detail"]
+
+            self.assertIsNotNone(detail)
+            self.assertIsNone(detail["decomposition_suggestion"])
 
     def test_run_payload_distinguishes_latest_revision_reason_from_review_infra_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -691,6 +691,11 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
                 "risk_notes": _list_value(plan.get("risk_notes")),
                 "acceptance_criteria": _list_value(manifest_dict.get("acceptance_criteria")),
                 "verification_commands": _list_value(manifest_dict.get("verification_commands")),
+                "decomposition_suggestion": (
+                    dict(plan.get("decomposition_suggestion"))
+                    if isinstance(plan.get("decomposition_suggestion"), dict)
+                    else None
+                ),
             }
     proposal_cwd = proposal.cwd or (manifest.cwd if manifest is not None else None)
     status = proposal.status

@@ -84,6 +84,11 @@ class UiTests(unittest.TestCase):
                 summary="Plan summary",
                 worker_prompt="Build the feature",
                 risk_notes=["Risk note"],
+                decomposition_suggestion={
+                    "recommended": False,
+                    "reason": "单模块改动，保持一个任务更清晰",
+                    "subtasks": [],
+                },
                 approval_status="approved",
             )
             manifest.plan_revisions.append(
@@ -152,6 +157,14 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["run"]["planner"]["reasoning_effort"], "high")
             self.assertEqual(payload["run"]["plan"]["approval_status"], "approved")
             self.assertEqual(payload["manifest"]["plan"]["worker_prompt"], "Build the feature")
+            self.assertEqual(
+                payload["manifest"]["plan"]["decomposition_suggestion"],
+                {
+                    "recommended": False,
+                    "reason": "单模块改动，保持一个任务更清晰",
+                    "subtasks": [],
+                },
+            )
             self.assertEqual(payload["run"]["workers"][0]["service_tier"], "flex")
             self.assertEqual(payload["run"]["review_attempt_count"], 0)
             self.assertEqual(payload["run"]["evidence_count"], 2)
@@ -609,6 +622,18 @@ class UiTests(unittest.TestCase):
                 summary="Plan summary",
                 worker_prompt="Do the work",
                 risk_notes=["Risk 1"],
+                decomposition_suggestion={
+                    "recommended": True,
+                    "reason": "跨模块变更，建议拆分",
+                    "subtasks": [
+                        {
+                            "id": "subtask-1",
+                            "title": "先做后端契约",
+                            "goal": "补齐后端数据结构",
+                            "acceptance_criteria": ["后端测试通过"],
+                        }
+                    ],
+                },
             )
             run_store.save(manifest)
             proposal.run_id = manifest.run_id
@@ -629,6 +654,21 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["proposals"][0]["plan_detail"]["risk_notes"], ["Risk 1"])
             self.assertEqual(payload["proposals"][0]["plan_detail"]["acceptance_criteria"], ["Acceptance 1"])
             self.assertEqual(payload["proposals"][0]["plan_detail"]["verification_commands"], ["pytest"])
+            self.assertEqual(
+                payload["proposals"][0]["plan_detail"]["decomposition_suggestion"],
+                {
+                    "recommended": True,
+                    "reason": "跨模块变更，建议拆分",
+                    "subtasks": [
+                        {
+                            "id": "subtask-1",
+                            "title": "先做后端契约",
+                            "goal": "补齐后端数据结构",
+                            "acceptance_criteria": ["后端测试通过"],
+                        }
+                    ],
+                },
+            )
 
     def test_build_proposals_payload_waiting_workspace_clean_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1079,6 +1119,8 @@ class UiTests(unittest.TestCase):
         self.assertNotIn("actionMutation.isPending ? \"处理中...\" : \"通过并加入执行队列\"", app_source)
         self.assertIn("ProposalPlanPanel", app_source)
         self.assertIn("完整 Planner 方案", app_source)
+        self.assertIn("建议拆分", app_source)
+        self.assertIn("DecompositionSuggestionPanel", app_source)
         self.assertIn("FailurePanel", app_source)
         self.assertIn("失败原因", app_source)
         self.assertIn("标记为已处理并跳过", app_source)

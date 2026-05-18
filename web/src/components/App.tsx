@@ -9,6 +9,7 @@ import type {
   AllowedTaskAction,
   AgentSummary,
   CostModePayload,
+  DecompositionSuggestion,
   EvidenceFile,
   ManifestRecord,
   ProposalPlanDetail,
@@ -971,6 +972,9 @@ function ProposalPlanPanel({
       <Collapsible title="风险说明">
         <BulletList items={plan.risk_notes} />
       </Collapsible>
+      <Collapsible title="建议拆分">
+        <DecompositionSuggestionPanel suggestion={plan.decomposition_suggestion} />
+      </Collapsible>
     </div>
   );
 }
@@ -1615,6 +1619,9 @@ function PlanPanel({ manifest }: { manifest: ManifestRecord }) {
           <Collapsible title="风险说明">
             <BulletList items={plan.risk_notes} />
           </Collapsible>
+          <Collapsible title="建议拆分">
+            <DecompositionSuggestionPanel suggestion={plan.decomposition_suggestion} />
+          </Collapsible>
         </>
       ) : (
         <p className="meta">暂无 Planner 方案。</p>
@@ -1867,5 +1874,35 @@ function BulletList({ items, code = false }: { items: string[]; code?: boolean }
         <li key={item}>{code ? <code>{item}</code> : item}</li>
       ))}
     </ul>
+  );
+}
+
+function DecompositionSuggestionPanel({ suggestion }: { suggestion: DecompositionSuggestion | null }) {
+  if (!suggestion) return <p className="meta">暂无建议。</p>;
+  if (!suggestion.recommended) {
+    return <p>{displayValue(suggestion.reason || "保持单任务更合适。")}</p>;
+  }
+  const subtasks = suggestion.subtasks ?? [];
+  return (
+    <div>
+      <p>{displayValue(suggestion.reason)}</p>
+      {subtasks.length ? (
+        <ol>
+          {subtasks.map((subtask, index) => (
+            <li key={subtask.id || `${subtask.title}-${index}`}>
+              <p>
+                <strong>{displayValue(subtask.title)}</strong>
+              </p>
+              <p className="meta mono">id: {displayValue(subtask.id)}</p>
+              <p>{displayValue(subtask.goal)}</p>
+              <p className="meta">验收标准</p>
+              <BulletList items={subtask.acceptance_criteria ?? []} />
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="meta">未提供子任务明细。</p>
+      )}
+    </div>
   );
 }
