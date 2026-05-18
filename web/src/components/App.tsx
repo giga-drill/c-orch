@@ -45,7 +45,7 @@ const statusText: Record<string, string> = {
   NEW: "新建",
   PLANNING: "Planner 方案生成中",
   PLAN_READY: "计划已生成",
-  PLAN_REVIEW_REQUIRED: "等待人工审核计划",
+  PLAN_REVIEW_REQUIRED: "等待计划审核",
   PLAN_REVISING: "Planner 修改计划中",
   WAITING_WORKSPACE: "等待 workspace",
   WAITING_WORKSPACE_CLEAN: "等待工作区清理",
@@ -578,7 +578,7 @@ function ProposalPanel({
   return (
     <section className="panel">
       <div className="sectionTitle">
-        <h2>待审核计划</h2>
+        <h2>计划提案池</h2>
         <span className="meta">{displayValue(payload?.proposals_file)}</span>
       </div>
       {summary ? (
@@ -598,7 +598,7 @@ function ProposalPanel({
         <textarea
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
-          placeholder="任务说明。Planner 会先生成方案，等待你审核后才进入执行队列。"
+          placeholder="任务说明。默认会在 Planner 生成方案后自动进入执行队列。"
         />
         <input
           value={cwd}
@@ -610,7 +610,7 @@ function ProposalPanel({
           onClick={createProposal}
           disabled={createMutation.isPending || !title.trim() || !prompt.trim()}
         >
-          {createMutation.isPending ? "创建中..." : "生成 Planner 方案"}
+          {createMutation.isPending ? "创建中..." : "提交提案"}
         </button>
       </div>
       {error ? <div className="error">{error}</div> : null}
@@ -690,7 +690,7 @@ function ProposalPanel({
             })()}
           </article>
         ))}
-        {payload && payload.proposals.length === 0 ? <div className="empty">暂无待审核计划。</div> : null}
+        {payload && payload.proposals.length === 0 ? <div className="empty">暂无计划提案。</div> : null}
       </div>
     </section>
   );

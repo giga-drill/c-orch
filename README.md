@@ -43,20 +43,22 @@ own restart gate.
 
 ## Workflow Shape
 
-c-orch now separates plan review from execution:
+c-orch separates proposal planning from execution, and by default auto-promotes
+successful plans into the execution queue:
 
 ```text
-Plan proposal pool: task idea -> Planner plan -> human approve/revise
+Plan proposal pool: task idea -> Planner plan -> (default) auto approve + queue
 Execution queue: approved plan -> Worker -> Planner review -> apply -> commit
 ```
 
-The proposal pool is where a human reviews Planner's plan. Approving a proposal
-adds an execution task that points at the same run, so the Worker starts from
-the approved Planner context. Revising a proposal sends feedback back to the
-same Planner thread and waits for a new plan. The execution queue is reserved
-for plans that have already been approved and can move automatically until a
-restart gate, failure, or task completion.
-Proposal creation now returns immediately after persisting proposal/run records;
+The proposal pool still owns Planner plan generation and plan-related states.
+In default mode, when Planner reaches `PLAN_REVIEW_REQUIRED`, backend runtime
+automatically marks the same run as `PLAN_APPROVED`, enqueues a task that
+reuses that run/workspace/thread context, and removes the proposal from the
+pool. Optional manual review mode is available through config
+(`run.require_proposal_plan_review = true`), where proposals remain in
+`PLAN_REVIEW_REQUIRED` with `approve-plan` / `revise-plan`.
+Proposal creation returns immediately after persisting proposal/run records;
 Planner plan generation continues in a backend proposal dispatcher thread.
 
 Each proposal/task can also bind its own target repository `cwd`. If omitted,
@@ -98,7 +100,7 @@ PYTHONPATH=src python3.11 -m c_orch.cli resume \
   <run_id>
 ```
 
-For smoke tests or trusted tiny changes, skip the approval gate:
+For smoke tests or trusted tiny changes, skip the CLI approval gate:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli run \
@@ -187,6 +189,7 @@ sandbox = "workspace-write"
 approval_policy = "never"
 runs_dir = "runs"
 worktrees_dir = ".c-orch/worktrees"
+require_proposal_plan_review = false
 
 [ui]
 # Optional. Omit these to use built-in defaults.
@@ -230,12 +233,14 @@ only the last fallback.
   root). New run attempts use `task.cwd` first, then fall back to runtime
   `--cwd`.
 - The current MVP supports one Worker thread with human plan approval before
-  Worker start and retryable review attempts after Worker execution. Dashboard
-  task submission uses a proposal pool so `human_plan_review` happens before
-  the task enters the execution queue. Queue scheduling can auto-trigger
-  `retry_review` from saved evidence. `restart` remains an operational gate when
-  running the plain dashboard, and the `supervise-ui` wrapper can clear it after
-  restarting the UI/runtime child.
+  Worker start and retryable review attempts after Worker execution in the
+  direct `c-orch run` / `resume` path. Dashboard task submission uses a proposal
+  pool: default policy auto-queues Planner-complete proposals into execution;
+  optional policy can require explicit human `approve-plan` / `revise-plan`
+  before queueing. Queue scheduling can auto-trigger `retry_review` from saved
+  evidence. `restart` remains an operational gate when running the plain
+  dashboard, and the `supervise-ui` wrapper can clear it after restarting the
+  UI/runtime child.
 - The current MVP does not support parallel runs that modify the same target
   repo. Even though different tasks may target different repos, tasks that
   target the same repo must still run serially; otherwise patch apply can

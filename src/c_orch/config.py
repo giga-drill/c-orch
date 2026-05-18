@@ -43,6 +43,7 @@ class RunConfig:
     worktrees_dir: str = DEFAULT_WORKTREES_DIR
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
+    require_proposal_plan_review: bool = False
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL_POLICY
 
@@ -145,6 +146,11 @@ def _run_config(data: Mapping[str, Any]) -> RunConfig:
             "run.max_parallel_workspaces",
             DEFAULT_MAX_PARALLEL_WORKSPACES,
         ),
+        require_proposal_plan_review=_bool(
+            data.get("require_proposal_plan_review"),
+            "run.require_proposal_plan_review",
+            False,
+        ),
         sandbox=_choice(data.get("sandbox"), "run.sandbox", SANDBOX_CHOICES, DEFAULT_SANDBOX),
         approval_policy=_choice(
             data.get("approval_policy"),
@@ -219,4 +225,12 @@ def _positive_int(value: Any, name: str, default: int) -> int:
         return default
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _bool(value: Any, name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
     return value

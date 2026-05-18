@@ -63,9 +63,8 @@ User task
   -> c-orch stores a proposal in the plan proposal pool
   -> c-orch creates Planner Codex thread through codex()
   -> Planner returns plan, acceptance criteria, worker prompt
-  -> c-orch records the plan and waits for human approval outside the execution queue
-  -> Human approves the plan
-  -> c-orch enqueues an execution task that points at the approved run
+  -> c-orch records the plan and (default policy) auto-approves it
+  -> c-orch enqueues an execution task that points at the same approved run
   -> c-orch creates Worker Codex thread through codex()
   -> Worker implements and returns result evidence
   -> c-orch sends Worker result to Planner through codex-reply()
@@ -80,7 +79,7 @@ User task
 - `c-orch doctor` 能探测 Codex.app 内置 CLI 和 PATH 里的裸 Codex CLI，并优先选择 Codex.app 内置 CLI。
 - `McpCodexDriver` 使用 stdlib newline-delimited JSON-RPC 直接调用 `codex mcp-server`，支持 `tools/list`、`codex` 和 `codex-reply`。
 - `RunStore` 保存 `runs/<run_id>/manifest.json`。
-- `ProposalStore` 保存 `.c-orch/tasks/proposals.json`，用于 dashboard 新任务的方案池。proposal 记录可持久化可选 `cwd`（目标 repo 根目录）。方案池负责 Planner 生成方案和人工 approve/revise；执行队列只接收已经 approve 的 plan。
+- `ProposalStore` 保存 `.c-orch/tasks/proposals.json`，用于 dashboard 新任务的方案池。proposal 记录可持久化可选 `cwd`（目标 repo 根目录）。方案池负责 Planner 生成方案；默认策略下 Planner 成功后由后端自动 approve+enqueue，同时保留可选人工 `approve/revise` 策略；执行队列只接收已可执行的 approved plan。
 - `TaskStore` 保存 `.c-orch/tasks/queue.json`；task 记录可持久化可选 `cwd`。queue scheduler 创建新 run/worktree 时优先使用 `task.cwd`，缺省才回退 runtime `--cwd`。
 - Worker 默认创建独立 git worktree；目标 repo 必须已有可解析的 committed base ref。
 - `RunOrchestrator` 支持 Planner plan、Worker 执行、diff evidence、verification output、Planner review、`revision_requested` 返工和最大尝试次数。
@@ -92,7 +91,7 @@ User task
 - `c-orch run` 默认会通过 MCP 创建 Planner Codex session，把方案写入 manifest，然后暂停在 `PLAN_REVIEW_REQUIRED`。
 - `c-orch resume --approve-plan <run_id>` 会标记人类已通过 Planner 方案，然后创建 Worker Codex session。
 - `c-orch run --auto-approve-plan` 可跳过人类方案审批点，直接延续旧的一次性执行流程。
-- Dashboard 新任务默认走 proposal pool：Planner 方案被人工通过后，runtime 会把同一个 run 标记为 `PLAN_APPROVED`，再创建 execution queue task。scheduler 看到这个 task 已绑定 approved run 时，会继续该 run，而不是重建 Planner run。
+- Dashboard 新任务默认走 proposal pool：Planner 成功生成方案后，runtime 会自动把同一个 run 标记为 `PLAN_APPROVED`，再创建 execution queue task。scheduler 看到这个 task 已绑定 approved run 时，会继续该 run，而不是重建 Planner run。可选策略 `run.require_proposal_plan_review=true` 时，proposal 保持在 `PLAN_REVIEW_REQUIRED`，由人工 `approve/revise`。
 - proposal approve 入队时，execution task 会继承 proposal 的 `cwd`、`active_run_id` 和 `run_ids`；后续 retry 仍在同一目标 repo 创建新 run attempt。
 - `POST /api/proposals` 不再同步等待 Planner。runtime 先持久化 proposal + preflight run（含 worktree 绑定）并立即返回 `PLANNING`，随后由后台 proposal dispatcher 按后端并发上限异步执行 Planner，成功后把 proposal 更新为 `PLAN_REVIEW_REQUIRED`，失败时更新为 `FAILED` 并持久化错误原因。
 

@@ -30,6 +30,7 @@ runs_dir = "custom-runs"
 worktrees_dir = ".custom/worktrees"
 max_attempts = 2
 max_parallel_workspaces = 3
+require_proposal_plan_review = true
 sandbox = "read-only"
 approval_policy = "on-request"
 
@@ -54,12 +55,27 @@ dev_port = 6173
             self.assertEqual(config.run.worktrees_dir, ".custom/worktrees")
             self.assertEqual(config.run.max_attempts, 2)
             self.assertEqual(config.run.max_parallel_workspaces, 3)
+            self.assertTrue(config.run.require_proposal_plan_review)
             self.assertEqual(config.run.sandbox, "read-only")
             self.assertEqual(config.run.approval_policy, "on-request")
             self.assertEqual(config.ui.host, "0.0.0.0")
             self.assertEqual(config.ui.port, 9876)
             self.assertEqual(config.ui.dev_host, "localhost")
             self.assertEqual(config.ui.dev_port, 6173)
+
+    def test_rejects_invalid_plan_review_flag_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".c-orch.toml").write_text(
+                """
+[run]
+require_proposal_plan_review = "yes"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "run.require_proposal_plan_review"):
+                load_project_config(cwd=cwd)
 
     def test_rejects_invalid_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

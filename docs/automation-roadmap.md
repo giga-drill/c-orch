@@ -37,17 +37,20 @@ review/retry visibility and failure-recovery slices stabilize.
 
 ### Remove Human Plan Approval From the Normal Path
 
-Today the proposal pool still has a human review gate after Planner generates a
-plan. The longer-term automation direction is to remove that gate from the
-ordinary path:
+Status (phase 1 delivered): default dashboard proposal flow now auto-queues the
+same Planner run after plan generation (`PLAN_REVIEW_REQUIRED` -> backend auto
+approve -> execution queue), while keeping optional human review policy for
+workspaces that require it.
+
+Current default path:
 
 ```text
 human proposal -> Planner plan -> execution queue
 ```
 
-The human would still publish intent and inspect evidence, but c-orch would not
-normally wait for plan approval before Worker execution. This needs safeguards
-before implementation:
+Human users still publish intent and inspect evidence, but c-orch no longer
+normally waits for plan approval before Worker execution. Remaining safeguards
+and followups:
 
 - proposal quality and scope checks before planning
 - clearer rollback/stop controls after execution starts

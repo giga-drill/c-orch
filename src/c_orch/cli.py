@@ -504,6 +504,7 @@ def _resolve_execution_config(
         ),
         "max_attempts": getattr(args, "max_attempts", None) or project_config.run.max_attempts,
         "max_parallel_workspaces": project_config.run.max_parallel_workspaces,
+        "require_proposal_plan_review": project_config.run.require_proposal_plan_review,
         "sandbox": getattr(args, "sandbox", None) or project_config.run.sandbox,
         "approval_policy": getattr(args, "approval_policy", None) or project_config.run.approval_policy,
     }
@@ -887,6 +888,7 @@ def run_queue_run(args: argparse.Namespace) -> int:
         worker_service_tier=config["worker_service_tier"],
         max_attempts=config["max_attempts"],
         max_parallel_workspaces=config["max_parallel_workspaces"],
+        require_proposal_plan_review=config["require_proposal_plan_review"],
         sandbox=config["sandbox"],
         approval_policy=config["approval_policy"],
         max_tasks=args.max_tasks,
@@ -946,6 +948,7 @@ def run_ui(args: argparse.Namespace) -> int:
                 worker_service_tier=execution_config["worker_service_tier"],
                 max_attempts=execution_config["max_attempts"],
                 max_parallel_workspaces=execution_config["max_parallel_workspaces"],
+                require_proposal_plan_review=execution_config["require_proposal_plan_review"],
                 sandbox=execution_config["sandbox"],
                 approval_policy=execution_config["approval_policy"],
             )

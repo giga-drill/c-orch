@@ -67,6 +67,7 @@ class SchedulerConfig:
     worker_service_tier: Optional[str] = None
     max_tasks: Optional[int] = None
     max_parallel_workspaces: int = DEFAULT_MAX_PARALLEL_WORKSPACES
+    require_proposal_plan_review: bool = False
 
     def resolve_task_cwd(self, task_cwd: Optional[str]) -> Path:
         if task_cwd is None or not task_cwd.strip():

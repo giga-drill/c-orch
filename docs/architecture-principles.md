@@ -90,18 +90,19 @@ another checkout of the same repo.
 
 Keep normal business progress separate from failure handling.
 
-c-orch separates human plan review from the executable task queue. New work
-should first enter the plan proposal pool:
+c-orch separates proposal planning from the executable task queue. New work
+enters the plan proposal pool first:
 
 ```text
-proposal -> Planner plan -> human plan review -> execution queue
+proposal -> Planner plan -> execution queue
 ```
 
-The proposal pool owns ambiguous or still-negotiated work. A proposal may ask
-Planner to revise the plan multiple times in the same Planner thread. Only
-after a human approves the plan does c-orch enqueue an execution task that
-points at the approved run. The execution queue should contain work that is
-already approved to run automatically:
+The proposal pool owns Planner plan generation and plan-related state. In the
+default policy, when Planner reaches `PLAN_REVIEW_REQUIRED`, backend runtime
+auto-approves that same run and enqueues execution using the same
+`active_run_id`, `run_ids`, workspace, and Planner thread context. The
+execution queue should contain work that is already approved to run
+automatically:
 
 ```text
 approved plan -> Worker execution -> Planner review -> apply -> commit
@@ -115,12 +116,13 @@ stays in the pool as `WAITING_WORKSPACE_CLEAN` with blocker details; c-orch
 must not create/advance Planner calls for that proposal until the user cleans
 the target repo and retries plan generation.
 
-This boundary keeps the queue pipeline from stopping on human plan review. The
-queue may still stop at explicit operational gates such as restart confirmation
-or failed task retry, but it should not treat "waiting for human plan approval"
-as normal executable queue progress. When the dashboard is supervised, the
-restart confirmation gate can be cleared automatically after the child runtime
-has been restarted.
+This boundary keeps the queue pipeline from stopping on plan review by default.
+Optional policy `run.require_proposal_plan_review = true` keeps proposals in
+`PLAN_REVIEW_REQUIRED` and exposes `approve-plan` / `revise-plan` actions for
+human plan review. The queue may still stop at explicit operational gates such
+as restart confirmation or failed task retry. When the dashboard is supervised,
+the restart confirmation gate can be cleared automatically after the child
+runtime has been restarted.
 
 Business run states describe where the task is in the Planner/Human/Worker
 loop:
@@ -211,10 +213,11 @@ FAILED
 `BLOCKED` is retained only for legacy or exceptional queue records. Detailed
 waiting points such as `planner_review_retry`, `worker_rework`, and
 `retry_task` are derived values, not separate task statuses.
-`human_plan_review` belongs to the proposal pool; if an execution-queue task
-reaches it, c-orch treats that as a flow-boundary violation rather than normal
-queue progress. `task_lifecycle.py` owns task/run reconciliation, so Scheduler,
-Runtime, CLI, and UI do not each invent their own task transition rules.
+`human_plan_review` belongs to the optional proposal-review policy; if an
+execution-queue task reaches it, c-orch treats that as a flow-boundary
+violation rather than normal queue progress. `task_lifecycle.py` owns task/run
+reconciliation, so Scheduler, Runtime, CLI, and UI do not each invent their own
+task transition rules.
 
 When an active run reaches `FAILED`, the owning task must converge to `FAILED`
 with `waiting_for=retry_task`; retrying the task should create a new run

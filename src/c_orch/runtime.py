@@ -28,6 +28,7 @@ from .proposal_store import (
     PROPOSAL_QUEUED,
     PROPOSAL_WAITING_WORKSPACE,
     PROPOSAL_WAITING_WORKSPACE_CLEAN,
+    ProposalPool,
     ProposalRecord,
     ProposalStore,
 )
@@ -1060,6 +1061,7 @@ class COrchRuntime:
             return
         with self._action_lock:
             proposal_store = ProposalStore(self.proposals_path)
+            run_store = RunStore(self.runs_dir)
             try:
                 pool = proposal_store.load()
                 proposal = proposal_store.find(pool, proposal_id)
@@ -1068,6 +1070,48 @@ class COrchRuntime:
             if proposal.status in {PROPOSAL_FAILED, PROPOSAL_WAITING_WORKSPACE_CLEAN}:
                 return
             status = _proposal_status_from_run(manifest)
+            if (
+                status == PROPOSAL_PLAN_REVIEW_REQUIRED
+                and manifest.plan is not None
+                and self.queue_path is not None
+                and self._scheduler_config is not None
+                and not self._scheduler_config.require_proposal_plan_review
+            ):
+                try:
+                    with self._queue_lock:
+                        _approve_and_enqueue_proposal(
+                            proposal_store=proposal_store,
+                            pool=pool,
+                            proposal=proposal,
+                            run_store=run_store,
+                            manifest=manifest,
+                            queue_path=self.queue_path,
+                            approved_by="c-orch:auto",
+                            event_type="proposal_plan_auto_queued",
+                            event_message=(
+                                "Proposal dispatcher auto-approved Planner plan and queued execution task."
+                            ),
+                            source="proposal_dispatcher",
+                        )
+                except Exception as exc:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal_id,
+                        status=PROPOSAL_FAILED,
+                        error=str(exc),
+                        reason="proposal_auto_queue_failed",
+                        blocker=None,
+                    )
+                    proposal_store.save(pool)
+                    run_store.append_event(
+                        manifest.run_id,
+                        "proposal_plan_auto_queue_failed",
+                        "Proposal dispatcher failed to auto-queue approved plan.",
+                        proposal_id=proposal.proposal_id,
+                        source="proposal_dispatcher",
+                        error=str(exc),
+                    )
+                return
             error = None
             reason = derive_run_waiting_for(manifest)
             if status == PROPOSAL_FAILED and not error:
@@ -1771,25 +1815,23 @@ def proposal_action(
         }
         return HTTPStatus.OK, payload
 
-    _approve_manifest_plan(run_store, manifest)
     if queue_path is None:
         return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
-    task_id = _enqueue_approved_proposal(
-        queue_path=queue_path,
-        proposal=proposal,
-        run_id=manifest.run_id,
-        fallback_cwd=manifest.cwd,
-    )
-    proposal_store.remove_proposal(pool, proposal.proposal_id)
-    proposal_store.save(pool)
-    run_store.append_event(
-        manifest.run_id,
-        "proposal_plan_approved",
-        "Human approved proposal plan; task queued for execution.",
-        proposal_id=proposal.proposal_id,
-        task_id=task_id,
-        source="dashboard",
-    )
+    try:
+        task_id = _approve_and_enqueue_proposal(
+            proposal_store=proposal_store,
+            pool=pool,
+            proposal=proposal,
+            run_store=run_store,
+            manifest=manifest,
+            queue_path=queue_path,
+            approved_by="human",
+            event_type="proposal_plan_approved",
+            event_message="Human approved proposal plan; task queued for execution.",
+            source="dashboard",
+        )
+    except Exception as exc:
+        return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
     payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
     payload["transition"] = {
         "type": "proposal_approved_and_queued",
@@ -2018,19 +2060,53 @@ def _proposal_status_from_run(manifest: RunManifest) -> str:
     return PROPOSAL_PLANNING
 
 
-def _approve_manifest_plan(run_store: RunStore, manifest: RunManifest) -> None:
+def _approve_manifest_plan(run_store: RunStore, manifest: RunManifest, *, approved_by: str) -> None:
     if manifest.plan is None:
         raise ValueError("manifest has no Planner plan")
     manifest.plan.approval_status = "approved"
     manifest.plan.approved_at = run_store.now_iso()
-    manifest.plan.approved_by = "human"
+    manifest.plan.approved_by = approved_by
     record_run_status_transition(
         manifest,
         RUN_PLAN_APPROVED,
         run_store.now_iso(),
-        metadata={"approved_by": "human"},
+        metadata={"approved_by": approved_by},
     )
     run_store.save(manifest)
+
+
+def _approve_and_enqueue_proposal(
+    *,
+    proposal_store: ProposalStore,
+    pool: ProposalPool,
+    proposal: ProposalRecord,
+    run_store: RunStore,
+    manifest: RunManifest,
+    queue_path: Pathish,
+    approved_by: str,
+    event_type: str,
+    event_message: str,
+    source: str,
+) -> str:
+    _approve_manifest_plan(run_store, manifest, approved_by=approved_by)
+    task_id = _enqueue_approved_proposal(
+        queue_path=queue_path,
+        proposal=proposal,
+        run_id=manifest.run_id,
+        fallback_cwd=manifest.cwd,
+    )
+    proposal_store.remove_proposal(pool, proposal.proposal_id)
+    proposal_store.save(pool)
+    run_store.append_event(
+        manifest.run_id,
+        event_type,
+        event_message,
+        proposal_id=proposal.proposal_id,
+        task_id=task_id,
+        source=source,
+        approved_by=approved_by,
+    )
+    return task_id
 
 
 def _enqueue_approved_proposal(
