@@ -48,9 +48,13 @@ The dashboard server keeps a process-lifetime runtime object. That runtime may
 reuse a live Codex MCP driver as a performance and continuity optimization, but
 MCP process memory is volatile cache only. Persisted run manifests, event logs,
 Codex thread ids, and Codex disk sessions remain the recovery source of truth.
-For self-modifying runs, `c-orch supervise-ui` is the preferred wrapper around
-the dashboard server. The supervisor owns process restart, while the restarted
-backend still owns clearing the restart gate through the normal queue action.
+Dashboard startup should use a supervised entry point by default:
+`c-orch dev-ui` for local React/Vite development, or `c-orch supervise-ui` for
+the checked-in static dashboard build. The bare `c-orch ui` command is a
+low-level child runtime/debug entry; it does not supervise its own restart gate.
+For self-modifying runs, the supervisor owns process restart, while the
+restarted backend still owns clearing the restart gate through the normal queue
+action.
 Automatic restart should eventually use a drain protocol: stop starting new
 lanes, let active lanes reach durable checkpoints or persist leases, restart
 the child runtime, reconcile persisted state, and then clear the restart gate.

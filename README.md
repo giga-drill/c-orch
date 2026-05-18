@@ -13,6 +13,34 @@ and verification evidence, and asks the Planner to approve or request changes.
 - [Architecture principles and state model](docs/architecture-principles.md)
 - [Automation roadmap](docs/automation-roadmap.md)
 
+## Canonical Entry Points
+
+Use a supervised entry point by default. Self-modifying c-orch tasks can apply
+runtime changes and set a restart gate; a supervisor is the process that can
+restart the runtime and clear that gate through the backend action.
+
+For day-to-day local development with the React/Vite dashboard, start:
+
+```bash
+PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs \
+  --queue-file .c-orch/tasks/queue.json
+```
+
+For the checked-in static dashboard build, start:
+
+```bash
+PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs \
+  --queue-file .c-orch/tasks/queue.json
+```
+
+Treat `c-orch ui` as a low-level child runtime/debug entry. Do not use it as
+the normal dashboard process for self-bootstrap work; it will not supervise its
+own restart gate.
+
 ## Workflow Shape
 
 c-orch now separates plan review from execution:
@@ -79,18 +107,21 @@ PYTHONPATH=src python3.11 -m c_orch.cli run \
   "Implement feature X"
 ```
 
-Open the local run dashboard from the checked-in frontend build:
+Open the local run dashboard from the checked-in frontend build through the
+supervised entry point:
 
 ```bash
-PYTHONPATH=src python3.11 -m c_orch.cli ui \
+PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
   --cwd /path/to/target-repo \
-  --runs-dir runs
+  --runs-dir runs \
+  --queue-file .c-orch/tasks/queue.json
 ```
 
 For frontend development, use Vite as the browser entry point. This keeps HMR
-enabled, proxies `/api/*` to the local API runtime, and restarts the API child
-when backend Python sources change. Host and port values come from `[ui]` config
-and can be overridden with CLI flags:
+enabled, proxies `/api/*` to the local API runtime, restarts the API child when
+backend Python sources change, and uses the same supervisor logic to clear
+restart gates after self-modifying runs. Host and port values come from `[ui]`
+config and can be overridden with CLI flags:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \

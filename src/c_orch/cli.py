@@ -210,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui = subparsers.add_parser(
         "ui",
-        help="Serve a local web dashboard for c-orch runs.",
+        help="Serve the low-level dashboard runtime; prefer dev-ui or supervise-ui for normal use.",
     )
     ui.add_argument("--cwd", default=".", help="Target repository path.")
     ui.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dev_ui = subparsers.add_parser(
         "dev-ui",
-        help="Run the API runtime plus Vite dev server for local dashboard development.",
+        help="Run supervised API runtime plus Vite dev server for local dashboard development.",
     )
     dev_ui.add_argument("--cwd", default=".", help="Target repository path.")
     dev_ui.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
