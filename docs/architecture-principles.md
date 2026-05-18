@@ -138,6 +138,17 @@ stays in the pool as `WAITING_WORKSPACE_CLEAN` with blocker details; c-orch
 must not create/advance Planner calls for that proposal until the user cleans
 the target repo and retries plan generation.
 
+After workspace-clean passes, proposal planning must also pass a backend
+quality/scope preflight before any Planner session creation or continuation.
+This rule-based gate is lightweight and conservative: it blocks only obviously
+vague prompts, missing-outcome proposals, or clearly oversized architecture
+requests. Blocked proposals enter `WAITING_PROPOSAL_INPUT` with structured
+blocker payload (`waiting_for=proposal_input`, stable `reason`, human-readable
+`message`, `suggested_action`, and optional `suggestions`/`issues`). The
+frontend only renders this backend-authored blocker and sends retry intent;
+retry may include extra user context, after which backend preflight runs again
+before c-orch creates/reuses a preflight run and dispatches Planner.
+
 This boundary keeps the queue pipeline from stopping on plan review by default.
 Optional policy `run.require_proposal_plan_review = true` keeps proposals in
 `PLAN_REVIEW_REQUIRED` and exposes `approve-plan` / `revise-plan` actions for

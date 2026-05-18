@@ -59,6 +59,7 @@ export interface ProposalSummary {
   active: number;
   waiting_workspace?: number;
   waiting_workspace_clean?: number;
+  waiting_proposal_input?: number;
 }
 
 export interface ProposalPoolRecord {
@@ -91,8 +92,11 @@ export interface ProposalRecord {
   reason: string | null;
   blocker?: {
     type?: string | null;
+    reason?: string | null;
     message?: string | null;
     suggested_action?: string | null;
+    suggestions?: string[] | null;
+    issues?: string[] | null;
     status_output?: string | null;
     command?: string | null;
     cwd?: string | null;

@@ -44,6 +44,36 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
             self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
             self.assertIn("src/main.py", payload["proposals"][0]["blocker"]["status_output"])
 
+    def test_waiting_proposal_input_payload_exposes_preflight_reason_and_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proposals_path = Path(tmp) / "proposals.json"
+            store = ProposalStore(proposals_path)
+            pool = store.create()
+            proposal = store.add_proposal(pool, title="Task", prompt="fix it", cwd="/tmp/repo")
+            proposal.status = "WAITING_PROPOSAL_INPUT"
+            proposal.reason = "proposal_too_vague"
+            proposal.blocker = {
+                "type": "proposal_preflight_blocked",
+                "reason": "proposal_too_vague",
+                "message": "提案信息过少，当前描述不足以让 Planner 生成可执行计划。",
+                "suggested_action": "请补充目标改动对象、预期行为和基本验证方式后重试。",
+                "suggestions": ["说明要改动的模块、文件或接口范围。"],
+                "issues": ["prompt_too_vague"],
+            }
+            store.save(pool)
+
+            payload = dashboard_payloads.build_proposals_payload(proposals_path)
+
+            self.assertEqual(payload["summary"]["waiting_proposal_input"], 1)
+            self.assertEqual(payload["proposals"][0]["waiting_for"], "proposal_input")
+            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
+            self.assertEqual(payload["proposals"][0]["blocker"]["reason"], "proposal_too_vague")
+            self.assertEqual(
+                payload["proposals"][0]["blocker"]["suggestions"],
+                ["说明要改动的模块、文件或接口范围。"],
+            )
+            self.assertEqual(payload["proposals"][0]["blocker"]["issues"], ["prompt_too_vague"])
+
     def test_run_payload_distinguishes_latest_revision_reason_from_review_infra_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

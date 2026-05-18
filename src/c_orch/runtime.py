@@ -19,6 +19,7 @@ from .failure_policy import (
     classify_retryable_review_failure,
 )
 from .phase_timing import record_run_status_transition
+from .proposal_preflight import evaluate_proposal_preflight
 from .proposal_store import (
     PROPOSAL_APPROVED,
     PROPOSAL_FAILED,
@@ -26,6 +27,7 @@ from .proposal_store import (
     PROPOSAL_PLAN_REVISING,
     PROPOSAL_PLANNING,
     PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_INPUT,
     PROPOSAL_WAITING_WORKSPACE,
     PROPOSAL_WAITING_WORKSPACE_CLEAN,
     ProposalPool,
@@ -77,6 +79,7 @@ DriverFactory = Callable[[str], ContextManager[CodexDriver]]
 
 WORKSPACE_DIRTY_MESSAGE = "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。"
 WORKSPACE_DIRTY_SUGGESTED_ACTION = "请先处理目标仓库改动，然后点击“重试生成计划”。"
+PROPOSAL_INPUT_SUGGESTED_ACTION = "请补充提案信息后重试生成计划。"
 
 
 class _UnusedCodexDriver:
@@ -1026,6 +1029,22 @@ class COrchRuntime:
                     )
                     promoted += 1
                     continue
+                proposal_preflight = _evaluate_proposal_quality_preflight(
+                    prompt=proposal.prompt,
+                    cwd=proposal_cwd,
+                )
+                if proposal_preflight is not None:
+                    proposal_store.update_proposal(
+                        pool,
+                        proposal.proposal_id,
+                        status=PROPOSAL_WAITING_INPUT,
+                        run_id=None,
+                        error=None,
+                        reason=str(proposal_preflight.get("reason") or "proposal_quality"),
+                        blocker=proposal_preflight,
+                    )
+                    promoted += 1
+                    continue
                 try:
                     manifest = _create_preflight_run(
                         run_store=run_store,
@@ -1191,7 +1210,25 @@ class COrchRuntime:
                 )
                 proposal_store.save(pool)
                 return False, proposal.run_id or run_id
-            if proposal.blocker is not None or proposal.reason == "workspace_clean":
+            proposal_preflight = _evaluate_proposal_quality_preflight(
+                prompt=proposal.prompt,
+                cwd=proposal_cwd,
+            )
+            if proposal_preflight is not None:
+                proposal_store.update_proposal(
+                    pool,
+                    proposal.proposal_id,
+                    status=PROPOSAL_WAITING_INPUT,
+                    run_id=None,
+                    error=None,
+                    reason=str(proposal_preflight.get("reason") or "proposal_quality"),
+                    blocker=proposal_preflight,
+                )
+                proposal_store.save(pool)
+                return False, proposal.run_id or run_id
+            if proposal.blocker is not None or proposal.reason in {"workspace_clean"} or (
+                isinstance(proposal.reason, str) and proposal.reason.startswith("proposal_")
+            ):
                 proposal_store.update_proposal(
                     pool,
                     proposal.proposal_id,
@@ -1276,7 +1313,7 @@ class COrchRuntime:
                 proposal = proposal_store.find(pool, proposal_id)
             except (OSError, ValueError):
                 return
-            if proposal.status in {PROPOSAL_FAILED, PROPOSAL_WAITING_WORKSPACE_CLEAN}:
+            if proposal.status in {PROPOSAL_FAILED, PROPOSAL_WAITING_WORKSPACE_CLEAN, PROPOSAL_WAITING_INPUT}:
                 return
             status = _proposal_status_from_run(manifest)
             if (
@@ -1706,12 +1743,7 @@ def create_proposal(
     proposals_file = Path(proposals_path).expanduser().resolve()
     proposal_store = ProposalStore(proposals_file)
     pool = proposal_store.load_or_create()
-    lane_busy = _workspace_lane_is_locked(
-        workspace_root=workspace_root,
-        proposals=pool.proposals,
-        queue_path=queue_path,
-        run_store=RunStore(Path(runs_dir).expanduser().resolve()),
-    )
+    run_store = RunStore(Path(runs_dir).expanduser().resolve())
     proposal = proposal_store.add_proposal(
         pool,
         title=title.strip(),
@@ -1759,6 +1791,34 @@ def create_proposal(
             "proposal_id": proposal.proposal_id,
         }
         return HTTPStatus.OK, payload
+    proposal_preflight = _evaluate_proposal_quality_preflight(
+        prompt=proposal.prompt,
+        cwd=proposal_cwd,
+    )
+    if proposal_preflight is not None:
+        proposal_store.update_proposal(
+            pool,
+            proposal.proposal_id,
+            status=PROPOSAL_WAITING_INPUT,
+            run_id=None,
+            error=None,
+            reason=str(proposal_preflight.get("reason") or "proposal_quality"),
+            blocker=proposal_preflight,
+        )
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_created_waiting_input",
+            "proposal_id": proposal.proposal_id,
+        }
+        return HTTPStatus.OK, payload
+    lane_busy = _workspace_lane_is_locked(
+        workspace_root=workspace_root,
+        proposals=pool.proposals,
+        queue_path=queue_path,
+        run_store=run_store,
+        ignore_proposal_id=proposal.proposal_id,
+    )
     if lane_busy:
         proposal_store.update_proposal(
             pool,
@@ -1775,8 +1835,6 @@ def create_proposal(
         }
         return HTTPStatus.OK, payload
     proposal_store.save(pool)
-
-    run_store = RunStore(Path(runs_dir).expanduser().resolve())
     try:
         manifest = _create_preflight_run(
             run_store=run_store,
@@ -1842,10 +1900,16 @@ def proposal_action(
     if action == "retry-plan":
         if config is None:
             return HTTPStatus.BAD_REQUEST, {"error": "missing execution config"}
-        if proposal.status not in {PROPOSAL_WAITING_WORKSPACE, PROPOSAL_WAITING_WORKSPACE_CLEAN, PROPOSAL_FAILED}:
+        if proposal.status not in {
+            PROPOSAL_WAITING_WORKSPACE,
+            PROPOSAL_WAITING_WORKSPACE_CLEAN,
+            PROPOSAL_WAITING_INPUT,
+            PROPOSAL_FAILED,
+        }:
             return HTTPStatus.CONFLICT, {
                 "error": (
                     "retry-plan requires WAITING_WORKSPACE, WAITING_WORKSPACE_CLEAN, "
+                    "WAITING_PROPOSAL_INPUT, "
                     f"or FAILED proposal status, current status is {proposal.status}"
                 ),
                 "status": proposal.status,
@@ -1879,30 +1943,17 @@ def proposal_action(
             proposal_store.save(pool)
             return HTTPStatus.CONFLICT, {"error": str(exc)}
 
-        run_store = RunStore(Path(runs_dir).expanduser().resolve())
-        lane_busy = _workspace_lane_is_locked(
-            workspace_root=workspace_root,
-            proposals=pool.proposals,
-            queue_path=queue_path,
-            run_store=run_store,
-            ignore_proposal_id=proposal.proposal_id,
-        )
-        if lane_busy:
+        feedback_text = feedback.strip() if isinstance(feedback, str) else ""
+        effective_prompt = proposal.prompt
+        if feedback_text:
+            effective_prompt = _append_proposal_feedback(proposal.prompt, feedback_text)
             proposal_store.update_proposal(
                 pool,
                 proposal.proposal_id,
-                status=PROPOSAL_WAITING_WORKSPACE,
-                error=None,
-                reason="workspace_lane",
-                blocker=None,
+                prompt=effective_prompt,
             )
-            proposal_store.save(pool)
-            payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
-            payload["transition"] = {
-                "type": "proposal_retry_waiting_workspace",
-                "proposal_id": proposal.proposal_id,
-            }
-            return HTTPStatus.OK, payload
+
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
         try:
             clean_status = _check_workspace_clean_or_raise(proposal_cwd)
         except WorkspaceStatusCommandError as exc:
@@ -1938,6 +1989,50 @@ def proposal_action(
                 "proposal_id": proposal.proposal_id,
             }
             return HTTPStatus.OK, payload
+        proposal_preflight = _evaluate_proposal_quality_preflight(
+            prompt=effective_prompt,
+            cwd=proposal_cwd,
+        )
+        if proposal_preflight is not None:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_WAITING_INPUT,
+                run_id=None,
+                error=None,
+                reason=str(proposal_preflight.get("reason") or "proposal_quality"),
+                blocker=proposal_preflight,
+            )
+            proposal_store.save(pool)
+            payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+            payload["transition"] = {
+                "type": "proposal_retry_waiting_input",
+                "proposal_id": proposal.proposal_id,
+            }
+            return HTTPStatus.OK, payload
+        lane_busy = _workspace_lane_is_locked(
+            workspace_root=workspace_root,
+            proposals=pool.proposals,
+            queue_path=queue_path,
+            run_store=run_store,
+            ignore_proposal_id=proposal.proposal_id,
+        )
+        if lane_busy:
+            proposal_store.update_proposal(
+                pool,
+                proposal.proposal_id,
+                status=PROPOSAL_WAITING_WORKSPACE,
+                error=None,
+                reason="workspace_lane",
+                blocker=None,
+            )
+            proposal_store.save(pool)
+            payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+            payload["transition"] = {
+                "type": "proposal_retry_waiting_workspace",
+                "proposal_id": proposal.proposal_id,
+            }
+            return HTTPStatus.OK, payload
 
         manifest: Optional[RunManifest] = None
         if proposal.run_id:
@@ -1952,7 +2047,7 @@ def proposal_action(
                 manifest = _create_preflight_run(
                     run_store=run_store,
                     config=config,
-                    user_task=proposal.prompt,
+                    user_task=effective_prompt,
                     task_cwd=proposal_cwd,
                     worktree_factory=worktree_factory,
                     proposal_id=proposal.proposal_id,
@@ -2212,6 +2307,28 @@ def _workspace_resolution_blocker(*, cwd: Optional[str], error: str) -> Dict[str
         "cwd": cwd,
         "error": error,
     }
+
+
+def _evaluate_proposal_quality_preflight(*, prompt: str, cwd: Path) -> Optional[Dict[str, Any]]:
+    result = evaluate_proposal_preflight(prompt)
+    if result.passed:
+        return None
+    return {
+        "type": "proposal_preflight_blocked",
+        "reason": result.reason or "proposal_quality",
+        "message": result.message or "提案需要补充信息后才能继续规划。",
+        "suggested_action": result.suggested_action or PROPOSAL_INPUT_SUGGESTED_ACTION,
+        "suggestions": list(result.suggestions),
+        "issues": list(result.issues),
+        "cwd": str(cwd),
+    }
+
+
+def _append_proposal_feedback(prompt: str, feedback: str) -> str:
+    feedback_text = feedback.strip()
+    if not feedback_text:
+        return prompt
+    return f"{prompt.rstrip()}\n\n补充信息：\n{feedback_text}"
 
 
 

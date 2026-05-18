@@ -53,6 +53,7 @@ const statusText: Record<string, string> = {
   PLAN_REVISING: "Planner 修改计划中",
   WAITING_WORKSPACE: "等待 workspace",
   WAITING_WORKSPACE_CLEAN: "等待工作区清理",
+  WAITING_PROPOSAL_INPUT: "等待补充提案信息",
   retry_backoff: "重试退避等待",
   retry_budget_exhausted: "自动重试预算耗尽",
   PLAN_APPROVED: "计划已通过",
@@ -205,6 +206,9 @@ function proposalRevision(proposal: ProposalRecord): string {
     proposal.error ?? "",
     proposal.reason ?? "",
     proposal.blocker?.message ?? "",
+    proposal.blocker?.reason ?? "",
+    (proposal.blocker?.suggestions ?? []).join(","),
+    (proposal.blocker?.issues ?? []).join(","),
     proposal.blocker?.status_output ?? "",
   ].join("|");
 }
@@ -718,6 +722,7 @@ function ProposalPanel({
   async function proposalAction(proposal: ProposalRecord, action: ProposalAction) {
     setError(null);
     const feedback = feedbackById[proposal.proposal_id] ?? "";
+    const feedbackTrimmed = feedback.trim();
     setPendingProposalAction({
       entityId: proposal.proposal_id,
       action,
@@ -727,9 +732,12 @@ function ProposalPanel({
       await actionMutation.mutateAsync({
         proposalId: proposal.proposal_id,
         action,
-        payload: action === "revise-plan" ? { feedback } : {},
+        payload:
+          action === "revise-plan" || (action === "retry-plan" && feedbackTrimmed)
+            ? { feedback: feedbackTrimmed }
+            : {},
       });
-      if (action === "revise-plan") {
+      if (action === "revise-plan" || action === "retry-plan") {
         setFeedbackById((current) => ({ ...current, [proposal.proposal_id]: "" }));
       }
       if (proposal.run_id) onSelectRun(proposal.run_id);
@@ -753,6 +761,7 @@ function ProposalPanel({
           <span>总数 {summary.total_proposals}</span>
           <span>待审 {summary.review_required}</span>
           <span>待清理 {summary.waiting_workspace_clean ?? 0}</span>
+          <span>待补充 {summary.waiting_proposal_input ?? 0}</span>
           <span>失败 {summary.failed}</span>
         </div>
       ) : null}
@@ -843,6 +852,18 @@ function ProposalPanel({
             ) : null}
             {proposal.allowed_actions.includes("retry-plan") ? (
               <div className="proposalActions">
+                {proposal.waiting_for === "proposal_input" ? (
+                  <textarea
+                    value={feedbackById[proposal.proposal_id] ?? ""}
+                    onChange={(event) =>
+                      setFeedbackById((current) => ({
+                        ...current,
+                        [proposal.proposal_id]: event.target.value,
+                      }))
+                    }
+                    placeholder="补充目标行为、范围与验收标准（可选但建议填写）"
+                  />
+                ) : null}
                 <button
                   type="button"
                   onClick={() => proposalAction(proposal, "retry-plan")}
@@ -875,8 +896,11 @@ function ProposalPlanPanel({
   error?: string | null;
   reason?: string | null;
   blocker?: {
+    reason?: string | null;
     message?: string | null;
     suggested_action?: string | null;
+    suggestions?: string[] | null;
+    issues?: string[] | null;
     status_output?: string | null;
     command?: string | null;
   } | null;
@@ -893,6 +917,27 @@ function ProposalPlanPanel({
           {blocker?.status_output ? (
             <Collapsible title="git status --short 输出" open>
               <pre>{blocker.status_output}</pre>
+            </Collapsible>
+          ) : null}
+        </div>
+      );
+    }
+    if (status === "WAITING_PROPOSAL_INPUT") {
+      const suggestions = blocker?.suggestions ?? [];
+      const issues = blocker?.issues ?? [];
+      return (
+        <div className="proposalPlan">
+          <p>{displayValue(blocker?.message ?? "提案信息不足，暂无法继续规划。")}</p>
+          {blocker?.reason ? <p className="meta">reason: {displayValue(blocker.reason)}</p> : null}
+          {blocker?.suggested_action ? <p className="meta">{displayValue(blocker.suggested_action)}</p> : null}
+          {suggestions.length ? (
+            <Collapsible title="建议补充项" open>
+              <BulletList items={suggestions} />
+            </Collapsible>
+          ) : null}
+          {issues.length ? (
+            <Collapsible title="检测到的问题">
+              <BulletList items={issues} code />
             </Collapsible>
           ) : null}
         </div>

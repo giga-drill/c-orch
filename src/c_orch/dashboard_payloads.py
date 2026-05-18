@@ -22,6 +22,7 @@ from .proposal_store import (
     PROPOSAL_PLAN_REVISING,
     PROPOSAL_PLANNING,
     PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_INPUT,
     PROPOSAL_WAITING_WORKSPACE,
     PROPOSAL_WAITING_WORKSPACE_CLEAN,
     ProposalRecord,
@@ -392,7 +393,7 @@ def _workspace_lane_summary(
         elif status in {PROPOSAL_PLANNING, PROPOSAL_PLAN_REVISING}:
             lane["status"] = "active"
             lane["active_item"] = {"type": "proposal", "id": proposal.get("proposal_id"), "title": proposal.get("title")}
-        elif status in {PROPOSAL_WAITING_WORKSPACE, PROPOSAL_WAITING_WORKSPACE_CLEAN}:
+        elif status in {PROPOSAL_WAITING_WORKSPACE, PROPOSAL_WAITING_WORKSPACE_CLEAN, PROPOSAL_WAITING_INPUT}:
             lane["queued"] += 1
     for task in _list_value(queue_payload.get("tasks")):
         if not isinstance(task, dict):
@@ -698,6 +699,7 @@ def _summarize_proposal(proposal: ProposalRecord, *, run_store: Optional[RunStor
         PROPOSAL_FAILED,
         PROPOSAL_WAITING_WORKSPACE,
         PROPOSAL_WAITING_WORKSPACE_CLEAN,
+        PROPOSAL_WAITING_INPUT,
     }:
         status = _proposal_status_from_run(manifest)
     return {
@@ -735,6 +737,9 @@ def _proposal_summary(proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
     waiting_workspace_clean = sum(
         1 for proposal in proposals if proposal.get("status") == PROPOSAL_WAITING_WORKSPACE_CLEAN
     )
+    waiting_proposal_input = sum(
+        1 for proposal in proposals if proposal.get("status") == PROPOSAL_WAITING_INPUT
+    )
     return {
         "total_proposals": total,
         "review_required": review_required,
@@ -743,6 +748,7 @@ def _proposal_summary(proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active": active,
         "waiting_workspace": waiting_workspace,
         "waiting_workspace_clean": waiting_workspace_clean,
+        "waiting_proposal_input": waiting_proposal_input,
     }
 
 
@@ -751,6 +757,8 @@ def _proposal_waiting_for(status: str) -> str:
         return "workspace_lane"
     if status == PROPOSAL_WAITING_WORKSPACE_CLEAN:
         return "workspace_clean"
+    if status == PROPOSAL_WAITING_INPUT:
+        return "proposal_input"
     if status == PROPOSAL_PLAN_REVIEW_REQUIRED:
         return "human_plan_review"
     if status == PROPOSAL_PLAN_REVISING:
@@ -771,6 +779,8 @@ def _allowed_proposal_actions(
     reason: Optional[str],
 ) -> List[str]:
     if status == PROPOSAL_WAITING_WORKSPACE_CLEAN:
+        return ["retry-plan"]
+    if status == PROPOSAL_WAITING_INPUT:
         return ["retry-plan"]
     if status == PROPOSAL_FAILED and reason in {
         "workspace_resolution_failed",

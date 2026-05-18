@@ -63,6 +63,8 @@ normally waits for plan approval before Worker execution. Remaining safeguards
 and followups:
 
 - proposal quality and scope checks before planning
+  (phase 1 delivered: backend rule-based preflight with `WAITING_PROPOSAL_INPUT`
+  blocker plus retry-with-feedback path)
 - clearer rollback/stop controls after execution starts
 - good run evidence so humans can audit what the Planner decided
 - optional policy modes for tasks that still require explicit human plan review
@@ -533,9 +535,12 @@ larger lifecycle architecture changes.
 6. Run-history performance telemetry.
    Aggregate phase timing, retry counts, review durations, and bottleneck
    categories across runs before attempting deeper performance optimization.
-7. Proposal quality and scope checks.
-   Add lightweight pre-planning checks that tell humans when a proposal is too
-   vague, too broad, or risky, while keeping the normal path automated.
+7. Proposal quality and scope checks. (Delivered in phase 1)
+   Backend now runs lightweight rule checks after workspace-clean preflight and
+   before Planner session creation/continuation. Vague/oversized proposals move
+   to `WAITING_PROPOSAL_INPUT` with structured blocker reason/suggestions, and
+   retry supports appended human补充信息 while preserving default auto
+   approve+enqueue flow after checks pass.
 8. Proposal decomposition and commit-size control.
    Let Planner suggest commit-sized subtasks for large intents, then later teach
    c-orch to enqueue those subtasks with explicit dependencies.

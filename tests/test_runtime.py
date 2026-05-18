@@ -13,6 +13,7 @@ from unittest import mock
 
 from c_orch.proposal_store import (
     PROPOSAL_QUEUED,
+    PROPOSAL_WAITING_INPUT,
     PROPOSAL_WAITING_WORKSPACE,
     ProposalPool,
     ProposalRecord,
@@ -1274,6 +1275,178 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("dirty.txt", proposal.blocker["status_output"])
             self.assertEqual(fake_planner.run_calls, 0)
             self.assertEqual(list((root / "runs").glob("*/manifest.json")), [])
+
+    def test_create_proposal_vague_prompt_waits_for_input_without_planner_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status, payload = runtime.create_proposal("Task vague", "fix it")
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_created_waiting_input")
+            proposal = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(proposal.status, PROPOSAL_WAITING_INPUT)
+            self.assertEqual(proposal.reason, "proposal_too_vague")
+            self.assertIsNone(proposal.run_id)
+            assert proposal.blocker is not None
+            self.assertEqual(proposal.blocker["reason"], "proposal_too_vague")
+            self.assertEqual(fake_planner.run_calls, 0)
+            self.assertEqual(list((root / "runs").glob("*/manifest.json")), [])
+
+    def test_retry_plan_with_feedback_promotes_waiting_input_to_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            create_status, _create_payload = runtime.create_proposal("Task vague", "fix it")
+            self.assertEqual(int(create_status), 200)
+            proposal_id = ProposalStore(root / "proposals.json").load().proposals[0].proposal_id
+
+            retry_status, retry_payload = runtime.proposal_action(
+                proposal_id,
+                "retry-plan",
+                "目标：更新 dashboard payload 并补充 test_dashboard_payloads.py 覆盖；验收：unittest 通过。",
+            )
+            self.assertEqual(int(retry_status), 200)
+            self.assertEqual(retry_payload["transition"]["type"], "proposal_retry_planning")
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(proposals[0]["status"], "PLAN_REVIEW_REQUIRED")
+            self.assertEqual(fake_planner.run_calls, 1)
+
+    def test_retry_plan_without_feedback_keeps_waiting_input_when_still_vague(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            create_status, _create_payload = runtime.create_proposal("Task vague", "fix it")
+            self.assertEqual(int(create_status), 200)
+            proposal_id = ProposalStore(root / "proposals.json").load().proposals[0].proposal_id
+
+            retry_status, retry_payload = runtime.proposal_action(proposal_id, "retry-plan")
+
+            self.assertEqual(int(retry_status), 200)
+            self.assertEqual(retry_payload["transition"]["type"], "proposal_retry_waiting_input")
+            proposals = runtime.build_proposals_payload()["proposals"]
+            self.assertEqual(proposals[0]["status"], PROPOSAL_WAITING_INPUT)
+            self.assertEqual(proposals[0]["reason"], "proposal_too_vague")
+            self.assertEqual(fake_planner.run_calls, 0)
+
+    def test_dispatcher_quality_block_clears_stale_run_id_and_retry_uses_fresh_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            run_store = RunStore(root / "runs")
+            stale_manifest = run_store.create_run(
+                cwd=repo,
+                user_task="fix it",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+            )
+            run_store.save(stale_manifest)
+
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            proposal = proposal_store.add_proposal(pool, title="Task stale", prompt="fix it", cwd=str(repo))
+            proposal.status = "PLANNING"
+            proposal.run_id = stale_manifest.run_id
+            proposal_store.save(pool)
+
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            blocked = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(blocked.status, PROPOSAL_WAITING_INPUT)
+            self.assertIsNone(blocked.run_id)
+            self.assertEqual(fake_planner.run_calls, 0)
+
+            feedback = (
+                "Target behavior: update proposal preflight in src/c_orch/runtime.py; "
+                "acceptance: add tests/test_runtime.py coverage and run unittest discover."
+            )
+            retry_status, retry_payload = runtime.proposal_action(proposal.proposal_id, "retry-plan", feedback)
+            self.assertEqual(int(retry_status), 200)
+            self.assertEqual(retry_payload["transition"]["type"], "proposal_retry_planning")
+            new_run_id = retry_payload["transition"]["run_id"]
+            self.assertNotEqual(new_run_id, stale_manifest.run_id)
+
+            new_manifest = run_store.load(new_run_id)
+            self.assertIn("补充信息", new_manifest.user_task)
+            self.assertIn(feedback, new_manifest.user_task)
+
+            self.assertTrue(runtime.wait_for_proposal_dispatch(timeout=3))
+            self.assertEqual(fake_planner.run_calls, 1)
+            self.assertEqual(fake_planner.run_ids, [new_run_id])
+
+    def test_workspace_dirty_preflight_has_priority_over_quality_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            run_store = RunStore(root / "runs")
+            fake_planner = _FakeProposalPlanner(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                proposals_path=root / "proposals.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake_planner,
+            )
+
+            status, payload = runtime.create_proposal("Task dirty vague", "fix it")
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_created_waiting_workspace_clean")
+            proposal = ProposalStore(root / "proposals.json").load().proposals[0]
+            self.assertEqual(proposal.status, "WAITING_WORKSPACE_CLEAN")
+            self.assertEqual(proposal.reason, "workspace_clean")
+            self.assertEqual(fake_planner.run_calls, 0)
 
     def test_retry_plan_rechecks_workspace_and_runs_planner_after_clean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
