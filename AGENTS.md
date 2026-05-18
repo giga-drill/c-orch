@@ -1,72 +1,55 @@
 # Agent Notes
 
-This file is the repo-local long-term memory for agents working on c-orch.
-Keep it concise, public-safe, and focused on reusable project learnings. Do not
-record secrets, personal credentials, local tokens, or transient logs here.
+Repo-local agent memory for c-orch. Keep this file very short: it may be
+included in context or reread often. Store durable detail in docs, not here.
+Never record secrets, credentials, tokens, or transient logs.
 
 ## Read First
-
-Before planning or editing c-orch itself, read:
 
 - `README.md`
 - `docs/mcp-orchestrator-design.md`
 - `docs/architecture-principles.md`
 
-Use those docs as the source of truth for architecture, state semantics, agent
-responsibilities, and product direction. Update them when a change alters a
-durable project rule.
+Update the docs, not this file, when a change alters architecture, state
+semantics, agent responsibilities, failure handling, or product direction.
 
-## Runtime And UI Entry Points
+## Core Rules
 
-Use supervised dashboard entry points by default:
+- Frontend only renders backend-authored state and sends user intent; backend
+  runtime owns business transitions.
+- `GET` endpoints are pure reads. Queue/proposal/run writes go through backend
+  actions or schedulers.
+- Proposal pool owns Planner plan generation and human plan review. Execution
+  queue owns already-approved work.
+- Failure recovery lives in events and `failure_policy.py`, not extra Planner
+  review outcomes.
+- Planner and Worker for one run use the same isolated task workspace.
+- Worker worktrees isolate code changes, not dependency caches.
+- Same-target-repo edits are serialized; apply may fail instead of rebasing if
+  the target repo changes during a Worker run.
+
+## Commands
+
+Use supervised dashboard entry points:
 
 ```bash
-PYTHONPATH=src python3.11 -m c_orch.cli dev-ui --cwd /path/to/target-repo --runs-dir runs --queue-file .c-orch/tasks/queue.json
-PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui --cwd /path/to/target-repo --runs-dir runs --queue-file .c-orch/tasks/queue.json
+PYTHONPATH=src python3.11 -m c_orch.cli dev-ui --cwd /path/to/repo --runs-dir runs --queue-file .c-orch/tasks/queue.json
+PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui --cwd /path/to/repo --runs-dir runs --queue-file .c-orch/tasks/queue.json
 ```
 
-Treat bare `c-orch ui` as a low-level child runtime/debug entry. It does not
-supervise its own restart gate.
+Treat bare `c-orch ui` as a low-level child runtime/debug entry.
 
-## State Boundaries
-
-- The frontend renders backend-authored state and sends user intent back to the
-  backend. It must not own business state transitions.
-- `GET` endpoints should be pure reads. Queue/proposal/run writes belong in
-  backend action entrypoints or scheduler code.
-- Proposal planning happens before execution queue entry. The proposal pool owns
-  human plan review; the execution queue owns already-approved work.
-- Failure recovery metadata belongs in events and `failure_policy.py`, not as
-  extra Planner review business outcomes.
-
-## Workspace And Apply Boundaries
-
-- Planner and Worker for one run should use the same isolated task workspace.
-- Worker worktrees isolate code changes, not package caches.
-- Same-target-repo modifications are currently serialized. If the target repo
-  changes while a Worker is running, c-orch may reject the patch during apply
-  instead of rebasing it.
-
-## Testing
-
-Use explicit unittest discovery for the Python suite:
+Run Python tests with explicit discovery:
 
 ```bash
 PYTHONPATH=src python3.11 -m unittest discover -s tests
 ```
 
-Do not use bare `python3.11 -m unittest` as the full-suite command; in this repo
-it can report `Ran 0 tests`.
+Bare `python3.11 -m unittest` can report `Ran 0 tests` in this repo. For
+frontend changes, also run `pnpm --dir web run typecheck` and
+`pnpm --dir web run build`.
 
-For dashboard frontend changes, also run relevant frontend checks:
+## Current Learning
 
-```bash
-pnpm --dir web run typecheck
-pnpm --dir web run build
-```
-
-## Recent Learnings
-
-- When a failed task is marked handled/skipped, the runtime must wake both the
-  queue dispatcher and the proposal dispatcher. A waiting proposal in the same
-  workspace may now be unblocked by that task action.
+When a failed task is marked handled/skipped, wake both queue and proposal
+dispatchers; waiting proposals in that workspace may become unblocked.
