@@ -248,6 +248,26 @@ class TaskStore:
         queue.updated_at = task.updated_at
         return task
 
+    def reorder_task(
+        self,
+        queue: TaskQueue,
+        *,
+        task_id: str,
+        target_task_id: str,
+        position: str,
+    ) -> None:
+        if position not in {"before", "after"}:
+            raise ValueError(f"unsupported position: {position}")
+        source_index = self._find_task_index(queue, task_id)
+        target_index = self._find_task_index(queue, target_task_id)
+        if source_index == target_index:
+            return
+        source = queue.tasks.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        insert_index = target_index if position == "before" else target_index + 1
+        queue.tasks.insert(insert_index, source)
+
     def validate(self, queue: TaskQueue) -> None:
         if not queue.queue_id:
             raise ValueError("queue_id cannot be empty")
@@ -271,6 +291,12 @@ class TaskStore:
         for task in queue.tasks:
             if task.task_id == task_id:
                 return task
+        raise ValueError(f"task not found: {task_id}")
+
+    def _find_task_index(self, queue: TaskQueue, task_id: str) -> int:
+        for index, task in enumerate(queue.tasks):
+            if task.task_id == task_id:
+                return index
         raise ValueError(f"task not found: {task_id}")
 
 

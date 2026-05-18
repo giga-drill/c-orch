@@ -32,6 +32,7 @@ from c_orch.states import (
     RUN_WORK_DONE,
 )
 from c_orch.task_store import TaskStore
+from c_orch.workspace_lanes import canonical_git_root
 
 
 class _FakeOrchestrator:
@@ -339,6 +340,75 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(loaded.tasks[0].reason)
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
+
+    def test_task_reorder_action_returns_state_version_and_persists_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(repo)},
+                ]
+            )
+            task_store.save(queue)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+            )
+
+            status, payload = runtime.task_action(
+                "task-002",
+                "move-before",
+                action_payload={"target_task_id": "task-001"},
+            )
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "task_reordered")
+            self.assertGreater(payload["state_version"], 0)
+            self.assertEqual(
+                [task["task_id"] for task in payload["state"]["queue"]["tasks"]],
+                ["task-002", "task-001"],
+            )
+            loaded = task_store.load()
+            self.assertEqual([task.task_id for task in loaded.tasks], ["task-002", "task-001"])
+
+    def test_task_reorder_without_task_cwd_uses_scheduler_default_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2"},
+                ]
+            )
+            task_store.save(queue)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+            )
+            runtime.queue_path = root / "queue.json"
+
+            status, payload = runtime.task_action(
+                "task-002",
+                "move-before",
+                action_payload={"target_task_id": "task-001"},
+            )
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "task_reordered")
+            self.assertGreater(payload["state_version"], 0)
+            queue_state = payload["state"]["queue"]["tasks"]
+            self.assertEqual([task["task_id"] for task in queue_state], ["task-002", "task-001"])
+            expected_lane = str(canonical_git_root(repo))
+            self.assertEqual([task["workspace_id"] for task in queue_state], [expected_lane, expected_lane])
+            loaded = task_store.load()
+            self.assertEqual([task.task_id for task in loaded.tasks], ["task-002", "task-001"])
 
     def test_mark_handled_skipped_wakes_waiting_workspace_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

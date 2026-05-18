@@ -81,6 +81,27 @@ class ProposalStoreTests(unittest.TestCase):
             self.assertEqual(loaded.proposals[0].blocker["type"], "workspace_dirty")
             self.assertIn("src/main.py", loaded.proposals[0].blocker["status_output"])
 
+    def test_reorder_proposal_persists_array_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProposalStore(Path(tmp) / "proposals.json")
+            pool = store.create()
+            first = store.add_proposal(pool, title="Task 1", prompt="Do 1", cwd="/tmp/repo-a")
+            second = store.add_proposal(pool, title="Task 2", prompt="Do 2", cwd="/tmp/repo-a")
+            third = store.add_proposal(pool, title="Task 3", prompt="Do 3", cwd="/tmp/repo-a")
+            store.reorder_proposal(
+                pool,
+                proposal_id=third.proposal_id,
+                target_proposal_id=first.proposal_id,
+                position="before",
+            )
+            store.save(pool)
+
+            loaded = store.load()
+            self.assertEqual(
+                [proposal.proposal_id for proposal in loaded.proposals],
+                [third.proposal_id, first.proposal_id, second.proposal_id],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

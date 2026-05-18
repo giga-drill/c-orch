@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -692,7 +693,10 @@ class UiTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["waiting_workspace_clean"], 1)
             self.assertEqual(payload["proposals"][0]["status"], "WAITING_WORKSPACE_CLEAN")
             self.assertEqual(payload["proposals"][0]["waiting_for"], "workspace_clean")
-            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
+            self.assertEqual(
+                payload["proposals"][0]["allowed_actions"],
+                ["move-before", "move-after", "retry-plan"],
+            )
             self.assertEqual(
                 payload["proposals"][0]["blocker"]["message"],
                 "目标工作区存在未提交改动。建议先提交或处理这些改动，再生成计划。",
@@ -806,6 +810,167 @@ class UiTests(unittest.TestCase):
             self.assertEqual(loaded.status, "PENDING")
             self.assertEqual(loaded.tasks[0].status, "SKIPPED")
             self.assertEqual(loaded.tasks[0].run_ids, ["run-1"])
+
+    def test_task_action_move_before_reorders_same_workspace_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(repo)},
+                ]
+            )
+            queue_store.save(queue)
+
+            status, payload = task_action(
+                root / "queue.json",
+                "task-002",
+                "move-before",
+                runs_dir=root / "runs",
+                action_payload={"target_task_id": "task-001"},
+            )
+            loaded = queue_store.load()
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "task_reordered")
+            self.assertEqual([task["task_id"] for task in payload["tasks"]], ["task-002", "task-001"])
+            self.assertEqual([task.task_id for task in loaded.tasks], ["task-002", "task-001"])
+
+    def test_task_action_move_before_rejects_cross_workspace_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            _init_git_repo(repo_a)
+            _init_git_repo(repo_b)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo_a)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(repo_b)},
+                ]
+            )
+            queue_store.save(queue)
+
+            status, payload = task_action(
+                root / "queue.json",
+                "task-001",
+                "move-before",
+                runs_dir=root / "runs",
+                action_payload={"target_task_id": "task-002"},
+            )
+            loaded = queue_store.load()
+
+            self.assertEqual(int(status), 409)
+            self.assertIn("same workspace lane", payload["error"])
+            self.assertEqual([task.task_id for task in loaded.tasks], ["task-001", "task-002"])
+
+    def test_task_action_move_before_rejects_started_active_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            queue_store = TaskStore(root / "queue.json")
+            queue = queue_store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do task 2", "cwd": str(repo)},
+                ]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Task 1 run",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex",
+            )
+            manifest.status = "WORKING"
+            run_store.save(manifest)
+            queue_store.update_task(
+                queue,
+                "task-001",
+                status="PENDING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+            )
+            queue_store.save(queue)
+
+            status, payload = task_action(
+                root / "queue.json",
+                "task-001",
+                "move-before",
+                runs_dir=root / "runs",
+                action_payload={"target_task_id": "task-002"},
+            )
+            loaded = queue_store.load()
+
+            self.assertEqual(int(status), 409)
+            self.assertIn("source task is not movable", payload["error"])
+            self.assertEqual([task.task_id for task in loaded.tasks], ["task-001", "task-002"])
+
+    def test_proposal_action_move_after_reorders_same_workspace_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            first = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1", cwd=str(repo))
+            second = proposal_store.add_proposal(pool, title="Task 2", prompt="Do task 2", cwd=str(repo))
+            proposal_store.update_proposal(pool, first.proposal_id, status="WAITING_WORKSPACE")
+            proposal_store.update_proposal(pool, second.proposal_id, status="WAITING_PROPOSAL_INPUT")
+            proposal_store.save(pool)
+
+            status, payload = proposal_action(
+                root / "proposals.json",
+                first.proposal_id,
+                "move-after",
+                runs_dir=root / "runs",
+                queue_path=None,
+                config=None,
+                worktree_factory=None,
+                driver_factory=_unused_driver_factory,
+                action_payload={"target_proposal_id": second.proposal_id},
+            )
+            loaded = proposal_store.load()
+
+            self.assertEqual(int(status), 200)
+            self.assertEqual(payload["transition"]["type"], "proposal_reordered")
+            self.assertEqual([proposal["proposal_id"] for proposal in payload["proposals"]], [second.proposal_id, first.proposal_id])
+            self.assertEqual([proposal.proposal_id for proposal in loaded.proposals], [second.proposal_id, first.proposal_id])
+
+    def test_proposal_action_move_before_rejects_non_waiting_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            proposal_store = ProposalStore(root / "proposals.json")
+            pool = proposal_store.create()
+            first = proposal_store.add_proposal(pool, title="Task 1", prompt="Do task 1", cwd=str(repo))
+            second = proposal_store.add_proposal(pool, title="Task 2", prompt="Do task 2", cwd=str(repo))
+            proposal_store.update_proposal(pool, first.proposal_id, status="PLAN_REVIEW_REQUIRED")
+            proposal_store.update_proposal(pool, second.proposal_id, status="WAITING_WORKSPACE")
+            proposal_store.save(pool)
+
+            status, payload = proposal_action(
+                root / "proposals.json",
+                first.proposal_id,
+                "move-before",
+                runs_dir=root / "runs",
+                queue_path=None,
+                config=None,
+                worktree_factory=None,
+                driver_factory=_unused_driver_factory,
+                action_payload={"target_proposal_id": second.proposal_id},
+            )
+            loaded = proposal_store.load()
+
+            self.assertEqual(int(status), 409)
+            self.assertIn("source proposal is not movable", payload["error"])
+            self.assertEqual([proposal.proposal_id for proposal in loaded.proposals], [first.proposal_id, second.proposal_id])
 
     def test_queue_action_confirm_runtime_restarted_clears_restart_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1071,8 +1236,8 @@ class UiTests(unittest.TestCase):
         self.assertNotIn("selectedRunId", sort_block)
         self.assertNotIn("task.status === \"RUNNING\"", sort_block)
         self.assertNotIn("task.status === \"FAILED\"", sort_block)
-        self.assertIn("return rightUpdated - leftUpdated;", sort_block)
-        self.assertIn("return left.index - right.index;", sort_block)
+        self.assertIn("return tasks.slice();", sort_block)
+        self.assertNotIn("return rightUpdated - leftUpdated;", sort_block)
         self.assertIn(
             "const selected = Boolean(taskRunId && taskRunId === selectedRunId);",
             app_source,
@@ -1476,6 +1641,16 @@ class _UnusedDriverContext:
 
 def _unused_driver_factory(_codex_path: str) -> _UnusedDriverContext:
     return _UnusedDriverContext()
+
+
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    (path / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":

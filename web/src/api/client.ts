@@ -77,10 +77,14 @@ export function postRunAction(
   });
 }
 
-export function postTaskAction(taskId: string, action: AllowedTaskAction): Promise<ActionResponse> {
+export function postTaskAction(
+  taskId: string,
+  action: AllowedTaskAction,
+  payload: Record<string, unknown> = {},
+): Promise<ActionResponse> {
   return requestJson<ActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/actions`, {
     method: "POST",
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, ...payload }),
   });
 }
 

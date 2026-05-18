@@ -198,6 +198,26 @@ class ProposalStore:
         pool.updated_at = proposal.updated_at
         return proposal
 
+    def reorder_proposal(
+        self,
+        pool: ProposalPool,
+        *,
+        proposal_id: str,
+        target_proposal_id: str,
+        position: str,
+    ) -> None:
+        if position not in {"before", "after"}:
+            raise ValueError(f"unsupported position: {position}")
+        source_index = self._find_proposal_index(pool, proposal_id)
+        target_index = self._find_proposal_index(pool, target_proposal_id)
+        if source_index == target_index:
+            return
+        source = pool.proposals.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        insert_index = target_index if position == "before" else target_index + 1
+        pool.proposals.insert(insert_index, source)
+
     def remove_proposal(self, pool: ProposalPool, proposal_id: str) -> ProposalRecord:
         for index, proposal in enumerate(pool.proposals):
             if proposal.proposal_id == proposal_id:
@@ -210,6 +230,12 @@ class ProposalStore:
         for proposal in pool.proposals:
             if proposal.proposal_id == proposal_id:
                 return proposal
+        raise ValueError(f"proposal not found: {proposal_id}")
+
+    def _find_proposal_index(self, pool: ProposalPool, proposal_id: str) -> int:
+        for index, proposal in enumerate(pool.proposals):
+            if proposal.proposal_id == proposal_id:
+                return index
         raise ValueError(f"proposal not found: {proposal_id}")
 
     def validate(self, pool: ProposalPool) -> None:

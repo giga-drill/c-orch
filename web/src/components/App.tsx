@@ -298,19 +298,47 @@ function formatShortTime(value?: string | null): string {
 }
 
 function sortQueueTasks(tasks: TaskSummary[]): TaskSummary[] {
-  return tasks
-    .map((task, index) => ({ task, index }))
-    .sort((left, right) => {
-      const leftUpdated = parseTimestamp(left.task.updated_at);
-      const rightUpdated = parseTimestamp(right.task.updated_at);
-      if (leftUpdated !== null && rightUpdated !== null && leftUpdated !== rightUpdated) {
-        return rightUpdated - leftUpdated;
-      }
-      if (leftUpdated !== null && rightUpdated === null) return -1;
-      if (leftUpdated === null && rightUpdated !== null) return 1;
-      return left.index - right.index;
-    })
-    .map((entry) => entry.task);
+  return tasks.slice();
+}
+
+function canReorderEntity(actions: readonly string[]): boolean {
+  return actions.includes("move-before") && actions.includes("move-after");
+}
+
+function findAdjacentMovableTask(
+  tasks: TaskSummary[],
+  task: TaskSummary,
+  direction: "up" | "down",
+): TaskSummary | null {
+  const index = tasks.findIndex((item) => item.task_id === task.task_id);
+  if (index < 0 || !canReorderEntity(task.allowed_actions)) return null;
+  const lane = task.workspace_id ?? null;
+  const step = direction === "up" ? -1 : 1;
+  for (let cursor = index + step; cursor >= 0 && cursor < tasks.length; cursor += step) {
+    const candidate = tasks[cursor];
+    if ((candidate.workspace_id ?? null) !== lane) continue;
+    if (!canReorderEntity(candidate.allowed_actions)) return null;
+    return candidate;
+  }
+  return null;
+}
+
+function findAdjacentMovableProposal(
+  proposals: ProposalRecord[],
+  proposal: ProposalRecord,
+  direction: "up" | "down",
+): ProposalRecord | null {
+  const index = proposals.findIndex((item) => item.proposal_id === proposal.proposal_id);
+  if (index < 0 || !canReorderEntity(proposal.allowed_actions)) return null;
+  const lane = proposal.workspace_id ?? null;
+  const step = direction === "up" ? -1 : 1;
+  for (let cursor = index + step; cursor >= 0 && cursor < proposals.length; cursor += step) {
+    const candidate = proposals[cursor];
+    if ((candidate.workspace_id ?? null) !== lane) continue;
+    if (!canReorderEntity(candidate.allowed_actions)) return null;
+    return candidate;
+  }
+  return null;
 }
 
 export function App() {
@@ -820,7 +848,7 @@ function ProposalPanel({
   const [feedbackById, setFeedbackById] = useState<Record<string, string>>({});
   const [pendingProposalAction, setPendingProposalAction] = useState<PendingProposalAction | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const proposalsNewestFirst = newestFirst(payload?.proposals ?? []);
+  const proposalsInOrder = payload?.proposals ?? [];
   const summary = payload?.summary;
   usePendingActionRefresh(Boolean(pendingProposalAction));
 
@@ -853,7 +881,11 @@ function ProposalPanel({
     }
   }
 
-  async function proposalAction(proposal: ProposalRecord, action: ProposalAction) {
+  async function proposalAction(
+    proposal: ProposalRecord,
+    action: ProposalAction,
+    actionPayload: Record<string, unknown> = {},
+  ) {
     setError(null);
     const feedback = feedbackById[proposal.proposal_id] ?? "";
     const feedbackTrimmed = feedback.trim();
@@ -863,13 +895,14 @@ function ProposalPanel({
       observedRevision: proposalRevision(proposal),
     });
     try {
+      const payload =
+        action === "revise-plan" || (action === "retry-plan" && feedbackTrimmed)
+          ? { feedback: feedbackTrimmed }
+          : actionPayload;
       await actionMutation.mutateAsync({
         proposalId: proposal.proposal_id,
         action,
-        payload:
-          action === "revise-plan" || (action === "retry-plan" && feedbackTrimmed)
-            ? { feedback: feedbackTrimmed }
-            : {},
+        payload,
       });
       if (action === "revise-plan" || action === "retry-plan") {
         setFeedbackById((current) => ({ ...current, [proposal.proposal_id]: "" }));
@@ -925,11 +958,13 @@ function ProposalPanel({
       </div>
       {error ? <div className="error">{error}</div> : null}
       <div className="taskList">
-        {proposalsNewestFirst.map((proposal) => (
+        {proposalsInOrder.map((proposal) => (
           <article key={proposal.proposal_id} className="taskItem">
             {(() => {
               const proposalActionPending = pendingProposalAction?.entityId === proposal.proposal_id;
               const pendingAction = proposalActionPending ? pendingProposalAction?.action : null;
+              const moveUpTarget = findAdjacentMovableProposal(proposalsInOrder, proposal, "up");
+              const moveDownTarget = findAdjacentMovableProposal(proposalsInOrder, proposal, "down");
               return (
                 <>
             <button
@@ -1004,6 +1039,34 @@ function ProposalPanel({
                   disabled={proposalActionPending}
                 >
                   {pendingAction === "retry-plan" ? "处理中..." : "重试生成计划"}
+                </button>
+              </div>
+            ) : null}
+            {moveUpTarget || moveDownTarget ? (
+              <div className="proposalActions">
+                <button
+                  type="button"
+                  onClick={() =>
+                    moveUpTarget &&
+                    proposalAction(proposal, "move-before", {
+                      target_proposal_id: moveUpTarget.proposal_id,
+                    })
+                  }
+                  disabled={proposalActionPending || !moveUpTarget}
+                >
+                  {pendingAction === "move-before" ? "处理中..." : "同 lane 上移"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    moveDownTarget &&
+                    proposalAction(proposal, "move-after", {
+                      target_proposal_id: moveDownTarget.proposal_id,
+                    })
+                  }
+                  disabled={proposalActionPending || !moveDownTarget}
+                >
+                  {pendingAction === "move-after" ? "处理中..." : "同 lane 下移"}
                 </button>
               </div>
             ) : null}
@@ -1148,7 +1211,11 @@ function QueuePanel({
     }
   }, [queueTasks, pendingTaskAction]);
 
-  async function runTaskAction(task: TaskSummary, action: AllowedTaskAction) {
+  async function runTaskAction(
+    task: TaskSummary,
+    action: AllowedTaskAction,
+    actionPayload: Record<string, unknown> = {},
+  ) {
     setTaskError(null);
     setPendingTaskAction({
       entityId: task.task_id,
@@ -1156,7 +1223,11 @@ function QueuePanel({
       observedRevision: taskRevision(task),
     });
     try {
-      const result = await taskMutation.mutateAsync({ taskId: task.task_id, action });
+      const result = await taskMutation.mutateAsync({
+        taskId: task.task_id,
+        action,
+        payload: actionPayload,
+      });
       const latest = result.state?.queue.tasks.find((item) => item.task_id === task.task_id);
       const runId = latest ? pickTaskRun(latest) : pickTaskRun(task);
       if (runId) onSelectRun(runId);
@@ -1202,6 +1273,8 @@ function QueuePanel({
           const selected = Boolean(taskRunId && taskRunId === selectedRunId);
           const taskActionPending = pendingTaskAction?.entityId === task.task_id;
           const pendingAction = taskActionPending ? pendingTaskAction?.action : null;
+          const moveUpTarget = findAdjacentMovableTask(queueTasks, task, "up");
+          const moveDownTarget = findAdjacentMovableTask(queueTasks, task, "down");
           const failureReason =
             task.failure_summary ??
             task.last_error_event?.summary ??
@@ -1265,6 +1338,32 @@ function QueuePanel({
                       disabled={taskActionPending}
                     >
                       {pendingAction === "mark-handled-skipped" ? "标记中..." : "标记为已处理并跳过"}
+                    </button>
+                  ) : null}
+                  {moveUpTarget ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        runTaskAction(task, "move-before", {
+                          target_task_id: moveUpTarget.task_id,
+                        })
+                      }
+                      disabled={taskActionPending}
+                    >
+                      {pendingAction === "move-before" ? "处理中..." : "同 lane 上移"}
+                    </button>
+                  ) : null}
+                  {moveDownTarget ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        runTaskAction(task, "move-after", {
+                          target_task_id: moveDownTarget.task_id,
+                        })
+                      }
+                      disabled={taskActionPending}
+                    >
+                      {pendingAction === "move-after" ? "处理中..." : "同 lane 下移"}
                     </button>
                   ) : null}
                 </div>

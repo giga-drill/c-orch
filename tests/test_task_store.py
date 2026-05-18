@@ -104,6 +104,31 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(loaded.tasks[0].active_run_id, "run-001")
             self.assertEqual(loaded.tasks[0].run_ids, ["run-001", "run-002"])
 
+    def test_reorder_task_persists_array_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "queue.json"
+            store = TaskStore(queue_path)
+            queue = store.import_tasks(
+                [
+                    {"task_id": "task-001", "title": "Task 1", "prompt": "Do 1"},
+                    {"task_id": "task-002", "title": "Task 2", "prompt": "Do 2"},
+                    {"task_id": "task-003", "title": "Task 3", "prompt": "Do 3"},
+                ]
+            )
+            store.reorder_task(
+                queue,
+                task_id="task-003",
+                target_task_id="task-001",
+                position="before",
+            )
+            store.save(queue)
+
+            loaded = store.load()
+            self.assertEqual(
+                [task.task_id for task in loaded.tasks],
+                ["task-003", "task-001", "task-002"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

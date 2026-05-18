@@ -43,7 +43,10 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
 
             self.assertEqual(payload["summary"]["waiting_workspace_clean"], 1)
             self.assertEqual(payload["proposals"][0]["waiting_for"], "workspace_clean")
-            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
+            self.assertEqual(
+                payload["proposals"][0]["allowed_actions"],
+                ["move-before", "move-after", "retry-plan"],
+            )
             self.assertIn("src/main.py", payload["proposals"][0]["blocker"]["status_output"])
 
     def test_waiting_proposal_input_payload_exposes_preflight_reason_and_suggestions(self) -> None:
@@ -68,7 +71,10 @@ class DashboardPayloadBoundaryTests(unittest.TestCase):
 
             self.assertEqual(payload["summary"]["waiting_proposal_input"], 1)
             self.assertEqual(payload["proposals"][0]["waiting_for"], "proposal_input")
-            self.assertEqual(payload["proposals"][0]["allowed_actions"], ["retry-plan"])
+            self.assertEqual(
+                payload["proposals"][0]["allowed_actions"],
+                ["move-before", "move-after", "retry-plan"],
+            )
             self.assertEqual(payload["proposals"][0]["blocker"]["reason"], "proposal_too_vague")
             self.assertEqual(
                 payload["proposals"][0]["blocker"]["suggestions"],

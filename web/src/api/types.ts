@@ -1,7 +1,17 @@
 export type AllowedRunAction = "retry-review" | "retry-verification";
-export type AllowedTaskAction = "retry-task" | "retry-verification" | "mark-handled-skipped";
+export type AllowedTaskAction =
+  | "retry-task"
+  | "retry-verification"
+  | "mark-handled-skipped"
+  | "move-before"
+  | "move-after";
 export type AllowedQueueAction = "confirm-runtime-restarted";
-export type AllowedProposalAction = "approve-plan" | "revise-plan" | "retry-plan";
+export type AllowedProposalAction =
+  | "approve-plan"
+  | "revise-plan"
+  | "retry-plan"
+  | "move-before"
+  | "move-after";
 
 export interface QueueSummary {
   total_tasks: number;

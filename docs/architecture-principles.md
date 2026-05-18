@@ -34,6 +34,16 @@ entrypoints or the queue scheduler. Dashboard actions should return an explicit
 transition result plus a fresh state snapshot, so the frontend can converge even
 when a proposal is removed from the pool or a runtime restart interrupts an
 in-flight request.
+Queue/proposal reorder follows the same control-plane rule: frontend only sends
+`move-before` / `move-after` intent, and backend action handlers enforce
+movable status, same-workspace lane constraints, and durable file updates.
+Reorder is currently in-collection only (`queue task` -> `queue task`,
+`proposal` -> `proposal`), and successful actions must persist the array order
+in `.c-orch/tasks/queue.json` or `.c-orch/tasks/proposals.json` while updating
+`updated_at`.
+Current UI phase ships same-lane up/down controls first for reliability and
+accessibility; drag-and-drop ordering remains the target interaction and should
+map to the same backend `move-before` / `move-after` actions.
 Run phase timing follows the same boundary: phase segments and transition
 timestamps are backend-authored run-manifest data, and UI timing panels must
 render backend `run.timing` summary directly instead of inferring business phase

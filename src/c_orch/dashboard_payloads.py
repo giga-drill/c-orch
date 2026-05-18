@@ -147,6 +147,7 @@ def build_state_payload(
     runs_dir: Pathish,
     queue_path: Optional[Pathish],
     proposals_path: Optional[Pathish],
+    default_task_cwd: Optional[Pathish] = None,
     runtime_generation: str,
     cost_mode: Optional[Dict[str, Any]] = None,
     dispatch_running: bool = False,
@@ -164,7 +165,11 @@ def build_state_payload(
     normalized_queue_lanes = max(0, int(queue_lane_active_count))
     normalized_proposal_lanes = max(0, int(proposal_lane_active_count))
     runs_payload = build_runs_payload(runs_dir)
-    queue_payload = build_queue_payload(queue_path, runs_dir=runs_dir)
+    queue_payload = build_queue_payload(
+        queue_path,
+        runs_dir=runs_dir,
+        default_task_cwd=default_task_cwd,
+    )
     proposals_payload = build_proposals_payload(proposals_path, runs_dir=runs_dir)
     restart_gate = _restart_gate_payload(
         queue_path=queue_file,
@@ -427,6 +432,7 @@ def build_queue_payload(
     queue_path: Optional[Pathish],
     *,
     runs_dir: Optional[Pathish] = None,
+    default_task_cwd: Optional[Pathish] = None,
 ) -> Dict[str, Any]:
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     if queue_path is None:
@@ -455,7 +461,16 @@ def build_queue_payload(
             run_events_loader=run_store.load_events,
             now_iso=run_store.now_iso,
         )
-    tasks = _annotate_task_lane_waits([_summarize_task(task, run_store=run_store) for task in queue.tasks])
+    tasks = _annotate_task_lane_waits(
+        [
+            _summarize_task(
+                task,
+                run_store=run_store,
+                default_task_cwd=default_task_cwd,
+            )
+            for task in queue.tasks
+        ]
+    )
     return {
         "queue_file": str(queue_file),
         "generated_at": generated_at,
@@ -881,7 +896,12 @@ def _latest_review_attempt_service_tier(review_attempts: List[Dict[str, Any]]) -
     return None
 
 
-def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, Any]:
+def _summarize_task(
+    task: Any,
+    *,
+    run_store: Optional[RunStore],
+    default_task_cwd: Optional[Pathish] = None,
+) -> Dict[str, Any]:
     active_run = None
     active_run_events: List[Dict[str, Any]] = []
     if run_store is not None and task.active_run_id:
@@ -891,6 +911,8 @@ def _summarize_task(task: Any, *, run_store: Optional[RunStore]) -> Dict[str, An
         except OSError:
             active_run = None
     task_cwd = task.cwd or (active_run.cwd if active_run is not None else None)
+    if not task_cwd and default_task_cwd is not None:
+        task_cwd = str(Path(default_task_cwd).expanduser().resolve())
     progress = derive_task_progress(
         task,
         active_run=active_run,
@@ -1040,10 +1062,15 @@ def _allowed_proposal_actions(
     *,
     reason: Optional[str],
 ) -> List[str]:
-    if status == PROPOSAL_WAITING_WORKSPACE_CLEAN:
-        return ["retry-plan"]
-    if status == PROPOSAL_WAITING_INPUT:
-        return ["retry-plan"]
+    if status in {
+        PROPOSAL_WAITING_WORKSPACE,
+        PROPOSAL_WAITING_WORKSPACE_CLEAN,
+        PROPOSAL_WAITING_INPUT,
+    }:
+        actions = ["move-before", "move-after"]
+        if status in {PROPOSAL_WAITING_WORKSPACE_CLEAN, PROPOSAL_WAITING_INPUT}:
+            actions.append("retry-plan")
+        return actions
     if status == PROPOSAL_FAILED and reason in {
         "workspace_resolution_failed",
         "workspace_git_status_failed",
@@ -1141,6 +1168,9 @@ def _allowed_task_actions(
         actions.append("retry-task")
         actions.append("mark-handled-skipped")
         return actions
+    if getattr(task, "status", None) == "PENDING":
+        if active_run is None or active_run.status == RUN_PLAN_APPROVED:
+            return ["move-before", "move-after"]
     return []
 
 

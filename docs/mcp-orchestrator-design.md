@@ -93,6 +93,11 @@ User task
   review evidence 进入现有 review retry/failure policy，不触发 infra fallback。
 - 对 `review.decision=accepted` 的 run，`RunOrchestrator` 现在支持 terminalization reconcile：当 `apply/commit/run_terminal_status` 边界事件缺失时，可在 runtime 启动或 scheduler 唤醒后按幂等边界继续 apply -> commit -> terminal；若无法证明 apply/commit 是否已发生，则写入 manual recovery 事件并在 UI/API 暴露人工恢复等待点。
 - `COrchRuntime` 是 dashboard 后端控制面入口。前端/HTTP handler 只负责展示状态和转发用户意图，action 校验、Codex driver 创建、Orchestrator 调用和 manifest 更新都在 runtime 层完成。dashboard server 会在进程生命周期内保留同一个 runtime，并可复用长活 MCP driver；但 MCP 内存状态只作为 cache，可靠恢复仍以 manifest、event log、Codex thread id 和 `codex exec resume` 为准。
+- queue/proposal 顺序调整也必须走 backend action：前端只发送 `move-before` /
+  `move-after` 意图。当前阶段仅支持集合内重排（queue task 与 queue task、
+  proposal 与 proposal），并且只允许同一 workspace lane 内未开始项重排；
+  失败请求返回 4xx 且不写文件。成功请求会持久化 JSON 数组顺序并更新
+  `updated_at`，供 queue scheduler / proposal dispatcher 按新顺序继续选取下一项。
 - `task_lifecycle.py` 将 Task 作为用户级状态机、Run 作为一次执行 attempt。它负责从 `active_run_id` 收敛 task/queue 状态，并派生 `waiting_for` / `next_action`。例如 active run 进入 `FAILED` 后，task 会收敛为 `FAILED`，queue 为 `FAILED`，等待点为 `retry_task`，而不是继续卡在 `RUNNING`。`queue retry <task_id>` 和 dashboard 的“重新排队”会保留旧 `run_ids`、清空 `active_run_id`、把 task 设回 `PENDING`。当 dashboard backend 拥有执行配置时，队首 `PENDING` task 会自动触发 scheduler 创建新的 run attempt；`queue run` 仍是手动触发同一调度路径的 CLI 入口。
 - `failure_policy.py` 将可恢复异常从业务状态机中拆出。比如 Planner review 的 Codex session 丢失时，run 保持 `WORK_DONE`，review attempt 记录 `FAILED_RETRYABLE`，UI/CLI 再提供重试动作。
 - `McpCodexDriver.reply()` 已验证：fresh MCP server 对旧 session id 调 `codex-reply` 会返回 `Session not found`，但 `codex exec resume <session-id>` 可以恢复同一个磁盘 session。因此 reply 先走 MCP 快路径，遇到 session-not-found 时降级到 CLI resume；CLI resume 也失败后，才交给 failure policy / replacement agent 兜底。

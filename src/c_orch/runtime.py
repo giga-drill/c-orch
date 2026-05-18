@@ -82,6 +82,14 @@ WORKSPACE_DIRTY_MESSAGE = "目标工作区存在未提交改动。建议先提�
 WORKSPACE_DIRTY_SUGGESTED_ACTION = "请先处理目标仓库改动，然后点击“重试生成计划”。"
 PROPOSAL_INPUT_SUGGESTED_ACTION = "请补充提案信息后重试生成计划。"
 
+_REORDERABLE_PROPOSAL_STATUSES = frozenset(
+    {
+        PROPOSAL_WAITING_WORKSPACE,
+        PROPOSAL_WAITING_WORKSPACE_CLEAN,
+        PROPOSAL_WAITING_INPUT,
+    }
+)
+
 
 class _UnusedCodexDriver:
     def start_session(self, **_: Any) -> Any:
@@ -160,7 +168,13 @@ class COrchRuntime:
         return dashboard_payloads.build_runs_payload(self.runs_dir)
 
     def build_queue_payload(self) -> Dict[str, Any]:
-        return dashboard_payloads.build_queue_payload(self.queue_path, runs_dir=self.runs_dir)
+        return dashboard_payloads.build_queue_payload(
+            self.queue_path,
+            runs_dir=self.runs_dir,
+            default_task_cwd=(
+                self._scheduler_config.cwd if self._scheduler_config is not None else None
+            ),
+        )
 
     def build_proposals_payload(self) -> Dict[str, Any]:
         return dashboard_payloads.build_proposals_payload(self.proposals_path, runs_dir=self.runs_dir)
@@ -181,6 +195,9 @@ class COrchRuntime:
             runs_dir=self.runs_dir,
             queue_path=self.queue_path,
             proposals_path=self.proposals_path,
+            default_task_cwd=(
+                self._scheduler_config.cwd if self._scheduler_config is not None else None
+            ),
             runtime_generation=self._runtime_generation,
             cost_mode=self._build_cost_mode_payload(),
             dispatch_running=queue_dispatch_running or proposal_dispatch_running,
@@ -256,7 +273,12 @@ class COrchRuntime:
                 self.dispatch_queue_async()
             return self._attach_state(result, selected_run_id=run_id)
 
-    def task_action(self, task_id: str, action: Any) -> RunActionResponse:
+    def task_action(
+        self,
+        task_id: str,
+        action: Any,
+        action_payload: Optional[Dict[str, Any]] = None,
+    ) -> RunActionResponse:
         with self._action_lock, self._queue_lock:
             if self.queue_path is None:
                 return HTTPStatus.BAD_REQUEST, {"error": "missing queue file"}
@@ -265,6 +287,10 @@ class COrchRuntime:
                 task_id,
                 action,
                 runs_dir=self.runs_dir,
+                action_payload=action_payload,
+                default_task_cwd=(
+                    self._scheduler_config.cwd if self._scheduler_config is not None else None
+                ),
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
@@ -311,6 +337,7 @@ class COrchRuntime:
         proposal_id: str,
         action: Any,
         feedback: Any = None,
+        action_payload: Optional[Dict[str, Any]] = None,
     ) -> RunActionResponse:
         with self._action_lock, self._proposal_lock, self._queue_lock:
             if self.proposals_path is None:
@@ -329,10 +356,11 @@ class COrchRuntime:
                 driver_factory=self._driver_context,
                 runtime_generation=self._runtime_generation,
                 process_hint=f"runtime:{os.getpid()}",
+                action_payload=action_payload,
             )
             if result is not None and int(result[0]) < 400:
                 self.dispatch_queue_async()
-                if action == "retry-plan":
+                if action in {"retry-plan", "move-before", "move-after"}:
                     self.dispatch_proposals_async()
             selected_run_id = _selected_run_from_payload(result[1]) if result is not None else None
             return self._attach_state(result, selected_run_id=selected_run_id)
@@ -1581,8 +1609,10 @@ def task_action(
     action: Any,
     *,
     runs_dir: Optional[Pathish] = None,
+    action_payload: Optional[Dict[str, Any]] = None,
+    default_task_cwd: Optional[Pathish] = None,
 ) -> RunActionResponse:
-    if action not in {"retry-task", "retry-verification", "mark-handled-skipped"}:
+    if action not in {"retry-task", "retry-verification", "mark-handled-skipped", "move-before", "move-after"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
     queue_file = Path(queue_path).expanduser().resolve()
     store = TaskStore(queue_file)
@@ -1598,6 +1628,68 @@ def task_action(
             run_events_loader=run_store.load_events,
             now_iso=run_store.now_iso,
         )
+    if action in {"move-before", "move-after"}:
+        if action_payload is None:
+            action_payload = {}
+        target_task_id_raw = action_payload.get("target_task_id")
+        if not isinstance(target_task_id_raw, str) or not target_task_id_raw.strip():
+            return HTTPStatus.BAD_REQUEST, {"error": "target_task_id is required"}
+        target_task_id = target_task_id_raw.strip()
+        try:
+            source_task = _find_task_record(queue, task_id)
+            target_task = _find_task_record(queue, target_task_id)
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        if source_task.task_id == target_task.task_id:
+            return HTTPStatus.CONFLICT, {"error": "source and target task_id must differ"}
+        if runs_dir is not None:
+            run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        else:
+            run_store = None
+        source_reject_reason = _task_reorder_reject_reason(source_task, run_store=run_store)
+        if source_reject_reason is not None:
+            return HTTPStatus.CONFLICT, {
+                "error": f"source task is not movable: {source_reject_reason}",
+                "status": source_task.status,
+            }
+        target_reject_reason = _task_reorder_reject_reason(target_task, run_store=run_store)
+        if target_reject_reason is not None:
+            return HTTPStatus.CONFLICT, {
+                "error": f"target task is not movable: {target_reject_reason}",
+                "status": target_task.status,
+            }
+        source_lane = _task_reorder_lane(
+            source_task,
+            run_store=run_store,
+            default_task_cwd=default_task_cwd,
+        )
+        target_lane = _task_reorder_lane(
+            target_task,
+            run_store=run_store,
+            default_task_cwd=default_task_cwd,
+        )
+        if source_lane is None or target_lane is None:
+            return HTTPStatus.CONFLICT, {"error": "task workspace lane is not resolvable for reorder"}
+        if source_lane != target_lane:
+            return HTTPStatus.CONFLICT, {"error": "task reorder only supports same workspace lane"}
+        try:
+            store.reorder_task(
+                queue,
+                task_id=source_task.task_id,
+                target_task_id=target_task.task_id,
+                position="before" if action == "move-before" else "after",
+            )
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        store.save(queue)
+        payload = dashboard_payloads.build_queue_payload(queue_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "task_reordered",
+            "task_id": source_task.task_id,
+            "target_task_id": target_task.task_id,
+            "action": action,
+        }
+        return HTTPStatus.OK, payload
     if action == "retry-verification":
         if runs_dir is None:
             return HTTPStatus.BAD_REQUEST, {"error": "missing runs_dir"}
@@ -1912,8 +2004,9 @@ def proposal_action(
     driver_factory: DriverFactory,
     runtime_generation: Optional[str] = None,
     process_hint: Optional[str] = None,
+    action_payload: Optional[Dict[str, Any]] = None,
 ) -> RunActionResponse:
-    if action not in {"approve-plan", "revise-plan", "retry-plan"}:
+    if action not in {"approve-plan", "revise-plan", "retry-plan", "move-before", "move-after"}:
         return HTTPStatus.BAD_REQUEST, {"error": "unsupported action"}
     proposals_file = Path(proposals_path).expanduser().resolve()
     proposal_store = ProposalStore(proposals_file)
@@ -1922,6 +2015,56 @@ def proposal_action(
         proposal = proposal_store.find(pool, proposal_id)
     except (OSError, ValueError) as exc:
         return HTTPStatus.NOT_FOUND, {"error": str(exc)}
+    if action in {"move-before", "move-after"}:
+        if action_payload is None:
+            action_payload = {}
+        target_proposal_id_raw = action_payload.get("target_proposal_id")
+        if not isinstance(target_proposal_id_raw, str) or not target_proposal_id_raw.strip():
+            return HTTPStatus.BAD_REQUEST, {"error": "target_proposal_id is required"}
+        target_proposal_id = target_proposal_id_raw.strip()
+        try:
+            target_proposal = proposal_store.find(pool, target_proposal_id)
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        if proposal.proposal_id == target_proposal.proposal_id:
+            return HTTPStatus.CONFLICT, {"error": "source and target proposal_id must differ"}
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        source_reject_reason = _proposal_reorder_reject_reason(proposal)
+        if source_reject_reason is not None:
+            return HTTPStatus.CONFLICT, {
+                "error": f"source proposal is not movable: {source_reject_reason}",
+                "status": proposal.status,
+            }
+        target_reject_reason = _proposal_reorder_reject_reason(target_proposal)
+        if target_reject_reason is not None:
+            return HTTPStatus.CONFLICT, {
+                "error": f"target proposal is not movable: {target_reject_reason}",
+                "status": target_proposal.status,
+            }
+        source_lane = _proposal_reorder_lane(proposal, run_store=run_store)
+        target_lane = _proposal_reorder_lane(target_proposal, run_store=run_store)
+        if source_lane is None or target_lane is None:
+            return HTTPStatus.CONFLICT, {"error": "proposal workspace lane is not resolvable for reorder"}
+        if source_lane != target_lane:
+            return HTTPStatus.CONFLICT, {"error": "proposal reorder only supports same workspace lane"}
+        try:
+            proposal_store.reorder_proposal(
+                pool,
+                proposal_id=proposal.proposal_id,
+                target_proposal_id=target_proposal.proposal_id,
+                position="before" if action == "move-before" else "after",
+            )
+        except ValueError as exc:
+            return HTTPStatus.CONFLICT, {"error": str(exc)}
+        proposal_store.save(pool)
+        payload = dashboard_payloads.build_proposals_payload(proposals_file, runs_dir=runs_dir)
+        payload["transition"] = {
+            "type": "proposal_reordered",
+            "proposal_id": proposal.proposal_id,
+            "target_proposal_id": target_proposal.proposal_id,
+            "action": action,
+        }
+        return HTTPStatus.OK, payload
     if action == "retry-plan":
         if config is None:
             return HTTPStatus.BAD_REQUEST, {"error": "missing execution config"}
@@ -2358,6 +2501,73 @@ def _append_proposal_feedback(prompt: str, feedback: str) -> str:
     if not feedback_text:
         return prompt
     return f"{prompt.rstrip()}\n\n补充信息：\n{feedback_text}"
+
+
+def _task_reorder_reject_reason(
+    task: TaskRecord,
+    *,
+    run_store: Optional[RunStore],
+) -> Optional[str]:
+    if task.status != TASK_PENDING:
+        return f"status must be {TASK_PENDING}, current status is {task.status}"
+    if not task.active_run_id:
+        return None
+    if run_store is None:
+        return "missing runs_dir for active run validation"
+    try:
+        active_run = run_store.load(task.active_run_id)
+    except OSError:
+        return f"active run not found: {task.active_run_id}"
+    if active_run.status != RUN_PLAN_APPROVED:
+        return (
+            "active run must stay in PLAN_APPROVED before Worker starts, "
+            f"current status is {active_run.status}"
+        )
+    return None
+
+
+def _task_reorder_lane(
+    task: TaskRecord,
+    *,
+    run_store: Optional[RunStore],
+    default_task_cwd: Optional[Pathish] = None,
+) -> Optional[str]:
+    task_cwd = task.cwd
+    if not task_cwd and task.active_run_id and run_store is not None:
+        try:
+            task_cwd = run_store.load(task.active_run_id).cwd
+        except OSError:
+            task_cwd = None
+    if not task_cwd and default_task_cwd is not None:
+        task_cwd = str(Path(default_task_cwd).expanduser().resolve())
+    if not task_cwd:
+        return None
+    try:
+        return str(canonical_git_root(task_cwd))
+    except WorkspaceResolutionError:
+        return None
+
+
+def _proposal_reorder_reject_reason(proposal: ProposalRecord) -> Optional[str]:
+    if proposal.status not in _REORDERABLE_PROPOSAL_STATUSES:
+        allowed = ", ".join(sorted(_REORDERABLE_PROPOSAL_STATUSES))
+        return f"status must be one of {allowed}, current status is {proposal.status}"
+    return None
+
+
+def _proposal_reorder_lane(proposal: ProposalRecord, *, run_store: RunStore) -> Optional[str]:
+    proposal_cwd = proposal.cwd
+    if not proposal_cwd and proposal.run_id:
+        try:
+            proposal_cwd = run_store.load(proposal.run_id).cwd
+        except OSError:
+            proposal_cwd = None
+    if not proposal_cwd:
+        return None
+    try:
+        return str(canonical_git_root(proposal_cwd))
+    except WorkspaceResolutionError:
+        return None
 
 
 

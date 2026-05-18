@@ -123,8 +123,15 @@ export function useRunActionMutation() {
 export function useTaskActionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ taskId, action }: { taskId: string; action: AllowedTaskAction }) =>
-      postTaskAction(taskId, action),
+    mutationFn: ({
+      taskId,
+      action,
+      payload,
+    }: {
+      taskId: string;
+      action: AllowedTaskAction;
+      payload?: Record<string, unknown>;
+    }) => postTaskAction(taskId, action, payload),
     onSuccess: (payload) => {
       updateStateFromAction(queryClient, payload);
       refreshDashboardQueries(queryClient, selectedRunFromAction(payload));

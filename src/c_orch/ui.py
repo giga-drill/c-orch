@@ -182,10 +182,15 @@ def make_dashboard_handler(runtime: COrchRuntime, *, api_only: bool = False) -> 
                 result = runtime.run_action(run_id, action, data.get("feedback"))
             elif path.startswith(proposal_prefix):
                 proposal_id = unquote(path[len(proposal_prefix):-len(suffix)])
-                result = runtime.proposal_action(proposal_id, action, data.get("feedback"))
+                result = runtime.proposal_action(
+                    proposal_id,
+                    action,
+                    data.get("feedback"),
+                    action_payload=data,
+                )
             else:
                 task_id = unquote(path[len(task_prefix):-len(suffix)])
-                result = runtime.task_action(task_id, action)
+                result = runtime.task_action(task_id, action, action_payload=data)
             if result is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
