@@ -157,6 +157,21 @@ the source of truth. Run manifests, events, queue/proposal records, evidence,
 and phase checkpoints must be persisted before c-orch treats a phase as
 complete.
 
+Current recovery-policy audit contract (phase 1):
+
+- recovery decisions are persisted as `recovery_decision_recorded` events
+- each decision records `phase`, `category`, `reason`, `recovery_action`,
+  `source`, `attempt`, `retryable`, `automatic`, and `requires_human`
+- normal run/task business states remain unchanged; recovery metadata does not
+  add new business states such as `retryable` or `blocked` into Planner review
+  outcomes
+
+Not implemented in phase 1:
+
+- runner lease ownership and heartbeat reconciliation
+- external runner subprocess execution handoff
+- automatic rebase/replay for same-repo parallel apply conflicts
+
 Task state is the user-level lifecycle; run state is one execution attempt.
 One task can have multiple run attempts over time. `active_run_id` points to the
 current attempt and `run_ids` preserves prior attempts for audit.

@@ -9,9 +9,18 @@ from .codex_review import CodexReviewReport, run_codex_uncommitted_review
 from .contracts import PlannerPlan, ReviewDecision, WorkerResult
 from .drivers import CodexDriver, SessionResult
 from .failure_policy import (
+    FailurePolicyDecision,
+    SOURCE_ORCHESTRATOR,
+    classify_apply_failure,
+    classify_code_review_findings,
+    classify_git_commit_failure,
+    classify_max_attempts_exceeded,
     has_retryable_review_failure,
     has_retryable_verification_failure,
-    should_start_replacement_agent,
+    classify_operation_failure,
+    classify_retryable_review_failure,
+    classify_session_recovery_result,
+    classify_verification_gate_failure,
 )
 from .phase_timing import record_run_status_transition
 from .prompts import (
@@ -253,7 +262,22 @@ class RunOrchestrator:
                 )
 
             if decision.decision == "revision_requested":
+                self._record_recovery_decision(
+                    manifest,
+                    classify_code_review_findings(
+                        reason=decision.reason,
+                        source=SOURCE_ORCHESTRATOR,
+                        attempt=worker.attempt,
+                    ),
+                )
                 if attempt >= self.config.max_attempts:
+                    self._record_recovery_decision(
+                        manifest,
+                        classify_max_attempts_exceeded(
+                            source=SOURCE_ORCHESTRATOR,
+                            attempt=worker.attempt,
+                        ),
+                    )
                     self._transition_status(manifest, RUN_FAILED, reason="max_attempts_reached")
                     manifest.planner.status = RUN_FAILED
                     worker.status = RUN_FAILED
@@ -568,7 +592,14 @@ class RunOrchestrator:
                     service_tier=worker.service_tier,
                 )
             except Exception as exc:
-                if not should_start_replacement_agent(exc):
+                decision = classify_operation_failure(
+                    exc,
+                    phase="worker_reply",
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                )
+                self._record_recovery_decision(manifest, decision)
+                if decision.recovery_action != "start_replacement_agent":
                     raise
                 self._record_event(
                     manifest,
@@ -752,6 +783,7 @@ class RunOrchestrator:
                 verification=verification,
                 code_review=code_review,
                 review_workspace=workspace_path,
+                worker_attempt=worker.attempt,
             )
         except Exception as exc:
             self._mark_retryable_review_failure(
@@ -803,6 +835,7 @@ class RunOrchestrator:
     ) -> None:
         attempt.status = REVIEW_ATTEMPT_FAILED_RETRYABLE
         attempt.completed_at = self.store.now_iso()
+        attempt.reason = reason
         attempt.error = error
         attempt.evidence_files = list(evidence_files)
         self._transition_status(
@@ -828,6 +861,13 @@ class RunOrchestrator:
             worker_id=worker.id,
             error=error,
         )
+        decision = classify_retryable_review_failure(
+            manifest,
+            source=SOURCE_ORCHESTRATOR,
+            attempt=worker.attempt,
+        )
+        if decision is not None:
+            self._record_recovery_decision(manifest, decision)
 
     def _request_review_decision(
         self,
@@ -839,6 +879,7 @@ class RunOrchestrator:
         verification: VerificationReport,
         code_review: CodexReviewReport,
         review_workspace: str,
+        worker_attempt: Optional[int] = None,
     ) -> ReviewDecision:
         if not manifest.planner.thread_id:
             raise OrchestratorError("cannot review without planner thread_id")
@@ -862,10 +903,22 @@ class RunOrchestrator:
                 reasoning_effort=manifest.planner.reasoning_effort,
                 service_tier=manifest.planner.service_tier,
             )
-            self._record_review_recovery_event(manifest, result, old_thread_id=previous_thread_id)
+            self._record_review_recovery_event(
+                manifest,
+                result,
+                old_thread_id=previous_thread_id,
+                attempt=worker_attempt,
+            )
             return ReviewDecision.parse(result.content)
         except Exception as exc:
-            if not should_start_replacement_agent(exc):
+            decision = classify_operation_failure(
+                exc,
+                phase="planner_review_reply",
+                source=SOURCE_ORCHESTRATOR,
+                attempt=worker_attempt,
+            )
+            self._record_recovery_decision(manifest, decision)
+            if decision.recovery_action != "start_replacement_agent":
                 raise
             self._record_event(
                 manifest,
@@ -932,6 +985,7 @@ class RunOrchestrator:
         result: SessionResult,
         *,
         old_thread_id: str,
+        attempt: Optional[int] = None,
     ) -> None:
         raw = result.raw
         if raw.get("resumedAfterMcpTimeout") is True:
@@ -951,6 +1005,13 @@ class RunOrchestrator:
             thread_id=result.thread_id,
             recovered_from_session_log=raw.get("recoveredFromSessionLog"),
         )
+        decision = classify_session_recovery_result(
+            result,
+            source=SOURCE_ORCHESTRATOR,
+            attempt=attempt,
+        )
+        if decision is not None:
+            self._record_recovery_decision(manifest, decision)
 
     def _continue_after_revision_requested(
         self,
@@ -959,9 +1020,24 @@ class RunOrchestrator:
         plan: PlannerPlan,
         decision: ReviewDecision,
     ) -> RunManifest:
+        self._record_recovery_decision(
+            manifest,
+            classify_code_review_findings(
+                reason=decision.reason,
+                source=SOURCE_ORCHESTRATOR,
+                attempt=worker.attempt,
+            ),
+        )
         self._enter_revision_requested(manifest, worker)
         self._save(manifest)
         if worker.attempt >= self.config.max_attempts:
+            self._record_recovery_decision(
+                manifest,
+                classify_max_attempts_exceeded(
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                ),
+            )
             self._transition_status(manifest, RUN_FAILED, reason="max_attempts_reached")
             manifest.planner.status = RUN_FAILED
             worker.status = RUN_FAILED
@@ -1045,6 +1121,18 @@ class RunOrchestrator:
         **fields: Any,
     ) -> None:
         self.store.append_event(manifest.run_id, event_type, message, **fields)
+
+    def _record_recovery_decision(
+        self,
+        manifest: RunManifest,
+        decision: FailurePolicyDecision,
+    ) -> None:
+        self._record_event(
+            manifest,
+            "recovery_decision_recorded",
+            "Failure recovery decision recorded",
+            **decision.to_event_fields(),
+        )
 
     def _record_terminal_status(
         self,
@@ -1137,6 +1225,14 @@ class RunOrchestrator:
         verification: VerificationReport,
     ) -> RunManifest:
         if _verification_has_failures(verification):
+            self._record_recovery_decision(
+                manifest,
+                classify_verification_gate_failure(
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                    error=verification.summary,
+                ),
+            )
             self._transition_status(manifest, RUN_FAILED, reason="verification_failed")
             manifest.planner.status = RUN_FAILED
             worker.status = RUN_FAILED
@@ -1158,6 +1254,14 @@ class RunOrchestrator:
             evidence=evidence,
         )
         if not apply_report.applied:
+            self._record_recovery_decision(
+                manifest,
+                classify_apply_failure(
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                    error=apply_report.summary,
+                ),
+            )
             self._transition_status(manifest, RUN_FAILED, reason="apply_failed")
             manifest.planner.status = RUN_FAILED
             worker.status = RUN_FAILED
@@ -1173,6 +1277,15 @@ class RunOrchestrator:
             pre_apply_staged_paths=pre_apply_staged_paths,
         )
         if commit_report.failed:
+            self._record_recovery_decision(
+                manifest,
+                classify_git_commit_failure(
+                    failure_reason=commit_report.failure_reason,
+                    summary=commit_report.summary,
+                    source=SOURCE_ORCHESTRATOR,
+                    attempt=worker.attempt,
+                ),
+            )
             self._transition_status(manifest, RUN_FAILED, reason="git_commit_failed")
             manifest.planner.status = RUN_FAILED
             worker.status = RUN_FAILED

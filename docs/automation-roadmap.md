@@ -235,6 +235,21 @@ or safe to retry.
 - Persist recovery attempts and decisions as events.
 - Keep dashboard actions as manual overrides, not the primary recovery path.
 
+Status (Phase 1 delivered):
+
+- `failure_policy.py` is now the centralized classifier for
+  `transient_infrastructure`, `mcp_session_lost_or_timeout`,
+  `verification_failure`, `code_review_findings`, `apply_conflict`,
+  `git_commit_failure`, and `max_attempts_exceeded`.
+- Orchestrator, Scheduler, and Runtime now persist
+  `recovery_decision_recorded` events with normalized decision fields
+  (`phase/category/reason/recovery_action/source/attempt/retryable/automatic/requires_human`)
+  as an audit layer beside existing business events.
+- Queue scheduler auto retry review is now policy-gated; dashboard retry actions
+  remain manual override entrypoints validated by backend policy.
+- Still out of scope in this phase: runner lease ownership metadata, external
+  runner subprocess handoff, and same-repo parallel conflict auto-rebase.
+
 ## 3. Self-Bootstrap Restart Protocol
 
 ### Goal

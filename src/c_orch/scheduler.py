@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from .drivers import CodexDriver
-from .failure_policy import has_retryable_review_failure
+from .failure_policy import (
+    SOURCE_QUEUE_SCHEDULER,
+    classify_retryable_review_failure,
+    has_retryable_review_failure,
+)
 from .orchestrator import OrchestratorConfig, RunOrchestrator
 from .run_store import RunManifest, RunStore
 from .states import RUN_APPROVED, RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
@@ -163,7 +167,25 @@ class TaskScheduler:
                         queue.status = QUEUE_RUNNING
                         self.task_store.save(queue)
                         return queue
+                    decision = classify_retryable_review_failure(
+                        active,
+                        source=SOURCE_QUEUE_SCHEDULER,
+                    )
+                    if (
+                        decision is None
+                        or decision.recovery_action != "retry_review"
+                        or not decision.automatic
+                    ):
+                        queue.status = QUEUE_RUNNING
+                        self.task_store.save(queue)
+                        return queue
                     attempted_retry_review_run_ids.add(active.run_id)
+                    self.run_store.append_event(
+                        active.run_id,
+                        "recovery_decision_recorded",
+                        "Failure recovery decision recorded",
+                        **decision.to_event_fields(),
+                    )
                     self.run_store.append_event(
                         active.run_id,
                         "queue_auto_retry_review_started",

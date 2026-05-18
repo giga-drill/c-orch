@@ -12,10 +12,16 @@ from typing import Dict, List, Optional
 from unittest import mock
 
 from c_orch.proposal_store import PROPOSAL_QUEUED, ProposalPool, ProposalRecord, ProposalStore
-from c_orch.run_store import PlanRecord, RunStore
+from c_orch.run_store import PlanRecord, ReviewAttemptRecord, ReviewRecord, RunStore
 from c_orch.runtime import COrchRuntime, prune_queued_proposals
 from c_orch.scheduler import SchedulerConfig
-from c_orch.states import RUN_FAILED, RUN_PLAN_APPROVED, RUN_PLAN_REVIEW_REQUIRED
+from c_orch.states import (
+    REVIEW_ATTEMPT_FAILED_RETRYABLE,
+    RUN_FAILED,
+    RUN_PLAN_APPROVED,
+    RUN_PLAN_REVIEW_REQUIRED,
+    RUN_WORK_DONE,
+)
 from c_orch.task_store import TaskStore
 
 
@@ -67,6 +73,27 @@ class _BlockingQueueOrchestrator:
 
     def retry_review(self, manifest):  # type: ignore[no-untyped-def]
         return self.run(manifest)
+
+
+class _RetryReviewQueueOrchestrator:
+    def __init__(self, run_store: RunStore) -> None:
+        self.run_store = run_store
+        self.run_calls = 0
+        self.retry_review_calls = 0
+        self.retry_run_ids: List[str] = []
+
+    def run(self, manifest):  # type: ignore[no-untyped-def]
+        self.run_calls += 1
+        manifest.status = "APPROVED"
+        self.run_store.save(manifest)
+        return manifest
+
+    def retry_review(self, manifest):  # type: ignore[no-untyped-def]
+        self.retry_review_calls += 1
+        self.retry_run_ids.append(manifest.run_id)
+        manifest.status = "APPROVED"
+        self.run_store.save(manifest)
+        return manifest
 
 
 class _FakeProposalPlanner:
@@ -192,6 +219,59 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(loaded.tasks[0].reason)
             self.assertEqual(loaded.tasks[0].run_ids, fake.run_ids)
             self.assertEqual(len(fake.run_ids), 1)
+
+    def test_queue_lane_retry_review_is_policy_gated_and_records_recovery_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            task_store = TaskStore(root / "queue.json")
+            queue = task_store.import_tasks(
+                [{"task_id": "task-001", "title": "Task 1", "prompt": "Do task 1", "cwd": str(repo)}]
+            )
+            run_store = RunStore(root / "runs")
+            manifest = run_store.create_run(
+                cwd=repo,
+                user_task="Do task 1",
+                planner_model="gpt-5.5",
+                worker_model="gpt-5.3-codex-spark",
+                codex_binary_path="/bin/codex",
+            )
+            _mark_retryable_review_failure(manifest)
+            run_store.save(manifest)
+            task_store.update_task(
+                queue,
+                "task-001",
+                status="WAITING",
+                active_run_id=manifest.run_id,
+                run_ids=[manifest.run_id],
+                reason="planner_review_retry",
+            )
+            task_store.save(queue)
+            fake = _RetryReviewQueueOrchestrator(run_store)
+            runtime = COrchRuntime(
+                runs_dir=root / "runs",
+                queue_path=root / "queue.json",
+                scheduler_config=replace(_scheduler_config(root), cwd=repo),
+                driver_factory=_fake_driver_factory,
+                worktree_factory=_fake_worktree_factory,
+                orchestrator_factory=lambda: fake,
+            )
+
+            self.assertTrue(runtime.dispatch_queue_async())
+            self.assertTrue(runtime.wait_for_dispatch(timeout=3))
+
+            self.assertEqual(fake.run_calls, 0)
+            self.assertEqual(fake.retry_review_calls, 1)
+            self.assertEqual(fake.retry_run_ids, [manifest.run_id])
+            events = run_store.load_events(manifest.run_id)
+            recovery_events = [
+                event for event in events if event.get("type") == "recovery_decision_recorded"
+            ]
+            self.assertTrue(recovery_events)
+            self.assertEqual(recovery_events[-1]["source"], "queue_scheduler")
+            self.assertEqual(recovery_events[-1]["recovery_action"], "retry_review")
+            self.assertTrue(recovery_events[-1]["automatic"])
 
     def test_queue_dispatch_runs_different_git_workspaces_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -694,6 +774,23 @@ def _fake_worktree_factory(*, repo_path: Path, worktrees_dir: Path, run_id: str,
     worktree = worktrees_dir / run_id / worker_id
     worktree.mkdir(parents=True, exist_ok=True)
     return worktree
+
+
+def _mark_retryable_review_failure(manifest) -> None:  # type: ignore[no-untyped-def]
+    manifest.status = RUN_WORK_DONE
+    manifest.review = ReviewRecord(evidence_files=["evidence/review.patch"])
+    manifest.review_attempts = [
+        ReviewAttemptRecord(
+            id="review-1",
+            worker_id="worker-1",
+            status=REVIEW_ATTEMPT_FAILED_RETRYABLE,
+            started_at="2026-05-18T00:00:00+00:00",
+            completed_at="2026-05-18T00:01:00+00:00",
+            reason="planner_review_failed",
+            error="Timed out waiting for MCP server output",
+            evidence_files=["evidence/review.patch"],
+        )
+    ]
 
 
 def _init_git_repo(path: Path) -> None:

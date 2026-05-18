@@ -177,6 +177,14 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(fake.retry_review_calls, 1)
             self.assertEqual(fake.retry_run_ids, [manifest.run_id])
             self.assertEqual(loaded_manifest.review.evidence_files, ["evidence/review.patch"])  # type: ignore[union-attr]
+            events = run_store.load_events(manifest.run_id)
+            recovery_events = [
+                event for event in events if event.get("type") == "recovery_decision_recorded"
+            ]
+            self.assertTrue(recovery_events)
+            self.assertEqual(recovery_events[-1]["source"], "queue_scheduler")
+            self.assertEqual(recovery_events[-1]["recovery_action"], "retry_review")
+            self.assertTrue(recovery_events[-1]["automatic"])
 
     def test_active_retryable_review_failure_auto_retries_and_sets_restart_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

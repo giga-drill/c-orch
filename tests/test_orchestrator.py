@@ -1263,6 +1263,7 @@ class OrchestratorTests(unittest.TestCase):
                     "verification_finished",
                     "planner_review_start",
                     "planner_review_completed",
+                    "recovery_decision_recorded",
                     "worker_start",
                     "worker_done",
                     "evidence_collected",
@@ -1413,6 +1414,12 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(len(committer.calls), 0)
             events = store.load_events(manifest.run_id)
             self.assertIn("verification_gate_failed", [event["type"] for event in events])
+            recovery_events = [
+                event for event in events if event.get("type") == "recovery_decision_recorded"
+            ]
+            self.assertTrue(recovery_events)
+            self.assertEqual(recovery_events[-1]["category"], "verification_failure")
+            self.assertEqual(recovery_events[-1]["recovery_action"], "manual_override")
             self.assertEqual(events[-1]["type"], "run_terminal_status")
             self.assertEqual(events[-1]["reason"], "verification_failed")
 

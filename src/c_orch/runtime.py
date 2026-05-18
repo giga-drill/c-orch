@@ -12,8 +12,11 @@ from typing import Any, Callable, ContextManager, Dict, List, Optional, Sequence
 from . import dashboard_payloads
 from .drivers import CodexDriver
 from .failure_policy import (
-    has_retryable_review_failure,
-    has_retryable_verification_failure,
+    SOURCE_DASHBOARD_ACTION,
+    SOURCE_QUEUE_SCHEDULER,
+    classify_retry_task_decision,
+    classify_retry_verification_action,
+    classify_retryable_review_failure,
 )
 from .phase_timing import record_run_status_transition
 from .proposal_store import (
@@ -482,7 +485,15 @@ class COrchRuntime:
                 continue
             active = self._load_task_active_run(task, run_store=run_store)
             if active is not None:
-                if active.status == RUN_PLAN_APPROVED or has_retryable_review_failure(active):
+                retry_review_decision = classify_retryable_review_failure(
+                    active,
+                    source=SOURCE_QUEUE_SCHEDULER,
+                )
+                if active.status == RUN_PLAN_APPROVED or (
+                    retry_review_decision is not None
+                    and retry_review_decision.recovery_action == "retry_review"
+                    and retry_review_decision.automatic
+                ):
                     candidates.append((lane_id, task))
                 continue
             if task.status in {TASK_PENDING, TASK_RUNNING}:
@@ -542,12 +553,21 @@ class COrchRuntime:
         run_store = RunStore(self.runs_dir)
         manifest: Optional[RunManifest] = None
         action = "run"
+        retry_review_decision = None
         with self._queue_lock:
             queue = task_store.load()
             task = _find_task_record(queue, task_id)
             if task.active_run_id:
                 manifest = run_store.load(task.active_run_id)
-                if has_retryable_review_failure(manifest):
+                retry_review_decision = classify_retryable_review_failure(
+                    manifest,
+                    source=SOURCE_QUEUE_SCHEDULER,
+                )
+                if (
+                    retry_review_decision is not None
+                    and retry_review_decision.recovery_action == "retry_review"
+                    and retry_review_decision.automatic
+                ):
                     action = "retry_review"
                 elif manifest.status == RUN_PLAN_APPROVED:
                     action = "run"
@@ -624,6 +644,20 @@ class COrchRuntime:
             with self._fresh_driver_context(self._scheduler_config.codex_binary_path) as driver:
                 orchestrator = self._build_queue_orchestrator(run_store=run_store, driver=driver)
                 if action == "retry_review":
+                    if retry_review_decision is not None:
+                        run_store.append_event(
+                            manifest.run_id,
+                            "recovery_decision_recorded",
+                            "Failure recovery decision recorded",
+                            **retry_review_decision.to_event_fields(),
+                        )
+                    run_store.append_event(
+                        manifest.run_id,
+                        "queue_auto_retry_review_started",
+                        "Queue scheduler started automatic planner review retry",
+                        source=SOURCE_QUEUE_SCHEDULER,
+                        action="retry-review",
+                    )
                     manifest = orchestrator.retry_review(manifest)
                 else:
                     manifest = orchestrator.run(manifest)
@@ -1028,6 +1062,19 @@ def run_action(
     if action == "revise-plan":
         if not isinstance(feedback, str) or not feedback.strip():
             return HTTPStatus.BAD_REQUEST, {"error": "feedback is required for revise-plan"}
+    decision = _policy_decision_for_run_action(
+        manifest,
+        action,
+        events=events,
+        source=SOURCE_DASHBOARD_ACTION,
+    )
+    if decision is not None:
+        store.append_event(
+            run_id,
+            "recovery_decision_recorded",
+            "Failure recovery decision recorded",
+            **decision.to_event_fields(),
+        )
 
     from .orchestrator import OrchestratorConfig, RunOrchestrator
 
@@ -1145,6 +1192,29 @@ def task_action(
             "task_id": task_id,
         }
         return HTTPStatus.OK, payload
+    try:
+        task = _find_task_record(queue, task_id)
+    except ValueError as exc:
+        return HTTPStatus.CONFLICT, {"error": str(exc)}
+    if runs_dir is not None and task.active_run_id:
+        run_store = RunStore(Path(runs_dir).expanduser().resolve())
+        try:
+            active_run = run_store.load(task.active_run_id)
+        except OSError:
+            active_run = None
+        if active_run is not None:
+            decision = classify_retry_task_decision(
+                active_run,
+                run_store.load_events(active_run.run_id),
+                source=SOURCE_DASHBOARD_ACTION,
+            )
+            if decision is not None:
+                run_store.append_event(
+                    active_run.run_id,
+                    "recovery_decision_recorded",
+                    "Failure recovery decision recorded",
+                    **decision.to_event_fields(),
+                )
     try:
         mark_task_for_retry(queue, task_id=task_id)
     except ValueError as exc:
@@ -1680,12 +1750,36 @@ def _validate_run_action(
             return f"{action} requires a saved Planner plan"
         if action == "approve-plan" and manifest.plan.approval_status == "approved":
             return "Planner plan is already approved"
-    if action == "retry-review" and not has_retryable_review_failure(manifest):
+    decision = _policy_decision_for_run_action(
+        manifest,
+        action,
+        events=events or [],
+        source=SOURCE_DASHBOARD_ACTION,
+    )
+    if action == "retry-review" and decision is None:
         return f"retry-review requires saved failed review evidence, current status is {manifest.status}"
-    if action == "retry-verification" and not has_retryable_verification_failure(manifest, events or []):
+    if action == "retry-verification" and decision is None:
         return (
             "retry-verification requires an accepted Planner review with a failed "
             f"verification gate, current status is {manifest.status}"
+        )
+    return None
+
+
+def _policy_decision_for_run_action(
+    manifest: Any,
+    action: Any,
+    *,
+    events: List[Dict[str, Any]],
+    source: str,
+):
+    if action == "retry-review":
+        return classify_retryable_review_failure(manifest, source=source)
+    if action == "retry-verification":
+        return classify_retry_verification_action(
+            manifest,
+            events,
+            source=source,
         )
     return None
 
