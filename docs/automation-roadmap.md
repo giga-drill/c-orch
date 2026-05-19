@@ -46,6 +46,60 @@ Dashboard UX follow-ups:
 These are product and architecture directions to revisit after the current
 review/retry visibility and failure-recovery slices stabilize.
 
+### Phase-Attempt Ledger And Runner Observability
+
+c-orch should make phase attempts the workflow ledger and keep session/runner
+state as observability attached to each attempt. This is not a move to hide
+session detail. Session, subprocess, transcript, heartbeat, and artifact data
+are still necessary for diagnosing stalls and optimizing runtime. The
+important boundary is that sessions should not become the workflow source of
+truth.
+
+Suggested hierarchy:
+
+```text
+Run
+  PhaseAttempt: planning#1
+    runner/session: Planner session id, pid, lease, heartbeat
+    artifacts: plan.md / plan.json
+    logs: planner.log
+
+  PhaseAttempt: worker_execution#1
+    runner/session: Worker session id, pid, lease, heartbeat
+    artifacts: worker.patch, worker-report.md
+    logs: worker-1.log
+
+  PhaseAttempt: planner_review#1
+    runner/session: Planner session id, pid, lease, heartbeat
+    artifacts: review.json
+    result: accepted or revision_requested
+```
+
+The dashboard should answer both levels of question:
+
+- workflow position: which run, phase, attempt, and expected artifact is active
+- operational diagnosis: which session/runner owns it, whether it is alive or
+  stale, when logs last advanced, and what concise evidence explains the stall
+  or retry
+
+This keeps fine-grained session visibility while avoiding a session-centered
+state machine. `codex exec resume` remains useful as an optimization for
+continuing a previous Codex conversation, but a failed resume should not make
+c-orch lose the task. c-orch should be able to recover or retry from the
+persisted phase attempt inputs, artifacts, logs, and runner observation data.
+
+Long-term followups:
+
+- normalize attempt identity across Worker attempts, Planner review attempts,
+  code-review attempts, verification retries, and recovery actions
+- show "current blocker" at attempt granularity, for example
+  `worker_execution#3 last log 4m ago; patch not produced`
+- distinguish workflow state (`running`, `accepted`, `revision_requested`,
+  `failed`) from runner observation (`alive`, `stale`, `exited`,
+  `resume_failed`)
+- make retrospective bottleneck analysis use attempt-level samples, not only
+  coarse phase aggregates
+
 ### Remove Human Plan Approval From the Normal Path
 
 Status (phase 1 delivered): default dashboard proposal flow now auto-queues the
