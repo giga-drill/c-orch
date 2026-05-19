@@ -18,11 +18,18 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow: hidden;
 }
 
 button,
@@ -82,9 +89,10 @@ pre {
 }
 
 .shell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
   grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .sidebar {
@@ -95,12 +103,23 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow: auto;
 }
 
 .content {
   min-width: 0;
   padding: 18px;
   overflow: auto;
+}
+
+.retrospectiveSummary {
+  display: grid;
+  gap: 8px;
+}
+
+.retrospectiveSummary.selected {
+  border-color: var(--green);
+  box-shadow: inset 3px 0 0 var(--green);
 }
 
 .appHeader,
@@ -701,13 +720,21 @@ details > div {
 }
 
 @media (max-width: 920px) {
+  body {
+    overflow: auto;
+  }
+
   .shell {
+    height: auto;
+    min-height: 100vh;
     grid-template-columns: 1fr;
+    overflow: visible;
   }
 
   .sidebar {
     border-right: 0;
     border-bottom: 1px solid var(--line);
+    overflow: visible;
   }
 
   .content {

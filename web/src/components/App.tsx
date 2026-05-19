@@ -186,6 +186,8 @@ type PendingQueueAction = {
   observedRevision: string;
 };
 
+type MainPanel = "run-detail" | "retrospective";
+
 type RuntimeRestartGate = {
   active: boolean;
   waiting_for: string;
@@ -297,6 +299,13 @@ function formatShortTime(value?: string | null): string {
   });
 }
 
+function summarizeText(value?: string | null, maxLength = 96): string {
+  const normalized = displayValue(value).replace(/\s+/g, " ").trim();
+  if (normalized === "-") return normalized;
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
 function sortQueueTasks(tasks: TaskSummary[]): TaskSummary[] {
   return tasks.slice();
 }
@@ -345,7 +354,8 @@ export function App() {
   const stateQuery = useDashboardStateQuery();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [manualSelection, setManualSelection] = useState(false);
-  const detailRef = useRef<HTMLElement | null>(null);
+  const [mainPanel, setMainPanel] = useState<MainPanel>("run-detail");
+  const contentRef = useRef<HTMLElement | null>(null);
   const runtimeGenerationRef = useRef<string | null>(null);
   const queuePayload = stateQuery.data?.queue;
   const proposalsPayload = stateQuery.data?.proposals;
@@ -392,12 +402,37 @@ export function App() {
     !runPayload &&
     (runQuery.isLoading || runQuery.isFetching || stateQuery.isLoading);
 
+  function resetContentScrollTop() {
+    if (contentRef.current) {
+      contentRef.current.scrollTop = 0;
+    }
+  }
+
+  function scrollContentIntoViewOnStackedLayout() {
+    if (window.matchMedia("(max-width: 920px)").matches) {
+      contentRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  }
+
   function selectRun(runId: string) {
+    const runChanged = selectedRunId !== runId;
+    const panelChanged = mainPanel !== "run-detail";
     setManualSelection(true);
+    setMainPanel("run-detail");
     setSelectedRunId(runId);
-    window.setTimeout(() => {
-      detailRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
-    }, 0);
+    if (runChanged || panelChanged) {
+      resetContentScrollTop();
+    }
+    scrollContentIntoViewOnStackedLayout();
+  }
+
+  function selectRetrospective() {
+    const expanding = mainPanel !== "retrospective";
+    resetContentScrollTop();
+    setMainPanel(expanding ? "retrospective" : "run-detail");
+    if (expanding) {
+      scrollContentIntoViewOnStackedLayout();
+    }
   }
 
   function refreshAll() {
@@ -436,7 +471,11 @@ export function App() {
           restartDrain={stateQuery.data?.runtime.restart_drain}
           runtimeLeaseSummary={stateQuery.data?.runtime.runner_leases?.summary}
         />
-        <RetrospectivePanel telemetry={stateQuery.data?.telemetry} />
+        <RetrospectiveSummaryEntry
+          telemetry={stateQuery.data?.telemetry}
+          selected={mainPanel === "retrospective"}
+          onSelect={selectRetrospective}
+        />
         <WorkspaceLanePanel payload={stateQuery.data?.workspace_lanes} />
         <ProposalPanel
           payload={proposalsPayload}
@@ -449,16 +488,58 @@ export function App() {
         />
         <RunList runs={runsPayload?.runs ?? []} selectedRunId={selectedRunId} onSelectRun={selectRun} />
       </aside>
-      <section className="content" ref={detailRef}>
-        <RunDetail
-          payload={runPayload}
-          isLoading={isRunLoading}
-          selectedRunId={selectedRunId}
-          onSelectRun={selectRun}
-        />
+      <section className="content" ref={contentRef}>
+        {mainPanel === "retrospective" ? (
+          <RetrospectiveMain telemetry={stateQuery.data?.telemetry} />
+        ) : (
+          <RunDetail
+            payload={runPayload}
+            isLoading={isRunLoading}
+            selectedRunId={selectedRunId}
+            onSelectRun={selectRun}
+          />
+        )}
       </section>
     </main>
   );
+}
+
+function RetrospectiveSummaryEntry({
+  telemetry,
+  selected,
+  onSelect,
+}: {
+  telemetry?: ProjectTelemetryPayload | null;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const summary = telemetry?.summary;
+  return (
+    <section className={selected ? "panel retrospectiveSummary selected" : "panel retrospectiveSummary"}>
+      <div className="sectionTitle">
+        <h2>Retrospective</h2>
+        <span className="meta">{formatShortTime(telemetry?.generated_at)}</span>
+      </div>
+      {summary ? (
+        <div className="queueStats" aria-label="retrospective compact summary">
+          <span>Runs {summary.total_runs}</span>
+          <span>完成 {summary.approved_runs}</span>
+          <span>失败 {summary.failed_runs}</span>
+          <span>返工 {summary.rework_count}</span>
+        </div>
+      ) : (
+        <p className="meta">暂无 retrospective 数据。</p>
+      )}
+      <button type="button" onClick={onSelect}>
+        {selected ? "收起 Retrospective" : "查看完整 Retrospective"}
+      </button>
+    </section>
+  );
+}
+
+function RetrospectiveMain({ telemetry }: { telemetry?: ProjectTelemetryPayload | null }) {
+  if (!telemetry) return <div className="empty">暂无 Retrospective 数据。</div>;
+  return <RetrospectivePanel telemetry={telemetry} />;
 }
 
 function SystemStatus({
@@ -1404,9 +1485,9 @@ function RunList({
               <span className="mono">{run.run_id}</span>
               <StatusBadge status={run.status} />
             </span>
-            <span>{run.user_task}</span>
+            <span>{summarizeText(run.user_task, 92)}</span>
             <span className="meta">waiting_for: {displayValue(run.waiting_for)}</span>
-            <span className="meta">{displayValue(run.updated_at)}</span>
+            <span className="meta">updated_at: {displayValue(run.updated_at)}</span>
           </button>
         ))}
       </div>
@@ -1505,16 +1586,17 @@ function RunDetail({
           <PlanPanel manifest={manifest} />
         </section>
         <section className="section">
-          <h2>运行信息</h2>
-          <KeyValue label="CWD" value={manifest.cwd} />
-          <KeyValue label="创建时间" value={manifest.created_at} />
-          <KeyValue label="更新时间" value={manifest.updated_at} />
-          <KeyValue label="Codex" value={manifest.codex_binary_path} />
-          <KeyValue label="plan_revision_count" value={run.plan_revision_count} />
-          <KeyValue label="latest_plan_revision_feedback" value={run.latest_plan_revision_feedback} />
-          <KeyValue label="需要重启" value={manifest.requires_restart ? "是" : "否"} />
-          {manifest.requires_restart ? <KeyValue label="重启原因" value={manifest.restart_reason} /> : null}
-          {manifest.requires_restart ? <KeyValue label="影响路径" value={manifest.restart_paths} /> : null}
+          <Collapsible title="运行信息">
+            <KeyValue label="CWD" value={manifest.cwd} />
+            <KeyValue label="创建时间" value={manifest.created_at} />
+            <KeyValue label="更新时间" value={manifest.updated_at} />
+            <KeyValue label="Codex" value={manifest.codex_binary_path} />
+            <KeyValue label="plan_revision_count" value={run.plan_revision_count} />
+            <KeyValue label="latest_plan_revision_feedback" value={run.latest_plan_revision_feedback} />
+            <KeyValue label="需要重启" value={manifest.requires_restart ? "是" : "否"} />
+            {manifest.requires_restart ? <KeyValue label="重启原因" value={manifest.restart_reason} /> : null}
+            {manifest.requires_restart ? <KeyValue label="影响路径" value={manifest.restart_paths} /> : null}
+          </Collapsible>
         </section>
       </div>
 
@@ -1630,22 +1712,24 @@ function ActivitySummaryPanel({
         </div>
       ) : null}
       {latestItems.length ? (
-        <ul className="timeline">
-          {latestItems.map((item, index) => (
-            <li key={`${item.timestamp ?? "activity"}-${item.source ?? "source"}-${index}`} className="timelineItem">
-              <div className="timelineTop">
-                <span className="mono">{displayValue(item.timestamp)}</span>
-                <StatusBadge status={item.kind ?? item.label ?? "-"} />
-              </div>
-              <p>{displayValue(item.summary ?? item.label)}</p>
-              <p className="meta">
-                {displayValue(item.role)} · {displayValue(item.source)}
-                {item.source_id ? ` · ${item.source_id}` : ""}
-              </p>
-              {item.detail ? <p className="meta">{item.detail}</p> : null}
-            </li>
-          ))}
-        </ul>
+        <Collapsible title={`最近活动明细（${latestItems.length}）`}>
+          <ul className="timeline">
+            {latestItems.map((item, index) => (
+              <li key={`${item.timestamp ?? "activity"}-${item.source ?? "source"}-${index}`} className="timelineItem">
+                <div className="timelineTop">
+                  <span className="mono">{displayValue(item.timestamp)}</span>
+                  <StatusBadge status={item.kind ?? item.label ?? "-"} />
+                </div>
+                <p>{displayValue(item.summary ?? item.label)}</p>
+                <p className="meta">
+                  {displayValue(item.role)} · {displayValue(item.source)}
+                  {item.source_id ? ` · ${item.source_id}` : ""}
+                </p>
+                {item.detail ? <p className="meta">{item.detail}</p> : null}
+              </li>
+            ))}
+          </ul>
+        </Collapsible>
       ) : (
         <p className="meta">暂无活动摘要。</p>
       )}
