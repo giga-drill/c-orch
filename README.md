@@ -1,11 +1,74 @@
 # c-orch
 
-Codex-native Planner/Worker workflow orchestrator.
+Codex-native Planner/Worker workflow orchestrator for running local coding
+tasks with explicit planning, isolated execution, review, verification, and
+merge control.
 
-`c-orch` uses a deterministic local controller plus Codex MCP. The controller
-creates real Codex sessions for a Planner and a Worker, records their thread
-ids in a run manifest, isolates Worker edits in a git worktree, collects diff
-and verification evidence, and asks the Planner to approve or request changes.
+## What Problem It Solves
+
+Plain one-shot agent coding is hard to supervise once work spans planning,
+implementation, review, verification, retries, and local git state. It is also
+easy to lose track of which workspace was changed, whether a failure is
+retryable, and what evidence supports merging a change.
+
+`c-orch` gives that workflow a local controller:
+
+- Planner and Worker are separate Codex sessions with durable thread ids.
+- Worker edits happen in isolated git worktrees.
+- Verification output, diffs, review decisions, retries, and apply/commit
+  events are recorded in run manifests.
+- A local dashboard shows proposals, queued tasks, runs, failures, restart
+  gates, and recovery actions.
+- Same-repo work is serialized while different target repos can run through
+  separate workspace lanes.
+
+The project is for local orchestration with your own Codex installation. It is
+not a hosted service and does not include Codex credentials.
+
+## Use It In Two Minutes
+
+Install the CLI and frontend dependencies:
+
+```bash
+git clone git@github.com:giga-drill/c-orch.git
+cd c-orch
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+
+corepack enable
+corepack prepare pnpm@10.33.0 --activate
+pnpm --dir web install --frozen-lockfile
+
+c-orch doctor
+```
+
+Start the live local dashboard for a target git repo:
+
+```bash
+c-orch dev-ui \
+  --cwd /path/to/target-repo \
+  --runs-dir runs \
+  --queue-file .c-orch/tasks/queue.json
+```
+
+Then open the dev UI URL printed by the command, submit a proposal, let Planner
+generate a plan, and let the execution queue run approved work through Worker,
+review, verification, apply, and commit.
+
+For CLI-only smoke tests:
+
+```bash
+c-orch run --prepare-only --cwd /path/to/target-repo "Implement feature X"
+```
+
+The target repo must be a git repository with at least one commit, because
+c-orch creates task worktrees from a committed base ref.
+
+## Dashboard
+
+![c-orch dashboard](docs/assets/dashboard-screenshot.png)
 
 ## Current Design
 
@@ -28,9 +91,10 @@ PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
   --queue-file .c-orch/tasks/queue.json
 ```
 
-For the checked-in static dashboard build, start:
+For a local static dashboard build, start:
 
 ```bash
+pnpm --dir web run build
 PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
   --cwd /path/to/target-repo \
   --runs-dir runs \
