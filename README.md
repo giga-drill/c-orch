@@ -118,7 +118,43 @@ Still follow-up work:
 
 ## Quick Start
 
-Run from this repo without installing:
+### Prerequisites
+
+c-orch is a local orchestrator. A fresh clone needs these host tools:
+
+- Python 3.11 or newer.
+- Git, and a target repository with at least one committed base ref.
+- Codex App or Codex CLI installed and logged in on the machine.
+- Node.js with Corepack, plus pnpm 10.33.0 for the React/Vite dashboard.
+
+Check out and install the Python CLI:
+
+```bash
+git clone git@github.com:giga-drill/c-orch.git
+cd c-orch
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev]'
+```
+
+Install frontend dependencies when you want to use the dashboard:
+
+```bash
+corepack enable
+corepack prepare pnpm@10.33.0 --activate
+pnpm --dir web install --frozen-lockfile
+```
+
+Verify the local Codex binary before running work:
+
+```bash
+c-orch doctor
+```
+
+If you prefer not to install the Python package, run commands from this repo
+with `PYTHONPATH=src`:
 
 ```bash
 PYTHONPATH=src python3.11 -m c_orch.cli doctor
@@ -160,10 +196,11 @@ PYTHONPATH=src python3.11 -m c_orch.cli run \
   "Implement feature X"
 ```
 
-Open the local run dashboard from the checked-in frontend build through the
-supervised entry point:
+Open the local run dashboard from a local frontend build through the supervised
+entry point:
 
 ```bash
+pnpm --dir web run build
 PYTHONPATH=src python3.11 -m c_orch.cli supervise-ui \
   --cwd /path/to/target-repo \
   --runs-dir runs \
@@ -185,6 +222,11 @@ PYTHONPATH=src python3.11 -m c_orch.cli dev-ui \
 
 Then open the dev UI URL printed by the command. The API process is API-only in
 this mode; its root page only points back to the Vite dev UI.
+
+If `web/dist/` is missing, `supervise-ui` still starts the API runtime but serves
+a fallback page telling you to build the frontend. `web/dist/` is intentionally
+not committed; use `dev-ui` for live frontend work and `pnpm --dir web run
+build` before serving the static dashboard.
 
 For self-modifying Cork runs, prefer the supervised dashboard. It starts the
 same UI/runtime child process, watches for `RESTART_REQUIRED`, restarts the
@@ -284,8 +326,14 @@ only the last fallback.
 
 ## Boundaries
 
+- c-orch is designed for local use with the user's own Codex installation and
+  credentials. The repository does not include Codex auth, a hosted backend, or
+  a remote execution service.
 - The target repo must have a committed base ref before `c-orch run` can create
   task git worktrees.
+- Dashboard development requires pnpm dependencies under `web/`. The static
+  dashboard requires a local `web/dist/` build because generated frontend assets
+  are ignored by git.
 - Each run gets one isolated task workspace. Planner and Worker sessions for
   that run use the same workspace so review can inspect the same files the
   Worker changed.
