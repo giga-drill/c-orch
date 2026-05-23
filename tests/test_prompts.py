@@ -34,6 +34,18 @@ class PromptTests(unittest.TestCase):
         self.assertIn("verification_commands` are hard gates", prompt)
         self.assertIn("any non-zero exit blocks apply/commit", prompt)
         self.assertIn("optional diagnostics", prompt)
+        self.assertIn("COrch workflow control boundary", prompt)
+        self.assertIn("c-orch owns queue/proposal/run state", prompt)
+        self.assertIn("Do not create or switch worktrees", prompt)
+        self.assertIn("Do not create or switch worktrees, commit", prompt)
+        self.assertIn("dispatch", prompt)
+        self.assertIn("Superpowers-inspired planning discipline", prompt)
+        self.assertIn("exact files", prompt)
+        self.assertIn("bite-sized, testable steps", prompt)
+        self.assertIn("failing test", prompt)
+        self.assertIn("expected outputs", prompt)
+        self.assertIn("Self-review the plan", prompt)
+        self.assertIn("Return exactly the requested JSON object", prompt)
 
     def test_planner_revision_prompt_requests_chinese_plan_content(self) -> None:
         prompt = planner_revision_prompt(human_feedback="请缩小范围")
@@ -50,6 +62,10 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Keep JSON keys", prompt)
         self.assertIn("docs/architecture-principles.md", prompt)
         self.assertIn("verification_commands` are hard gates", prompt)
+        self.assertIn("COrch workflow control boundary", prompt)
+        self.assertIn("Superpowers-inspired planning discipline", prompt)
+        self.assertIn("do not create or switch worktrees", prompt.lower())
+        self.assertIn("Return exactly the requested JSON object", prompt)
 
     def test_worker_prompt_includes_project_context_docs(self) -> None:
         prompt = worker_prompt(
@@ -60,6 +76,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn("README.md", prompt)
         self.assertIn("docs/architecture-principles.md", prompt)
         self.assertIn("Implement the focused change", prompt)
+        self.assertIn("COrch workflow control boundary", prompt)
+        self.assertIn("Do not create or switch worktrees", prompt)
+        self.assertIn("commit, merge", prompt)
+        self.assertIn("ask the", prompt)
+        self.assertIn("Superpowers-inspired execution discipline", prompt)
+        self.assertIn("Critically review the Planner instructions", prompt)
+        self.assertIn("report them in the `blockers` array", prompt)
+        self.assertIn("Use TDD for behavior changes", prompt)
+        self.assertIn("confirm it fails for the expected reason", prompt)
+        self.assertIn("tests that exercise real behavior", prompt)
+        self.assertIn('"status": "work_done"', prompt)
 
     def test_review_prompts_keep_two_outcome_contract_and_project_context(self) -> None:
         prompt = planner_review_prompt(
@@ -106,6 +133,34 @@ class PromptTests(unittest.TestCase):
             self.assertIn("codex-review-output.txt", value)
             self.assertIn('If decision is "revision_requested", the first sentence of reason', value)
             self.assertIn('If decision is "accepted", keep reason concise', value)
+            self.assertIn("COrch workflow control boundary", value)
+            self.assertIn("Do not create or switch worktrees", value)
+            self.assertIn("Superpowers-inspired review discipline", value)
+            self.assertIn("Review in two passes", value)
+            self.assertIn("first spec compliance", value)
+            self.assertIn("then code quality", value)
+            self.assertIn("Critical, Important, or Minor", value)
+            self.assertIn("Do not dispatch implementers", value)
+            self.assertIn("c-orch owns those transitions", value)
+
+    def test_superpowers_extraction_manifest_records_sources_and_sanitization(self) -> None:
+        from pathlib import Path
+
+        manifest = (
+            Path(__file__).resolve().parents[1] / "docs" / "superpowers-prompt-extraction.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("f2cbfbefebbfef77321e4c9abc9e949826bea9d7", manifest)
+        self.assertIn("skills/writing-plans/SKILL.md:L10-L12", manifest)
+        self.assertIn("skills/writing-plans/SKILL.md:L106-L120", manifest)
+        self.assertIn("skills/executing-plans/SKILL.md:L18-L30", manifest)
+        self.assertIn("skills/test-driven-development/SKILL.md:L47-L68", manifest)
+        self.assertIn("skills/requesting-code-review/SKILL.md:L24-L46", manifest)
+        self.assertIn("skills/subagent-driven-development/SKILL.md:L8-L12", manifest)
+        self.assertIn("Sanitized out", manifest)
+        self.assertIn("c-orch owns commit", manifest)
+        self.assertIn("c-orch owns worktree setup", manifest)
+        self.assertIn("Reviewer must not dispatch subagents", manifest)
 
 
 if __name__ == "__main__":

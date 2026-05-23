@@ -17,6 +17,7 @@ from .settings import (
     SANDBOX_CHOICES,
     SERVICE_TIER_CHOICES,
 )
+from .experiments import DEFAULT_EXPERIMENT_STRATEGIES, EXPERIMENT_STRATEGIES
 from .failure_policy import has_retryable_review_failure
 from .phase_timing import record_run_status_transition
 from .states import RUN_FAILED, RUN_PLAN_REVIEW_REQUIRED, TERMINAL_RUN_STATUSES
@@ -134,6 +135,93 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-approve-plan",
         action="store_true",
         help="Skip the human Planner plan review gate and start the Worker immediately.",
+    )
+
+    experiment = subparsers.add_parser(
+        "experiment",
+        help="Run isolated candidate strategies for side-by-side comparison.",
+    )
+    experiment_subparsers = experiment.add_subparsers(
+        dest="experiment_command",
+        required=True,
+    )
+    experiment_run = experiment_subparsers.add_parser(
+        "run",
+        help="Run multiple strategy arms in isolated worktrees without applying or committing.",
+    )
+    experiment_run.add_argument("task", help="Task prompt to give each strategy arm.")
+    experiment_run.add_argument("--cwd", default=".", help="Target repository path.")
+    experiment_run.add_argument("--config", default=None, help="Project config file. Defaults to .c-orch.toml.")
+    experiment_run.add_argument("--codex-bin", default=None, help="Explicit Codex binary path.")
+    experiment_run.add_argument(
+        "--experiments-dir",
+        default=None,
+        help="Experiment result directory. Relative paths resolve under --cwd.",
+    )
+    experiment_run.add_argument(
+        "--worktrees-dir",
+        default=None,
+        help="Experiment worktree root. Relative paths resolve under --cwd.",
+    )
+    experiment_run.add_argument(
+        "--strategy",
+        action="append",
+        choices=sorted(EXPERIMENT_STRATEGIES),
+        help=(
+            "Strategy arm to run. May be repeated. "
+            f"Default: {', '.join(DEFAULT_EXPERIMENT_STRATEGIES)}."
+        ),
+    )
+    experiment_run.add_argument(
+        "--worker-model",
+        default=None,
+        help=f"Model for candidate arms (default: {DEFAULT_WORKER_MODEL}).",
+    )
+    experiment_run.add_argument(
+        "--worker-reasoning-effort",
+        default=None,
+        choices=REASONING_EFFORT_CHOICES,
+        help="Reasoning effort for candidate arms.",
+    )
+    experiment_run.add_argument(
+        "--worker-service-tier",
+        default=None,
+        choices=SERVICE_TIER_CHOICES,
+        help="Service tier for candidate arms.",
+    )
+    experiment_run.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="Maximum strategy arms to run at once.",
+    )
+    experiment_run.add_argument(
+        "--base-ref",
+        default="HEAD",
+        help="Base ref used to create each candidate worktree.",
+    )
+    experiment_run.add_argument(
+        "--verification-command",
+        action="append",
+        default=[],
+        help="Optional shell command to run in each candidate worktree after generation.",
+    )
+    experiment_run.add_argument(
+        "--sandbox",
+        default=None,
+        choices=SANDBOX_CHOICES,
+        help="Sandbox mode passed to Codex MCP sessions.",
+    )
+    experiment_run.add_argument(
+        "--approval-policy",
+        default=None,
+        choices=APPROVAL_POLICY_CHOICES,
+        help="Approval policy passed to Codex MCP sessions.",
+    )
+    experiment_run.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON.",
     )
 
     resume = subparsers.add_parser(
@@ -528,6 +616,101 @@ def _resolve_queue_path(cwd: Path, queue_file: Optional[str]) -> Path:
     if not queue_file:
         return _default_queue_file(cwd)
     return _resolve_under_cwd(cwd, queue_file)
+
+
+def run_experiment_command(args: argparse.Namespace) -> int:
+    from contextlib import contextmanager
+
+    from .codex_discovery import inspect_codex_environment
+    from .config import load_project_config
+    from .experiments import ExperimentConfig, new_experiment_id, run_experiment
+    from .mcp_driver import McpCodexDriver
+
+    cwd = Path(args.cwd).expanduser().resolve()
+    try:
+        project_config = load_project_config(cwd=cwd, config_path=args.config)
+        codex_bin = args.codex_bin or project_config.codex_bin
+        report = inspect_codex_environment(explicit_codex_bin=codex_bin)
+        if not report.selected:
+            raise ValueError("No usable Codex binary found. Run `c-orch doctor` for details.")
+        worker_model = args.worker_model or project_config.worker.model or DEFAULT_WORKER_MODEL
+        if not report.selected.has_model(worker_model):
+            raise ValueError(
+                f"Worker model {worker_model!r} was not found in selected Codex binary: "
+                f"{report.selected.path}"
+            )
+        strategies = tuple(args.strategy or DEFAULT_EXPERIMENT_STRATEGIES)
+        max_parallel = args.max_parallel or min(
+            project_config.run.max_parallel_workspaces,
+            len(strategies),
+        )
+        if max_parallel < 1:
+            raise ValueError("--max-parallel must be a positive integer")
+        experiments_dir = _resolve_under_cwd(
+            cwd,
+            args.experiments_dir or ".c-orch/experiments",
+        )
+        worktrees_dir = _resolve_under_cwd(
+            cwd,
+            args.worktrees_dir or project_config.run.worktrees_dir,
+        )
+        config = ExperimentConfig(
+            cwd=cwd,
+            task=args.task,
+            experiment_id=new_experiment_id(),
+            experiments_dir=experiments_dir,
+            worktrees_dir=worktrees_dir,
+            codex_path=report.selected.path,
+            model=worker_model,
+            sandbox=args.sandbox or project_config.run.sandbox,
+            approval_policy=args.approval_policy or project_config.run.approval_policy,
+            reasoning_effort=_first_value(
+                args.worker_reasoning_effort,
+                project_config.worker.reasoning_effort,
+                DEFAULT_WORKER_REASONING_EFFORT,
+            ),
+            service_tier=_first_value(
+                args.worker_service_tier,
+                project_config.worker.service_tier,
+                DEFAULT_WORKER_SERVICE_TIER,
+            ),
+            strategies=strategies,
+            verification_commands=tuple(args.verification_command or ()),
+            max_parallel=max_parallel,
+            base_ref=args.base_ref,
+        )
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 1
+
+    @contextmanager
+    def driver_factory(codex_path: str):
+        with McpCodexDriver(codex_bin=codex_path) as driver:
+            yield driver
+
+    try:
+        result = run_experiment(config, driver_factory=driver_factory)
+    except Exception as exc:
+        print(f"experiment error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False, default=_json_default))
+        return 0
+    print(f"experiment_id: {result.experiment_id}")
+    print(f"experiment_dir: {result.experiment_dir}")
+    print(f"base_commit: {result.base_commit}")
+    print("arms:")
+    for arm in result.arms:
+        print(f"- {arm.strategy}: {arm.status}")
+        print(f"  worktree: {arm.worktree_path or '-'}")
+        print(f"  patch: {arm.patch_path or '-'}")
+        if arm.verification_summary:
+            print(f"  verification: {arm.verification_summary}")
+        if arm.error:
+            print(f"  error: {arm.error}")
+    print(f"summary: {Path(result.experiment_dir) / 'summary.md'}")
+    return 0
 
 
 def run_prepare(args: argparse.Namespace) -> int:
@@ -1183,6 +1366,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_doctor(args)
     if args.command == "run":
         return run_prepare(args)
+    if args.command == "experiment":
+        if args.experiment_command == "run":
+            return run_experiment_command(args)
+        parser.error(f"unknown experiment command: {args.experiment_command}")
+        return 2
     if args.command == "resume":
         return run_resume(args)
     if args.command == "ui":

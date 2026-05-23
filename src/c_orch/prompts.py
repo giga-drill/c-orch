@@ -62,6 +62,66 @@ DECOMPOSITION_ADVISORY_INSTRUCTIONS = """Advisory decomposition suggestion requi
 """
 
 
+CORCH_WORKFLOW_CONTROL_BOUNDARY = """COrch workflow control boundary:
+- c-orch owns queue/proposal/run state, workspace/worktree setup, retries,
+  apply, commit, merge/PR, restart gates, and user interaction.
+- Do not create or switch worktrees, commit, merge, open PRs, dispatch
+  subagents, choose execution modes, run finishing branch workflows, or ask the
+  user directly.
+- Report concerns, blockers, and suggested next steps through the required
+  c-orch JSON contract for this phase.
+- Return exactly the requested JSON object, with no markdown or prose outside
+  the JSON."""
+
+
+SUPERPOWERS_PLANNING_DISCIPLINE = """Superpowers-inspired planning discipline,
+sanitized for c-orch:
+- Write plans for a skilled Worker that may have little project context.
+  Include the codebase facts, assumptions, exact files, and exact commands the
+  Worker needs.
+- Before task steps, map files to responsibilities and keep boundaries focused;
+  follow existing project patterns and avoid opportunistic restructures.
+- Make the plan executable in bite-sized, testable steps: failing test, verify
+  the failure, minimal implementation, verify pass, refactor where useful.
+- Use exact file paths, exact command lines, and expected outputs. Avoid vague
+  phrases such as TODO, TBD, "add appropriate handling", "write tests", or
+  "handle edge cases" without concrete detail.
+- Keep verification_commands limited to hard gates. Optional diagnostics belong
+  in worker_prompt or risk_notes.
+- Self-review the plan before returning it: check spec coverage, placeholder
+  language, and consistency of function/type/property names."""
+
+
+SUPERPOWERS_WORKER_DISCIPLINE = """Superpowers-inspired execution discipline,
+sanitized for c-orch:
+- Critically review the Planner instructions before editing. If the plan has
+  critical gaps, unclear instructions, impossible steps, or repeated
+  verification failures, report them in the `blockers` array instead of
+  guessing or asking the user directly.
+- Follow the plan closely and keep changes scoped to the assigned task.
+- Use TDD for behavior changes when practical: write a focused failing test,
+  confirm it fails for the expected reason, implement the smallest useful
+  change, confirm it passes, then refactor while staying green.
+- Prefer tests that exercise real behavior; avoid tests that only prove mocks
+  were called unless mocking is unavoidable.
+- Run the relevant verification commands you can run locally and summarize
+  exact outcomes in the `verification` array."""
+
+
+SUPERPOWERS_REVIEW_DISCIPLINE = """Superpowers-inspired review discipline,
+sanitized for c-orch:
+- Review the work product, plan, requirements, diff, and evidence, not the
+  Worker's narrative alone.
+- Review in two passes: first spec compliance against the original task,
+  approved plan, and acceptance criteria; then code quality, maintainability,
+  tests, edge cases, and integration risk.
+- Classify issues as Critical, Important, or Minor in the `reason`. Critical
+  and Important issues should result in `revision_requested` unless clearly
+  invalidated by code or verification evidence.
+- Do not dispatch implementers, ask the Worker to fix issues directly, merge,
+  commit, or choose the next workflow step. c-orch owns those transitions."""
+
+
 def planner_initial_prompt(*, user_task: str, cwd: str, worker_model: str) -> str:
     return f"""You are the Planner for c-orch.
 
@@ -69,6 +129,10 @@ You run inside Codex. Do not edit files. Design the plan, acceptance criteria,
 and a self-contained Worker prompt only.
 
 {PROJECT_CONTEXT_INSTRUCTIONS}
+
+{CORCH_WORKFLOW_CONTROL_BOUNDARY}
+
+{SUPERPOWERS_PLANNING_DISCIPLINE}
 
 Task workspace: {cwd}
 Worker model: {worker_model}
@@ -114,6 +178,10 @@ You are not alone in this codebase. Do not revert unrelated changes. Keep edits
 inside the assigned task scope and adapt to existing code.
 
 {PROJECT_CONTEXT_INSTRUCTIONS}
+
+{CORCH_WORKFLOW_CONTROL_BOUNDARY}
+
+{SUPERPOWERS_WORKER_DISCIPLINE}
 
 Acceptance criteria:
 {criteria}
@@ -179,6 +247,10 @@ Code review summary:
 
 {PLANNER_REVIEW_INSTRUCTIONS}
 
+{CORCH_WORKFLOW_CONTROL_BOUNDARY}
+
+{SUPERPOWERS_REVIEW_DISCIPLINE}
+
 Review the Worker result against the task workspace and the evidence above. Do
 not judge by reading another checkout of the same repository. Decide whether the
 Worker satisfies the acceptance criteria. There are only two business outcomes:
@@ -209,6 +281,10 @@ def planner_revision_prompt(*, human_feedback: str) -> str:
 The human reviewer asked you to revise your previous plan.
 
 {PROJECT_CONTEXT_INSTRUCTIONS}
+
+{CORCH_WORKFLOW_CONTROL_BOUNDARY}
+
+{SUPERPOWERS_PLANNING_DISCIPLINE}
 
 Human feedback:
 {human_feedback}
@@ -299,6 +375,10 @@ Code review summary:
 {review_summary}{review_path_line}
 
 {PLANNER_REVIEW_INSTRUCTIONS}
+
+{CORCH_WORKFLOW_CONTROL_BOUNDARY}
+
+{SUPERPOWERS_REVIEW_DISCIPLINE}
 
 Review the Worker result against the task workspace and the evidence above. Do
 not judge by reading another checkout of the same repository. Decide whether the
